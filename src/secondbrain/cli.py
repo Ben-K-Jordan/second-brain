@@ -276,6 +276,33 @@ def serve() -> None:
 
 
 @app.command()
+def daemon() -> None:
+    """Headless watcher. Bootstrap-indexes all watched_folders, then watches forever.
+
+    Reads `watched_folders` from config (~/.secondbrain/config.toml). Logs to
+    `~/.secondbrain/daemon.log`. Stop with Ctrl-C. For autostart, schedule via
+    Windows Task Scheduler / launchd / systemd (see README).
+    """
+    from .daemon import run_daemon
+
+    cfg = load_config()
+    run_daemon(cfg)
+
+
+@app.command()
+def tray() -> None:
+    """Run as a system-tray app: bootstrap-indexes, then watches with a tray icon.
+
+    Right-click the icon for status / open data dir / quit. Requires the [tray]
+    extra: pip install -e .[tray]
+    """
+    from .daemon import run_tray
+
+    cfg = load_config()
+    run_tray(cfg)
+
+
+@app.command()
 def reset(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
 ) -> None:

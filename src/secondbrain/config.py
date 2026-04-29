@@ -156,6 +156,9 @@ def default_config_toml() -> str:
 # Edit this file to customize behavior. Restart any running daemon to apply.
 
 # Folders to watch and index. Paths can be absolute or use ~ for home.
+# Used by `secondbrain daemon` and `secondbrain tray`.
+# Example:
+# watched_folders = ["C:/Users/me/Downloads", "C:/Users/me/Documents/notes"]
 watched_folders = []
 
 # Embedder: "auto" picks Voyage if VOYAGE_API_KEY is set, else local.

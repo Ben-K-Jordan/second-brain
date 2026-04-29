@@ -32,6 +32,9 @@ whisper = [
 ocr = [
     "pytesseract>=0.3",
 ]
+tray = [
+    "pystray>=0.19",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

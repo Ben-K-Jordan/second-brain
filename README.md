@@ -90,11 +90,40 @@ secondbrain serve
 
 ### Watch mode (continuous indexing)
 
+Foreground (one folder, blocks the terminal):
+
 ```bash
 secondbrain watch ~/Downloads
 ```
 
-Files added, modified, moved, or deleted are reflected in the index after a short debounce.
+Headless background (recommended — uses `watched_folders` from config):
+
+```bash
+secondbrain daemon
+```
+
+System tray app (background with status menu):
+
+```bash
+pip install -e .[tray]
+secondbrain tray
+```
+
+Edit `~/.secondbrain/config.toml` (or the OS-appropriate path printed by `secondbrain init`) and add the folders you want watched:
+
+```toml
+watched_folders = ["C:/Users/me/Downloads", "C:/Users/me/Documents/notes"]
+```
+
+### Autostart on login
+
+Once `secondbrain tray` works manually, autostart it via your OS:
+
+- **Windows:** Win+R → `shell:startup` → drop a shortcut to `secondbrain tray` in the folder. Or use Task Scheduler with the trigger "At log on" pointing at `pythonw.exe -m secondbrain.cli tray`.
+- **macOS:** create a LaunchAgent plist under `~/Library/LaunchAgents/`.
+- **Linux:** systemd user service or your DE's "Startup Applications".
+
+Files added, modified, moved, or deleted are reflected in the index after a short debounce. New files in your watched folders are searchable from any AI assistant within seconds, no terminal required.
 
 ### Connect to Claude Desktop
 
