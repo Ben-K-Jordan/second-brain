@@ -23,6 +23,7 @@ from . import __version__
 from .config import Config, load_config, write_default_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
+from .entities import make_entity_extractor
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder, walk_folder
 from .reranker import make_reranker
@@ -102,6 +103,9 @@ def index(
         False, "--no-transcribe", help="Skip Whisper transcription for audio/video."
     ),
     no_ocr: bool = typer.Option(False, "--no-ocr", help="Skip OCR for images."),
+    no_entities: bool = typer.Option(
+        False, "--no-entities", help="Skip spaCy entity extraction."
+    ),
 ) -> None:
     """One-shot index a folder. Skips files whose content is unchanged."""
     _setup_logging(verbose)
@@ -115,6 +119,8 @@ def index(
         cfg.transcribe_enabled = False
     if no_ocr:
         cfg.ocr_enabled = False
+    if no_entities:
+        cfg.entities_enabled = False
     conn, embedder = _open_state(cfg)
 
     transcriber = None
@@ -139,6 +145,16 @@ def index(
         except ImportError as e:
             console.print(f"[yellow]OCR disabled:[/] {e}")
             ocr_engine = None
+
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+            if entity_extractor:
+                console.print(f"[dim]Entities:[/] {entity_extractor.name}")
+        except (ImportError, RuntimeError) as e:
+            console.print(f"[yellow]Entity extraction disabled:[/] {e}")
+            entity_extractor = None
 
     candidates = list(walk_folder(folder, cfg))
     console.print(
@@ -165,6 +181,7 @@ def index(
         index_folder(
             conn, embedder, cfg, folder, progress=on_result,
             transcriber=transcriber, ocr_engine=ocr_engine,
+            entity_extractor=entity_extractor,
         )
 
     console.print(
@@ -243,11 +260,19 @@ def watch(
         except ImportError as e:
             console.print(f"[yellow]OCR disabled:[/] {e}")
 
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+        except (ImportError, RuntimeError) as e:
+            console.print(f"[yellow]Entity extraction disabled:[/] {e}")
+
     if bootstrap:
         console.print(f"Bootstrapping index for [cyan]{folder}[/]...")
         index_folder(
             conn, embedder, cfg, folder,
             transcriber=transcriber, ocr_engine=ocr_engine,
+            entity_extractor=entity_extractor,
         )
         console.print("[green]Bootstrap complete.[/]")
 
@@ -258,6 +283,7 @@ def watch(
     watcher = Watcher(
         cfg, conn, embedder, on_event=on_event,
         transcriber=transcriber, ocr_engine=ocr_engine,
+        entity_extractor=entity_extractor,
     )
     watcher.start([folder])
     console.print(f"[green]Watching[/] {folder}. Press Ctrl-C to stop.")

@@ -59,6 +59,18 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
 
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            text TEXT NOT NULL,
+            text_lower TEXT NOT NULL,
+            label TEXT NOT NULL,
+            UNIQUE(chunk_id, text_lower, label)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entities_chunk_id ON entities(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_entities_text_lower ON entities(text_lower);
+        CREATE INDEX IF NOT EXISTS idx_entities_label ON entities(label);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
             text,
             content='chunks',
@@ -156,34 +168,60 @@ def replace_chunks(
     conn: sqlite3.Connection,
     file_id: int,
     chunks: list[tuple[str, list[float]]],
-) -> None:
-    """Atomically replace all chunks (and their vectors) for a file."""
+) -> list[int]:
+    """Atomically replace all chunks (and their vectors) for a file.
+
+    Returns the new chunk IDs in order so callers can attach derivative data
+    (entities, citations, etc.) without re-querying.
+    """
     old_ids = [
         r["id"] for r in conn.execute("SELECT id FROM chunks WHERE file_id = ?", (file_id,))
     ]
     for cid in old_ids:
         conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+        conn.execute("DELETE FROM entities WHERE chunk_id = ?", (cid,))
     conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
 
+    new_ids: list[int] = []
     for idx, (text, embedding) in enumerate(chunks):
         cur = conn.execute(
             "INSERT INTO chunks(file_id, chunk_index, text) VALUES (?, ?, ?) RETURNING id",
             (file_id, idx, text),
         )
         chunk_id = cur.fetchone()["id"]
+        new_ids.append(chunk_id)
         conn.execute(
             "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)",
             (chunk_id, serialize_f32(embedding)),
+        )
+    return new_ids
+
+
+def insert_entities(
+    conn: sqlite3.Connection,
+    chunk_id: int,
+    entities: list[tuple[str, str]],
+) -> None:
+    """Insert (text, label) entities for a chunk. Dedupes by (chunk, text_lower, label)."""
+    for text, label in entities:
+        if not text:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO entities(chunk_id, text, text_lower, label) "
+            "VALUES (?, ?, ?, ?)",
+            (chunk_id, text, text.lower(), label),
         )
 
 
 def stats(conn: sqlite3.Connection) -> dict[str, int | str | None]:
     files = conn.execute("SELECT COUNT(*) AS c FROM files").fetchone()["c"]
     chunks = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+    entities = conn.execute("SELECT COUNT(*) AS c FROM entities").fetchone()["c"]
     last = conn.execute("SELECT MAX(indexed_at) AS t FROM files").fetchone()["t"]
     return {
         "files": files,
         "chunks": chunks,
+        "entities": entities,
         "last_indexed_at": last,
         "embedder": get_meta(conn, "embedder_name"),
         "embedding_dim": get_meta(conn, "embedding_dim"),

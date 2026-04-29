@@ -197,10 +197,94 @@ def index_status() -> str:
     return (
         f"Files: {s['files']}\n"
         f"Chunks: {s['chunks']}\n"
+        f"Entities: {s.get('entities', 0)}\n"
         f"Embedder: {s['embedder']} (dim={s['embedding_dim']})\n"
         f"Reranker: {rerank}\n"
         f"Last indexed: {last_str}"
     )
+
+
+@mcp.tool()
+def list_entities(label: str | None = None, top_n: int = 30) -> str:
+    """Most-mentioned entities in the brain, with chunk counts.
+
+    Optional ``label`` filter (PERSON, ORG, GPE, LOC, FAC, PRODUCT, EVENT,
+    WORK_OF_ART, LAW, DATE, MONEY, LANGUAGE, NORP). Useful for an assistant
+    to find recurring people, organizations, projects, etc.
+    """
+    _, conn, _, _ = _get_state()
+    if label:
+        rows = conn.execute(
+            "SELECT text, label, COUNT(DISTINCT chunk_id) AS n "
+            "FROM entities WHERE label = ? "
+            "GROUP BY text_lower, label ORDER BY n DESC LIMIT ?",
+            (label.upper(), top_n),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT text, label, COUNT(DISTINCT chunk_id) AS n "
+            "FROM entities GROUP BY text_lower, label ORDER BY n DESC LIMIT ?",
+            (top_n,),
+        ).fetchall()
+    if not rows:
+        return "(no entities indexed; install [ner] extra and re-index)"
+    lines = [f"{r['n']:5d}  [{r['label']:10s}]  {r['text']}" for r in rows]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_mentions(entity: str, k: int = 10) -> str:
+    """Find chunks that mention an entity (case-insensitive exact-text match).
+
+    Returns up to k chunks with file paths so you can read context. Pair with
+    `list_entities` to discover what's worth searching.
+    """
+    _, conn, _, _ = _get_state()
+    rows = conn.execute(
+        "SELECT c.text, c.chunk_index, f.path, f.mtime, e.label "
+        "FROM entities e "
+        "JOIN chunks c ON c.id = e.chunk_id "
+        "JOIN files f ON f.id = c.file_id "
+        "WHERE e.text_lower = ? "
+        "ORDER BY f.mtime DESC LIMIT ?",
+        (entity.lower(), k),
+    ).fetchall()
+    if not rows:
+        return f"(no mentions of {entity!r})"
+    lines = [f"# Mentions of {entity!r}", ""]
+    for r in rows:
+        snippet = r["text"] if len(r["text"]) <= 600 else r["text"][:600] + "..."
+        lines.append(
+            f"### [{r['label']}] {r['path']} (chunk {r['chunk_index']})"
+        )
+        lines.append(snippet)
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def entity_timeline(entity: str, limit: int = 30) -> str:
+    """Files that mention an entity, sorted by file mtime (newest first).
+
+    A timeline view: when does this person/org/thing show up in your brain?
+    """
+    _, conn, _, _ = _get_state()
+    rows = conn.execute(
+        "SELECT DISTINCT f.path, f.mtime, f.kind "
+        "FROM entities e "
+        "JOIN chunks c ON c.id = e.chunk_id "
+        "JOIN files f ON f.id = c.file_id "
+        "WHERE e.text_lower = ? "
+        "ORDER BY f.mtime DESC LIMIT ?",
+        (entity.lower(), limit),
+    ).fetchall()
+    if not rows:
+        return f"(no mentions of {entity!r})"
+    lines = [f"# Timeline of {entity!r}", ""]
+    for r in rows:
+        age_days = (time.time() - r["mtime"]) / 86400
+        lines.append(f"  {age_days:6.1f}d ago  [{r['kind']:12s}]  {r['path']}")
+    return "\n".join(lines)
 
 
 def run() -> None:

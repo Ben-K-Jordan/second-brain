@@ -16,8 +16,9 @@ from .config import (
     classify_file,
     is_ignored,
 )
-from .db import delete_file, get_file_by_path, replace_chunks, upsert_file
+from .db import delete_file, get_file_by_path, insert_entities, replace_chunks, upsert_file
 from .embedder import Embedder
+from .entities import EntityExtractor
 from .imager import OCREngine
 from .transcriber import Transcriber
 
@@ -232,8 +233,9 @@ def index_file(
     path: Path,
     transcriber: Transcriber | None = None,
     ocr_engine: OCREngine | None = None,
+    entity_extractor: EntityExtractor | None = None,
 ) -> IndexResult:
-    """Index a single file (extract -> chunk -> embed -> store)."""
+    """Index a single file (extract -> chunk -> embed -> entities -> store)."""
     ok, reason = should_index(path, cfg, transcriber=transcriber, ocr_engine=ocr_engine)
     if not ok:
         return IndexResult(path, "skipped", reason=reason)
@@ -281,7 +283,25 @@ def index_file(
         kind=kind,
         content_hash=chash,
     )
-    replace_chunks(conn, file_id, list(zip(chunk_texts, embeddings, strict=True)))
+    chunk_ids = replace_chunks(
+        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+    )
+
+    if entity_extractor is not None:
+        try:
+            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
+                ents = entity_extractor.extract(chunk_text_val)
+                if ents:
+                    insert_entities(
+                        conn,
+                        chunk_id,
+                        [(e.text, e.label) for e in ents],
+                    )
+        except Exception as e:
+            # Entity failures are non-fatal: the chunk + embedding are already stored,
+            # so the file is still searchable - we just won't have NER on it.
+            log.warning("entity extraction failed for %s: %s", path, e)
+
     conn.commit()
     return IndexResult(path, "indexed", chunks=len(chunk_texts))
 
@@ -311,6 +331,7 @@ def index_folder(
     progress=None,
     transcriber: Transcriber | None = None,
     ocr_engine: OCREngine | None = None,
+    entity_extractor: EntityExtractor | None = None,
 ) -> dict[str, int]:
     """Walk a folder and index all eligible files. Returns counts."""
     counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0}
@@ -318,6 +339,7 @@ def index_folder(
         result = index_file(
             conn, embedder, cfg, p,
             transcriber=transcriber, ocr_engine=ocr_engine,
+            entity_extractor=entity_extractor,
         )
         counts[result.status] = counts.get(result.status, 0) + 1
         if progress:

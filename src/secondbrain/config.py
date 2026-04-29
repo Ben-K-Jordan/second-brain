@@ -143,6 +143,10 @@ class Config:
     ocr_enabled: bool = True
     ocr_lang: str = "eng"
 
+    # Named-entity recognition (people, orgs, places, dates, money, ...) via spaCy
+    entities_enabled: bool = True
+    spacy_model: str = "en_core_web_sm"
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -216,6 +220,13 @@ whisper_model_size = "small"  # tiny/base/small/medium/large-v3
 # binary on PATH (see README for install).
 ocr_enabled = true
 ocr_lang = "eng"
+
+# Named-entity recognition. When enabled, spaCy extracts people, orgs,
+# places, dates, money, etc. per chunk and stores them for graph queries.
+# Requires the [ner] extra AND a one-time model download:
+#   python -m spacy download en_core_web_sm
+entities_enabled = true
+spacy_model = "en_core_web_sm"
 """
 
 
@@ -266,6 +277,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.ocr_enabled = bool(data["ocr_enabled"])
         if "ocr_lang" in data:
             cfg.ocr_lang = data["ocr_lang"]
+        if "entities_enabled" in data:
+            cfg.entities_enabled = bool(data["entities_enabled"])
+        if "spacy_model" in data:
+            cfg.spacy_model = data["spacy_model"]
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg

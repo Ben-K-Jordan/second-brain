@@ -35,6 +35,9 @@ ocr = [
 tray = [
     "pystray>=0.19",
 ]
+ner = [
+    "spacy>=3.7",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
