@@ -19,7 +19,9 @@ from .config import (
     is_ignored,
 )
 from .db import (
+    add_alias,
     delete_file,
+    find_file_by_hash,
     get_file_by_path,
     insert_entities,
     replace_chunks,
@@ -288,6 +290,16 @@ def index_file(
     if existing and existing["content_hash"] == chash:
         return IndexResult(path, "unchanged")
 
+    # Hash-dedup across paths: if some other file with the same content hash
+    # is already indexed, register this path as an alias and skip embedding.
+    # First-seen wins as the canonical path; later copies become aliases.
+    if existing is None:
+        twin = find_file_by_hash(conn, chash)
+        if twin is not None:
+            add_alias(conn, twin["id"], str(path))
+            conn.commit()
+            return IndexResult(path, "alias", reason=f"duplicate of {twin['path']}")
+
     try:
         text = extract_text(path, transcriber=transcriber, ocr_engine=ocr_engine)
     except Exception as e:
@@ -366,6 +378,52 @@ def remove_file(conn: sqlite3.Connection, path: Path) -> IndexResult:
     delete_file(conn, str(path))
     conn.commit()
     return IndexResult(path, "deleted")
+
+
+def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
+    """Walk the existing index, find files sharing a content_hash, and convert
+    duplicates to aliases.
+
+    Keeps the oldest indexed file as canonical; the rest get their chunks /
+    entities / image embeddings dropped (cascade) and their path moved into
+    `file_aliases`. Returns counts for reporting.
+
+    Idempotent. Safe to run on a populated index even after the indexer-side
+    dedup is in place - it cleans up duplicates added before that fix shipped.
+    """
+    rows = conn.execute(
+        "SELECT content_hash, GROUP_CONCAT(id) AS ids, COUNT(*) AS n "
+        "FROM files WHERE content_hash IS NOT NULL "
+        "GROUP BY content_hash HAVING n > 1"
+    ).fetchall()
+
+    converted = 0
+    chunks_freed = 0
+    for r in rows:
+        ids = [int(x) for x in r["ids"].split(",")]
+        # Pick the oldest indexed_at as the canonical primary - lowest id is a
+        # good proxy since our schema uses AUTOINCREMENT and inserts grow.
+        canonical_id = min(ids)
+        duplicate_ids = [i for i in ids if i != canonical_id]
+        for dup_id in duplicate_ids:
+            dup = conn.execute("SELECT path FROM files WHERE id = ?", (dup_id,)).fetchone()
+            if dup is None:
+                continue
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ?", (dup_id,)
+            ).fetchone()["c"]
+            chunks_freed += chunk_count
+            # Cascade drops chunks, entities, image rows, and vec_ rows via
+            # the explicit cleanup we already do in delete_file - reuse it.
+            delete_file(conn, dup["path"])
+            add_alias(conn, canonical_id, dup["path"])
+            converted += 1
+    conn.commit()
+    return {
+        "groups_with_duplicates": len(rows),
+        "duplicate_files_converted": converted,
+        "chunks_freed": chunks_freed,
+    }
 
 
 _USER_AGENT = (
@@ -527,7 +585,7 @@ def index_folder(
     image_embedder: ImageEmbedder | None = None,
 ) -> dict[str, int]:
     """Walk a folder and index all eligible files. Returns counts."""
-    counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0}
+    counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0, "alias": 0}
     for p in walk_folder(folder, cfg):
         result = index_file(
             conn, embedder, cfg, p,

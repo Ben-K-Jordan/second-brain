@@ -59,6 +59,20 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
 
+        -- Hash-based dedup: when the same content lives at multiple paths
+        -- (e.g. Downloads + OneDrive copies), only one row in `files` carries
+        -- the embeddings; the other paths land here as aliases. Saves
+        -- embedding cost and keeps search results de-duplicated.
+        CREATE TABLE IF NOT EXISTS file_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            path TEXT UNIQUE NOT NULL,
+            discovered_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_aliases_file_id ON file_aliases(file_id);
+
+        CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);
+
         CREATE TABLE IF NOT EXISTS entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -173,8 +187,50 @@ def get_file_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM files WHERE path = ?", (path,)).fetchone()
 
 
+def find_file_by_hash(conn: sqlite3.Connection, content_hash: str) -> sqlite3.Row | None:
+    """Find an existing primary file with the given content hash.
+
+    Used to detect cross-path duplicates so we register them as aliases instead
+    of embedding the same content twice. Returns the canonical file row.
+    """
+    return conn.execute(
+        "SELECT * FROM files WHERE content_hash = ? LIMIT 1",
+        (content_hash,),
+    ).fetchone()
+
+
+def add_alias(conn: sqlite3.Connection, file_id: int, path: str) -> None:
+    """Record an alternate path for a file. No-op if the alias already exists."""
+    import time as _time
+
+    conn.execute(
+        "INSERT OR IGNORE INTO file_aliases(file_id, path, discovered_at) "
+        "VALUES (?, ?, ?)",
+        (file_id, path, _time.time()),
+    )
+
+
+def get_aliases(conn: sqlite3.Connection, file_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT path FROM file_aliases WHERE file_id = ? ORDER BY discovered_at",
+        (file_id,),
+    ).fetchall()
+    return [r["path"] for r in rows]
+
+
+def aliased_paths_set(conn: sqlite3.Connection) -> set[str]:
+    """Return all paths currently registered as aliases (any file_id)."""
+    rows = conn.execute("SELECT path FROM file_aliases").fetchall()
+    return {r["path"] for r in rows}
+
+
 def delete_file(conn: sqlite3.Connection, path: str) -> None:
-    """Remove a file and all its chunks (cascade) and vector rows."""
+    """Remove a file and all its chunks (cascade) and vector rows.
+
+    Cleans both vec_chunks and vec_images explicitly - they're sqlite-vec
+    virtual tables without foreign keys, so cascades from `files` don't reach
+    them. Without this, a delete leaks vector rows.
+    """
     row = get_file_by_path(conn, path)
     if not row:
         return
@@ -184,6 +240,11 @@ def delete_file(conn: sqlite3.Connection, path: str) -> None:
     ]
     for cid in chunk_ids:
         conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+    image_ids = [
+        r["id"] for r in conn.execute("SELECT id FROM images WHERE file_id = ?", (file_id,))
+    ]
+    for iid in image_ids:
+        conn.execute("DELETE FROM vec_images WHERE image_id = ?", (iid,))
     conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
 
@@ -286,11 +347,13 @@ def stats(conn: sqlite3.Connection) -> dict[str, int | str | None]:
     files = conn.execute("SELECT COUNT(*) AS c FROM files").fetchone()["c"]
     chunks = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
     entities = conn.execute("SELECT COUNT(*) AS c FROM entities").fetchone()["c"]
+    aliases = conn.execute("SELECT COUNT(*) AS c FROM file_aliases").fetchone()["c"]
     last = conn.execute("SELECT MAX(indexed_at) AS t FROM files").fetchone()["t"]
     return {
         "files": files,
         "chunks": chunks,
         "entities": entities,
+        "aliases": aliases,
         "last_indexed_at": last,
         "embedder": get_meta(conn, "embedder_name"),
         "embedding_dim": get_meta(conn, "embedding_dim"),

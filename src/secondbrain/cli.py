@@ -26,7 +26,7 @@ from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
-from .indexer import IndexResult, index_folder, index_url, walk_folder
+from .indexer import IndexResult, dedupe_existing, index_folder, index_url, walk_folder
 from .reranker import make_reranker
 from .search import hybrid_search
 from .transcriber import make_transcriber
@@ -88,11 +88,32 @@ def status() -> None:
     s = stats(conn)
     table = Table(show_header=False, box=None)
     table.add_row("Files", str(s["files"]))
+    table.add_row("Aliases", f"{s.get('aliases', 0)} (duplicate paths)")
     table.add_row("Chunks", str(s["chunks"]))
+    table.add_row("Entities", str(s.get("entities", 0)))
     table.add_row("Embedder", f"{s['embedder']} (dim {s['embedding_dim']})")
     table.add_row("DB path", str(cfg.db_path))
     table.add_row("Watched folders", ", ".join(str(p) for p in cfg.watched_folders) or "(none)")
     console.print(table)
+    conn.close()
+
+
+@app.command()
+def dedupe() -> None:
+    """Find files in the index sharing a content hash and convert duplicates
+    to aliases. Frees their chunks/entities/vectors, keeps the path.
+
+    Idempotent. Safe to run repeatedly. Worth running once after bulk-indexing
+    folders with overlap (e.g. Downloads + OneDrive)."""
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    console.print("Scanning for content-hash duplicates...")
+    result = dedupe_existing(conn)
+    console.print(
+        f"[green]Done.[/] groups={result['groups_with_duplicates']} "
+        f"converted={result['duplicate_files_converted']} "
+        f"chunks_freed={result['chunks_freed']}"
+    )
     conn.close()
 
 

@@ -279,6 +279,7 @@ def create_app():
     <div class="card">
         <h2>Index</h2>
         <div class="stat"><span class="k">Files</span><span class="v">{s['files']}</span></div>
+        <div class="stat"><span class="k">Aliases</span><span class="v">{s.get('aliases', 0)} <span class="muted">(dup paths)</span></span></div>
         <div class="stat"><span class="k">Chunks</span><span class="v">{s['chunks']}</span></div>
         <div class="stat"><span class="k">Entities</span><span class="v">{s.get('entities', 0)}</span></div>
         <div class="stat"><span class="k">Embedder</span><span class="v">{escape(str(s['embedder']))} (dim {s['embedding_dim']})</span></div>
