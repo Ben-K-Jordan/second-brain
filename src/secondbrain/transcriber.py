@@ -24,7 +24,7 @@ class LocalWhisperTranscriber:
     so no separate ffmpeg install is required.
     """
 
-    def __init__(self, model_size: str = "small", device: str = "auto"):
+    def __init__(self, model_size: str = "small", device: str = "cpu"):
         try:
             from faster_whisper import WhisperModel
         except ImportError as e:
@@ -34,8 +34,11 @@ class LocalWhisperTranscriber:
             ) from e
 
         # int8 on CPU is the right default for personal use: ~5x faster than
-        # float32 with negligible quality loss for most content.
-        compute_type = "int8" if device in ("auto", "cpu") else "float16"
+        # float32 with negligible quality loss for most content. We default to
+        # device="cpu" rather than "auto" because faster-whisper's "auto" tries
+        # CUDA first and fails noisily on machines without the cuBLAS DLLs even
+        # when CTranslate2 itself was built without GPU support.
+        compute_type = "int8" if device == "cpu" else "float16"
         self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
         self.name = f"faster-whisper-{model_size}"
 
