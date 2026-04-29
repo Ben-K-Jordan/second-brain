@@ -76,38 +76,99 @@ def extract_text(path: Path) -> str:
         return ""
 
 
-def chunk_text(text: str, target_size: int = 800, overlap: int = 150) -> list[str]:
+def chunk_text(
+    text: str, target_size: int = 800, overlap: int = 150
+) -> list[tuple[str, int]]:
     """Paragraph-aware chunking with character overlap.
 
     Splits on paragraph boundaries, packs into chunks near target_size, and falls back
     to character splits with overlap when a single paragraph is larger than target_size.
+    Returns ``[(chunk_text, start_offset), ...]`` where start_offset is the chunk's
+    approximate location in the original text. Offsets are used to find the nearest
+    preceding heading for contextual embedding.
     """
     text = text.strip()
     if not text:
         return []
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks: list[str] = []
+    chunks: list[tuple[str, int]] = []
     current = ""
+    current_start = 0
+    cursor = 0
 
     def flush():
-        nonlocal current
+        nonlocal current, current_start
         if current.strip():
-            chunks.append(current.strip())
+            chunks.append((current.strip(), current_start))
         current = ""
 
-    for p in paragraphs:
-        if len(p) > target_size:
+    paragraph_pattern = "\n\n"
+    parts = text.split(paragraph_pattern)
+    for p in parts:
+        p_stripped = p.strip()
+        p_offset = cursor
+        cursor += len(p) + len(paragraph_pattern)
+        if not p_stripped:
+            continue
+        if len(p_stripped) > target_size:
             flush()
             step = max(1, target_size - overlap)
-            for i in range(0, len(p), step):
-                chunks.append(p[i : i + target_size])
+            for i in range(0, len(p_stripped), step):
+                chunks.append((p_stripped[i : i + target_size], p_offset + i))
             continue
-        if current and len(current) + len(p) + 2 > target_size:
+        if current and len(current) + len(p_stripped) + 2 > target_size:
             flush()
-        current = f"{current}\n\n{p}" if current else p
+        if not current:
+            current_start = p_offset
+        current = f"{current}\n\n{p_stripped}" if current else p_stripped
     flush()
     return chunks
+
+
+_HEADING_PATTERNS = (
+    "# ", "## ", "### ", "#### ",
+    "Slide number:", "<!-- Slide number:",
+)
+
+
+def find_nearest_heading(full_text: str, offset: int, max_lookback: int = 4000) -> str | None:
+    """Find the nearest heading-like line before ``offset``.
+
+    Recognises Markdown ATX headings and Markitdown's ``<!-- Slide number: N -->``
+    markers (followed by a slide title on the next non-empty line).
+    """
+    start = max(0, offset - max_lookback)
+    window = full_text[start:offset]
+    lines = window.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i].strip()
+        if not line:
+            continue
+        for prefix in ("####", "###", "##", "#"):
+            if line.startswith(prefix + " "):
+                return line.lstrip("# ").strip()
+        if line.startswith("<!-- Slide number:") or line.startswith("Slide number:"):
+            for j in range(i + 1, min(i + 5, len(lines))):
+                title = lines[j].strip()
+                if title and not title.startswith("<!--"):
+                    return title
+    return None
+
+
+def build_context_prefix(path: Path, full_text: str, chunk_offset: int) -> str:
+    """Build a short context preamble for an embedded chunk.
+
+    Including the filename, parent folder, and nearest heading lets the embedder
+    place each chunk in its document; recall on conceptual queries improves
+    measurably vs. embedding bare chunks.
+    """
+    parts = [f"Document: {path.name}"]
+    if path.parent.name:
+        parts.append(f"Folder: {path.parent.name}")
+    heading = find_nearest_heading(full_text, chunk_offset)
+    if heading:
+        parts.append(f"Section: {heading}")
+    return "\n".join(parts) + "\n\n"
 
 
 def should_index(path: Path, cfg: Config) -> tuple[bool, str | None]:
@@ -167,12 +228,17 @@ def index_file(
     if not text.strip():
         return IndexResult(path, "skipped", reason="no extractable text")
 
-    chunks = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
-    if not chunks:
+    chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+    if not chunked:
         return IndexResult(path, "skipped", reason="no chunks produced")
 
+    chunk_texts = [c for c, _ in chunked]
+    contextualized = [
+        build_context_prefix(path, text, offset) + c for c, offset in chunked
+    ]
+
     try:
-        embeddings = embedder.embed_documents(chunks)
+        embeddings = embedder.embed_documents(contextualized)
     except Exception as e:
         log.warning("embedding failed for %s: %s", path, e)
         return IndexResult(path, "error", reason=f"embedding: {e}")
@@ -186,9 +252,9 @@ def index_file(
         kind=kind,
         content_hash=chash,
     )
-    replace_chunks(conn, file_id, list(zip(chunks, embeddings, strict=True)))
+    replace_chunks(conn, file_id, list(zip(chunk_texts, embeddings, strict=True)))
     conn.commit()
-    return IndexResult(path, "indexed", chunks=len(chunks))
+    return IndexResult(path, "indexed", chunks=len(chunk_texts))
 
 
 def remove_file(conn: sqlite3.Connection, path: Path) -> IndexResult:

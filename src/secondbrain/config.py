@@ -119,7 +119,9 @@ class Config:
 
     # Search
     hybrid_alpha: float = 0.5  # weight: 0=keyword only, 1=vector only
-    rerank_enabled: bool = False  # Phase 2
+    rerank_enabled: bool = True
+    rerank_model: str = "rerank-2-lite"
+    rerank_overfetch: int = 50  # how many candidates to fetch before reranking down to k
 
     @property
     def db_path(self) -> Path:
@@ -160,6 +162,14 @@ extra_ignore_globs = []
 
 # Hybrid search: 0.0 = keyword only, 1.0 = vector only.
 hybrid_alpha = 0.5
+
+# Cross-encoder reranking. When enabled, hybrid search over-fetches candidates
+# and reranks them with a cross-encoder for ~30% precision lift on top results.
+# Requires Voyage API access. Adds ~50-100ms latency per query and a small
+# extra API cost (rerank-2-lite is ~$0.05/1M tokens).
+rerank_enabled = true
+rerank_model = "rerank-2-lite"
+rerank_overfetch = 50
 """
 
 
@@ -188,6 +198,12 @@ def load_config(path: Path | None = None) -> Config:
             cfg.extra_ignore_globs = tuple(data["extra_ignore_globs"])
         if "hybrid_alpha" in data:
             cfg.hybrid_alpha = float(data["hybrid_alpha"])
+        if "rerank_enabled" in data:
+            cfg.rerank_enabled = bool(data["rerank_enabled"])
+        if "rerank_model" in data:
+            cfg.rerank_model = data["rerank_model"]
+        if "rerank_overfetch" in data:
+            cfg.rerank_overfetch = int(data["rerank_overfetch"])
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg

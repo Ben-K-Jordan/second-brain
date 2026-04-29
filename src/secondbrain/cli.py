@@ -24,6 +24,7 @@ from .config import Config, load_config, write_default_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
 from .indexer import IndexResult, index_folder, walk_folder
+from .reranker import make_reranker
 from .search import hybrid_search
 
 app = typer.Typer(
@@ -146,18 +147,25 @@ def search(
     alpha: float = typer.Option(
         None, "--alpha", help="0=keyword only, 1=vector only. Default uses config."
     ),
+    no_rerank: bool = typer.Option(
+        False, "--no-rerank", help="Skip cross-encoder reranking."
+    ),
 ) -> None:
     """Search the index from the command line."""
     cfg = load_config()
     conn, embedder = _open_state(cfg)
+    reranker = None if no_rerank else make_reranker(cfg)
     a = alpha if alpha is not None else cfg.hybrid_alpha
-    results = hybrid_search(conn, embedder, query, k=k, alpha=a)
+    results = hybrid_search(
+        conn, embedder, query, k=k, alpha=a,
+        reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
+    )
     if not results:
         console.print("[yellow]No matches.[/]")
         return
     for i, r in enumerate(results, 1):
-        sources = "+".join(r.sources)
-        console.rule(f"[bold]{i}.[/] {r.file_path}  [dim](chunk {r.chunk_index} | {sources} | {r.score:.4f})")
+        tag = "reranked" if r.reranked else "+".join(r.sources)
+        console.rule(f"[bold]{i}.[/] {r.file_path}  [dim](chunk {r.chunk_index} | {tag} | {r.score:.4f})")
         console.print(r.text if len(r.text) <= 1200 else r.text[:1200] + "...")
     conn.close()
 

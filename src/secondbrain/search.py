@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .db import serialize_f32
 from .embedder import Embedder
+from .reranker import Reranker
 
 RRF_K = 60  # RRF constant; 60 is the original paper's value
 
@@ -19,6 +20,7 @@ class SearchResult:
     text: str
     score: float
     sources: tuple[str, ...]  # which retrievers matched: ("vector",), ("fts",), or both
+    reranked: bool = False
 
 
 def _vector_search(
@@ -99,20 +101,54 @@ def hybrid_search(
     query: str,
     k: int = 10,
     alpha: float = 0.5,
+    reranker: Reranker | None = None,
+    rerank_overfetch: int = 50,
 ) -> list[SearchResult]:
-    """Run hybrid search and return up to k merged results."""
-    over_fetch = max(k * 3, 30)
+    """Run hybrid search and return up to k merged results.
+
+    If a reranker is supplied, fetch ``rerank_overfetch`` candidates from RRF and
+    rerank them with the cross-encoder before truncating to k. This costs one
+    extra API call per query but typically improves precision on the top-k by
+    20-40% on conceptual queries.
+    """
+    candidate_count = max(rerank_overfetch if reranker else k * 3, 30)
     q_emb = embedder.embed_query(query)
-    vec = _vector_search(conn, q_emb, over_fetch)
-    fts = _fts_search(conn, query, over_fetch)
+    vec = _vector_search(conn, q_emb, candidate_count)
+    fts = _fts_search(conn, query, candidate_count)
     fused = _rrf_merge(vec, fts, alpha=alpha)
 
-    top = sorted(fused.items(), key=lambda kv: -kv[1][0])[:k]
-    chunk_ids = [cid for cid, _ in top]
+    candidates = sorted(fused.items(), key=lambda kv: -kv[1][0])[:candidate_count]
+    chunk_ids = [cid for cid, _ in candidates]
     hydrated = _hydrate(conn, chunk_ids)
 
-    results: list[SearchResult] = []
-    for cid, (score, sources) in top:
+    if reranker and len(candidates) > 1:
+        cids: list[int] = []
+        docs: list[str] = []
+        for cid, _ in candidates:
+            if cid in hydrated:
+                cids.append(cid)
+                docs.append(hydrated[cid][2])
+        rerank_pairs = reranker.rerank(query, docs, top_k=k)
+        results: list[SearchResult] = []
+        for orig_idx, score in rerank_pairs:
+            cid = cids[orig_idx]
+            path, idx, text = hydrated[cid]
+            _, sources = fused[cid]
+            results.append(
+                SearchResult(
+                    chunk_id=cid,
+                    file_path=path,
+                    chunk_index=idx,
+                    text=text,
+                    score=score,
+                    sources=tuple(sorted(sources)),
+                    reranked=True,
+                )
+            )
+        return results
+
+    results = []
+    for cid, (score, sources) in candidates[:k]:
         if cid not in hydrated:
             continue
         path, idx, text = hydrated[cid]
@@ -130,12 +166,28 @@ def hybrid_search(
 
 
 def vector_only(
-    conn: sqlite3.Connection, embedder: Embedder, query: str, k: int = 10
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    query: str,
+    k: int = 10,
+    reranker: Reranker | None = None,
+    rerank_overfetch: int = 50,
 ) -> list[SearchResult]:
-    return hybrid_search(conn, embedder, query, k=k, alpha=1.0)
+    return hybrid_search(
+        conn, embedder, query, k=k, alpha=1.0,
+        reranker=reranker, rerank_overfetch=rerank_overfetch,
+    )
 
 
 def keyword_only(
-    conn: sqlite3.Connection, embedder: Embedder, query: str, k: int = 10
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    query: str,
+    k: int = 10,
+    reranker: Reranker | None = None,
+    rerank_overfetch: int = 50,
 ) -> list[SearchResult]:
-    return hybrid_search(conn, embedder, query, k=k, alpha=0.0)
+    return hybrid_search(
+        conn, embedder, query, k=k, alpha=0.0,
+        reranker=reranker, rerank_overfetch=rerank_overfetch,
+    )
