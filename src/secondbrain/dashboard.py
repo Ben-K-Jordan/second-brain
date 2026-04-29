@@ -40,103 +40,621 @@ log = logging.getLogger(__name__)
 # --- HTML rendering helpers (no Jinja dep — embedded templates as f-strings) ---
 
 CSS = """
+/*  ─── second-brain · 80s hacker theme ─────────────────────────────  */
 :root {
-    --bg: #0e0e10;
-    --surface: #16161a;
-    --surface-2: #1e1e24;
-    --border: #2a2a32;
-    --text: #e6e6ea;
-    --text-dim: #9090a0;
-    --accent: #4d9fff;
-    --accent-soft: #2c5fa0;
-    --good: #6ed46e;
-    --warn: #e6b86d;
-    --bad: #e66d6d;
-    --mono: 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --bg:           #0a0a0a;     /* near-black with phosphor warmth */
+    --bg-elevated:  #111111;
+    --bg-card:      #0e0e0e;
+    --bg-hover:     #161616;
+    --bg-input:     #050505;     /* deeper than bg for "inset terminal" */
+    --border:       #1f1f1f;
+    --border-strong:#2c2c2c;
+    --grid:         rgba(127,255,127,0.04);
+
+    --text:         #d4d4c8;     /* warm phosphor white */
+    --text-2:       #8a8a7a;
+    --text-3:       #555548;
+    --text-4:       #2e2e2a;
+
+    --green:        #7fff7f;     /* phosphor primary */
+    --green-dim:    #4abe4a;
+    --green-glow:   rgba(127,255,127,0.45);
+    --green-soft:   rgba(127,255,127,0.10);
+
+    --amber:        #ffb700;     /* warning / secondary accent */
+    --amber-glow:   rgba(255,183,0,0.40);
+
+    --cyan:         #5af0ff;
+    --magenta:      #ff5af0;
+    --red:          #ff4d4d;
+
+    --accent:       var(--green);
+    --accent-glow:  var(--green-glow);
+    --accent-soft:  var(--green-soft);
+
+    --good: #7fff7f;
+    --warn: #ffb700;
+    --bad:  #ff4d4d;
+
+    --mono: 'JetBrains Mono', 'Berkeley Mono', 'IBM Plex Mono', 'SF Mono',
+            'Cascadia Mono', Consolas, 'Courier New', monospace;
+    --sans: var(--mono);   /* committing to mono everywhere */
+
+    --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px;
+    --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 64px;
+
+    --r:   2px;   /* sharp, terminal edges */
+    --r-md: 3px;
+    --r-lg: 4px;
+
+    --shadow-glow: 0 0 24px rgba(127,255,127,0.10);
+    --shadow-pop:  0 0 0 1px var(--green-glow), 0 0 60px rgba(127,255,127,0.18), 0 14px 50px rgba(0,0,0,0.85);
+
+    --transition: 120ms steps(8, end);   /* steppy retro feel on color shifts */
+    --ease: 160ms cubic-bezier(.2,.8,.2,1);
 }
+
 * { box-sizing: border-box; }
+*::selection { background: var(--green); color: #000; }
+
 html, body {
-    margin: 0; padding: 0; background: var(--bg); color: var(--text);
-    font-family: var(--sans); font-size: 14.5px; line-height: 1.5;
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.55;
+    font-feature-settings: 'liga' 0, 'calt' 0;  /* disable code ligatures */
+    -webkit-font-smoothing: antialiased;
 }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
+
+/* Subtle dot-grid background — feels like terminal graph paper */
+body::before {
+    content: ""; position: fixed; inset: 0; z-index: -2;
+    background-image: radial-gradient(var(--grid) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-position: 0 0;
+    pointer-events: none;
+    opacity: 0.6;
+}
+/* Soft phosphor vignette */
+body::after {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background: radial-gradient(70% 50% at 50% -10%, rgba(127,255,127,0.05), transparent 60%),
+                radial-gradient(50% 40% at 100% 100%, rgba(255,183,0,0.025), transparent 70%);
+}
+
+a { color: var(--green); text-decoration: none; transition: color var(--ease); }
+a:hover { color: #b8ffb8; text-shadow: 0 0 8px var(--green-glow); }
+
+/* Sticky header */
 header {
-    border-bottom: 1px solid var(--border);
-    padding: 12px 24px;
-    display: flex; align-items: center; gap: 28px;
-    position: sticky; top: 0; background: var(--bg); z-index: 10;
+    border-bottom: 1px solid var(--border-strong);
+    padding: var(--s-3) var(--s-5);
+    display: flex; align-items: center; gap: var(--s-5);
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10,10,10,0.92);
+    backdrop-filter: blur(10px);
 }
-header .brand { font-weight: 700; letter-spacing: -0.01em; font-size: 16px; }
-header nav a { color: var(--text-dim); margin-right: 16px; }
-header nav a.active, header nav a:hover { color: var(--text); }
-main { padding: 24px; max-width: 1200px; margin: 0 auto; }
-h1, h2, h3 { font-weight: 600; letter-spacing: -0.01em; }
-h1 { font-size: 24px; margin: 0 0 16px; }
-h2 { font-size: 18px; margin: 24px 0 12px; }
-h3 { font-size: 15px; margin: 12px 0 6px; }
-.grid { display: grid; gap: 24px; grid-template-columns: 1fr 1fr; }
-@media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+header .brand {
+    font-weight: 700; font-size: 14px;
+    color: var(--green); text-shadow: 0 0 12px var(--green-glow);
+    letter-spacing: 0.02em;
+}
+header .brand::before { content: "▮ "; color: var(--green); animation: blink 1.4s steps(2) infinite; }
+header nav { display: flex; gap: 2px; }
+header nav a {
+    color: var(--text-2); padding: 6px 10px; font-size: 12.5px;
+    transition: all var(--ease); border: 1px solid transparent;
+    border-radius: var(--r);
+}
+header nav a:hover {
+    color: var(--green); background: var(--green-soft);
+    border-color: var(--border-strong);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+header nav a.active {
+    color: var(--green); background: var(--green-soft);
+    border-color: var(--green-dim);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+header .spacer { flex: 1; }
+header .kbd-hint {
+    display: inline-flex; align-items: center; gap: var(--s-2);
+    padding: 5px 10px; border-radius: var(--r);
+    background: var(--bg-input); border: 1px solid var(--border-strong);
+    color: var(--text-2); font-size: 11.5px;
+    cursor: pointer; transition: all var(--ease); font-family: var(--mono);
+}
+header .kbd-hint:hover {
+    color: var(--green); border-color: var(--green-dim);
+    box-shadow: inset 0 0 0 1px var(--green-soft), 0 0 12px var(--green-soft);
+}
+.kbd {
+    display: inline-block; padding: 1px 5px; border-radius: 2px;
+    background: #000; border: 1px solid var(--border-strong);
+    font-family: var(--mono); font-size: 10.5px; color: var(--green);
+    box-shadow: inset 0 -2px 0 #000, 0 0 4px var(--green-soft);
+}
+
+main { padding: var(--s-6) var(--s-5); max-width: 1280px; margin: 0 auto; }
+
+h1, h2, h3, h4 { font-weight: 700; color: var(--text); letter-spacing: 0; }
+h1 {
+    font-size: 22px; margin: 0 0 var(--s-5); color: var(--green);
+    text-shadow: 0 0 14px var(--green-glow);
+}
+h1::before { content: "$ "; color: var(--green-dim); }
+h2 {
+    font-size: 14px; margin: var(--s-6) 0 var(--s-3);
+    color: var(--text); text-transform: uppercase; letter-spacing: 0.04em;
+}
+h2::before { content: "// "; color: var(--text-3); }
+h3 { font-size: 13px; margin: var(--s-3) 0 var(--s-2); color: var(--green-dim); }
+
+.grid {
+    display: grid; gap: var(--s-4);
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+
+/* Cards as terminal "boxes" */
 .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r); padding: var(--s-5);
+    transition: border-color var(--ease), box-shadow var(--ease);
+    position: relative;
+}
+.card:hover {
+    border-color: var(--green-dim);
+    box-shadow: inset 0 0 0 1px var(--green-soft), 0 0 20px rgba(127,255,127,0.06);
 }
 .card h2 { margin-top: 0; }
-.stat { display: flex; justify-content: space-between; padding: 4px 0; }
-.stat .k { color: var(--text-dim); }
-.stat .v { font-family: var(--mono); }
-.muted { color: var(--text-dim); }
-.path { font-family: var(--mono); font-size: 12.5px; color: var(--text-dim); word-break: break-all; }
-.label { display: inline-block; padding: 1px 6px; border-radius: 3px;
-    font-size: 11px; background: var(--accent-soft); color: var(--text);
-    font-family: var(--mono); margin-right: 4px; }
-.label.PERSON { background: #4d6dff; }
-.label.ORG    { background: #ff8c4d; }
-.label.GPE, .label.LOC, .label.FAC { background: #4dff8c; color: #062b15; }
-.label.PRODUCT, .label.WORK_OF_ART { background: #c44dff; }
-.label.DATE { background: #4dffe6; color: #06292c; }
-.label.MONEY { background: #ffe14d; color: #2c2806; }
-.label.LAW, .label.NORP, .label.LANGUAGE, .label.EVENT { background: #ff4d6d; }
+.card h2:first-child::before { content: "[ "; color: var(--green-dim); }
+.card h2:first-child::after  { content: " ]"; color: var(--green-dim); }
+
+.stat {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: var(--s-2) 0; border-bottom: 1px dashed var(--border-strong);
+    gap: var(--s-3); min-height: 30px;
+}
+.stat:last-child { border-bottom: none; }
+.stat .k {
+    color: var(--text-2); font-size: 12px;
+    font-family: var(--mono);
+}
+.stat .k::before { content: "› "; color: var(--text-3); }
+.stat .v {
+    font-family: var(--mono); font-size: 12.5px;
+    color: var(--green); text-align: right;
+}
+.muted { color: var(--text-3); }
+.path {
+    font-family: var(--mono); font-size: 11.5px;
+    color: var(--text-2); word-break: break-all;
+}
+
+/* Entity labels — phosphor variants per type */
+.label {
+    display: inline-block; padding: 2px 6px; border-radius: 2px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+    font-family: var(--mono); margin-right: var(--s-1);
+    text-transform: uppercase;
+    border: 1px solid;
+}
+.label.PERSON      { color: var(--green);   border-color: var(--green-dim);  background: rgba(127,255,127,0.06); }
+.label.ORG         { color: var(--amber);   border-color: rgba(255,183,0,0.4); background: rgba(255,183,0,0.06); }
+.label.GPE,
+.label.LOC,
+.label.FAC         { color: var(--cyan);    border-color: rgba(90,240,255,0.4); background: rgba(90,240,255,0.06); }
+.label.PRODUCT,
+.label.WORK_OF_ART { color: var(--magenta); border-color: rgba(255,90,240,0.4); background: rgba(255,90,240,0.06); }
+.label.DATE        { color: #b8ffb8; border-color: rgba(184,255,184,0.4); background: rgba(184,255,184,0.05); }
+.label.MONEY       { color: var(--amber); border-color: rgba(255,183,0,0.6); background: rgba(255,183,0,0.10); }
+.label.LAW,
+.label.NORP,
+.label.LANGUAGE,
+.label.EVENT       { color: var(--red); border-color: rgba(255,77,77,0.4); background: rgba(255,77,77,0.06); }
+
+/* Inputs — terminal prompt style */
+.search-box { position: relative; }
+.search-box::before {
+    content: ">"; position: absolute; left: 14px; top: 50%;
+    transform: translateY(-50%); color: var(--green); font-family: var(--mono);
+    font-weight: 700; pointer-events: none;
+}
 .search-box input, .ingest-box input {
-    width: 100%; padding: 10px 12px; font-size: 15px;
-    background: var(--surface-2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px;
-    font-family: var(--sans);
+    width: 100%; padding: 12px 14px 12px 32px; font-size: 14px;
+    background: var(--bg-input); color: var(--green);
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    font-family: var(--mono); caret-color: var(--green);
+    transition: all var(--ease);
 }
-.search-box input:focus, .ingest-box input:focus {
-    outline: none; border-color: var(--accent);
+.ingest-box input { padding-left: 14px; }
+.search-box input:focus, .ingest-box input:focus,
+.filters input:focus, .filters select:focus {
+    outline: none; border-color: var(--green);
+    box-shadow: 0 0 0 1px var(--green-glow), 0 0 14px var(--green-soft);
+    background: #000;
 }
-.filters { display: flex; gap: 8px; margin: 8px 0 16px; flex-wrap: wrap; }
+.filters {
+    display: flex; gap: var(--s-2); margin: var(--s-2) 0 var(--s-5);
+    flex-wrap: wrap; align-items: center;
+}
 .filters input, .filters select {
-    padding: 6px 8px; font-size: 13px;
-    background: var(--surface-2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 10px; font-size: 12px;
+    background: var(--bg-input); color: var(--green);
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    font-family: var(--mono); transition: all var(--ease);
 }
+.filters label { color: var(--text-3); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* Buttons — terminal call-to-action */
 button {
-    padding: 8px 14px; background: var(--accent); color: white;
-    border: none; border-radius: 6px; font-size: 14px; cursor: pointer;
-    font-family: var(--sans);
+    padding: 7px 14px; background: var(--bg-card); color: var(--green);
+    border: 1px solid var(--green-dim); border-radius: var(--r);
+    font-size: 12px; font-weight: 700; letter-spacing: 0.04em;
+    cursor: pointer; font-family: var(--mono);
+    text-transform: uppercase;
+    transition: all var(--ease);
 }
-button:hover { background: #3d8fef; }
-button.ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
-button.ghost:hover { background: var(--surface-2); color: var(--text); }
+button:hover {
+    background: var(--green-soft); color: var(--green);
+    box-shadow: 0 0 14px var(--green-soft), inset 0 0 0 1px var(--green-glow);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+button:active { transform: translateY(1px); }
+button.ghost {
+    background: transparent; color: var(--text-2);
+    border-color: var(--border-strong);
+}
+button.ghost:hover {
+    background: var(--bg-hover); color: var(--text); border-color: var(--green-dim);
+    box-shadow: none; text-shadow: none;
+}
+
+/* Search results — output blocks */
 .result {
-    border-top: 1px solid var(--border); padding: 12px 0; margin: 0;
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    padding: var(--s-4); margin-bottom: var(--s-3);
+    background: var(--bg-card);
+    transition: border-color var(--ease);
+    position: relative;
 }
-.result h3 { margin: 0 0 4px; font-weight: 500; font-size: 13.5px; }
-.result .snippet { white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px;
-    color: var(--text); background: var(--surface-2); padding: 10px;
-    border-radius: 4px; max-height: 280px; overflow: auto; }
-.result .meta { color: var(--text-dim); font-size: 12px; margin: 4px 0; }
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
-th { color: var(--text-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; }
-td.num { font-family: var(--mono); text-align: right; color: var(--text-dim); }
-.empty { padding: 40px 20px; text-align: center; color: var(--text-dim); }
+.result::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+    width: 2px; background: var(--green-dim);
+    transition: background var(--ease);
+}
+.result:hover {
+    border-color: var(--green-dim);
+}
+.result:hover::before { background: var(--green); }
+.result h3 {
+    margin: 0 0 var(--s-1); font-weight: 600; font-size: 12.5px;
+    color: var(--text); text-transform: none;
+}
+.result h3::before { content: ""; }
+.result h3 a { color: var(--green-dim); }
+.result h3 a:hover { color: var(--green); text-shadow: 0 0 6px var(--green-glow); }
+.result .snippet {
+    white-space: pre-wrap; font-family: var(--mono); font-size: 11.5px;
+    color: var(--text); background: #000;
+    padding: var(--s-3); border-radius: var(--r);
+    border: 1px solid var(--border);
+    max-height: 280px; overflow: auto;
+    line-height: 1.65;
+}
+.result .meta {
+    color: var(--amber); font-size: 11px; margin: var(--s-1) 0 var(--s-2);
+    font-family: var(--mono); letter-spacing: 0.02em;
+}
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); }
+th, td {
+    padding: var(--s-2) var(--s-3); text-align: left;
+    border-bottom: 1px dashed var(--border-strong);
+    font-size: 12px;
+}
+th {
+    color: var(--green-dim); font-weight: 700; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    border-bottom-style: solid;
+}
+tr:hover td { background: var(--green-soft); color: var(--green); }
+td.num { font-family: var(--mono); text-align: right; color: var(--amber); }
+
+.empty {
+    padding: var(--s-7) var(--s-5); text-align: center;
+    color: var(--text-3); font-size: 13px; font-family: var(--mono);
+}
+.empty::before { content: "// "; color: var(--text-4); }
 .warn { color: var(--warn); }
-#cy { width: 100%; height: 80vh; background: var(--surface); border-radius: 8px;
-    border: 1px solid var(--border); }
+.good { color: var(--good); }
+.bad  { color: var(--bad); }
+
+/* Graph canvas */
+#cy {
+    width: 100%; height: 78vh;
+    background: #050505;
+    border-radius: var(--r);
+    border: 1px solid var(--border-strong);
+    box-shadow: inset 0 0 60px rgba(127,255,127,0.04);
+}
+.graph-overlay {
+    position: absolute; top: var(--s-3); right: var(--s-3);
+    background: rgba(10,10,10,0.94); backdrop-filter: blur(8px);
+    border: 1px solid var(--green-dim); border-radius: var(--r);
+    padding: var(--s-3); font-size: 11.5px; max-width: 220px;
+    box-shadow: var(--shadow-glow);
+    font-family: var(--mono);
+}
+.graph-overlay h4 {
+    margin: 0 0 var(--s-2); font-size: 10.5px; color: var(--green);
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+.graph-overlay h4::before { content: "▸ "; }
+.graph-overlay .legend-row {
+    display: flex; align-items: center; gap: var(--s-2);
+    padding: 3px 0; cursor: pointer; user-select: none;
+    transition: opacity var(--ease);
+    color: var(--text-2);
+}
+.graph-overlay .legend-row:hover { color: var(--green); }
+.graph-overlay .legend-row.disabled { opacity: 0.30; }
+.graph-overlay .swatch {
+    width: 10px; height: 10px; border-radius: 1px;
+    box-shadow: 0 0 6px currentColor;
+}
+.graph-wrap { position: relative; }
+
+/* Command palette */
+#palette-backdrop {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.7);
+    backdrop-filter: blur(6px);
+    display: none; align-items: flex-start; justify-content: center;
+    padding-top: 12vh;
+    animation: fadeIn 120ms ease-out;
+}
+#palette-backdrop.open { display: flex; }
+#palette {
+    width: min(640px, 92vw); max-height: 70vh;
+    background: var(--bg-elevated);
+    border: 1px solid var(--green-dim); border-radius: var(--r);
+    box-shadow: var(--shadow-pop);
+    display: flex; flex-direction: column; overflow: hidden;
+    animation: popIn 180ms cubic-bezier(.2,.8,.2,1);
+    font-family: var(--mono);
+}
+#palette-input {
+    width: 100%; padding: var(--s-4) var(--s-5);
+    border: none; border-bottom: 1px solid var(--border-strong);
+    background: transparent; color: var(--green);
+    font-family: var(--mono); font-size: 15px;
+    caret-color: var(--green);
+}
+#palette-input::placeholder { color: var(--text-3); }
+#palette-input:focus { outline: none; }
+#palette-results { overflow-y: auto; padding: var(--s-2) 0; }
+#palette-results .group-title {
+    padding: var(--s-2) var(--s-5) var(--s-1);
+    color: var(--green-dim); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em;
+}
+#palette-results .group-title::before { content: "── "; }
+#palette-results .item {
+    display: flex; align-items: center; gap: var(--s-3);
+    padding: var(--s-2) var(--s-5); cursor: pointer;
+    color: var(--text); font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: background var(--ease), color var(--ease);
+}
+#palette-results .item.selected {
+    background: var(--green-soft); color: var(--green);
+    border-left-color: var(--green);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+#palette-results .item .icon {
+    color: var(--green-dim); font-family: var(--mono); font-size: 12px;
+    width: 24px; text-align: center;
+}
+#palette-results .item.selected .icon { color: var(--green); }
+#palette-results .item .item-meta {
+    color: var(--amber); font-size: 10.5px; margin-left: auto;
+    font-family: var(--mono);
+}
+#palette-footer {
+    padding: var(--s-2) var(--s-5); border-top: 1px solid var(--border-strong);
+    color: var(--text-3); font-size: 10.5px;
+    display: flex; gap: var(--s-4); align-items: center; font-family: var(--mono);
+}
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes popIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Briefing renders nicer */
+.briefing-body h1 { font-size: 20px; }
+.briefing-body h2 {
+    font-size: 13px; margin-top: var(--s-5);
+    color: var(--green); font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.04em;
+}
+.briefing-body p { color: var(--text); }
+.briefing-body ul { padding-left: var(--s-5); }
+.briefing-body li { color: var(--text); margin: var(--s-1) 0; }
+"""
+
+
+PALETTE_JS = r"""
+(function() {
+    const backdrop = document.getElementById('palette-backdrop');
+    const input    = document.getElementById('palette-input');
+    const results  = document.getElementById('palette-results');
+    const opener   = document.getElementById('open-palette');
+
+    let items = [];        // flat list of selectable items (in order)
+    let selectedIdx = 0;
+    let abortCtrl = null;
+
+    const STATIC_PAGES = [
+        {kind: 'page', icon: '⌂', label: 'Overview',  href: '/',          meta: ''},
+        {kind: 'page', icon: '⌕', label: 'Search',    href: '/search',    meta: ''},
+        {kind: 'page', icon: '◊', label: 'Graph',     href: '/graph',     meta: ''},
+        {kind: 'page', icon: '※', label: 'Entities',  href: '/entities',  meta: ''},
+        {kind: 'page', icon: '⊟', label: 'Folders',   href: '/folders',   meta: ''},
+        {kind: 'page', icon: '☼', label: 'Briefing',  href: '/briefing',  meta: ''},
+        {kind: 'page', icon: '+',  label: 'Ingest URL',href: '/ingest',   meta: ''},
+    ];
+
+    function open() {
+        backdrop.classList.add('open');
+        input.value = '';
+        input.focus();
+        renderResults('');
+    }
+    function close() {
+        backdrop.classList.remove('open');
+    }
+    function isOpen() { return backdrop.classList.contains('open'); }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => (
+            {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+        ));
+    }
+
+    function fuzzy(q, s) {
+        // tiny fuzzy: lowercased substring match. Good enough for nav + small lists.
+        if (!q) return true;
+        return s.toLowerCase().includes(q.toLowerCase());
+    }
+
+    function renderResults(query) {
+        const q = query.trim();
+        const groups = [];
+        items = [];
+
+        // Pages first (always shown, filtered by query)
+        const pages = STATIC_PAGES.filter(p => fuzzy(q, p.label));
+        if (pages.length) {
+            groups.push({title: 'Pages', items: pages});
+            for (const p of pages) items.push({...p, action: () => location.href = p.href});
+        }
+
+        // Search action — always present if there's a query
+        if (q.length >= 2) {
+            const sa = {kind: 'search', icon: '⌕',
+                        label: 'Search the brain for "' + q + '"',
+                        href: '/search?q=' + encodeURIComponent(q),
+                        meta: 'enter'};
+            groups.push({title: 'Action', items: [sa]});
+            items.push({...sa, action: () => location.href = sa.href});
+        }
+
+        renderGroups(groups);
+
+        // Server-side: entities + files (only when query is non-trivial)
+        if (q.length >= 2) {
+            if (abortCtrl) abortCtrl.abort();
+            abortCtrl = new AbortController();
+            fetch('/api/palette?q=' + encodeURIComponent(q), {signal: abortCtrl.signal})
+                .then(r => r.json())
+                .then(data => {
+                    if (q !== input.value.trim()) return; // stale response
+                    if (data.entities && data.entities.length) {
+                        groups.push({title: 'Entities', items: data.entities});
+                        for (const e of data.entities) items.push({...e, action: () => location.href = e.href});
+                    }
+                    if (data.files && data.files.length) {
+                        groups.push({title: 'Files', items: data.files});
+                        for (const f of data.files) items.push({...f, action: () => location.href = f.href});
+                    }
+                    renderGroups(groups);
+                })
+                .catch(() => { /* aborted */ });
+        }
+    }
+
+    function renderGroups(groups) {
+        let html = '';
+        let idx = 0;
+        for (const g of groups) {
+            html += '<div class="group-title">' + escapeHtml(g.title) + '</div>';
+            for (const it of g.items) {
+                const cls = idx === selectedIdx ? 'item selected' : 'item';
+                html += '<div class="' + cls + '" data-idx="' + idx + '">'
+                     + '<span class="icon">' + (it.icon || '·') + '</span>'
+                     + '<span>' + escapeHtml(it.label) + '</span>'
+                     + (it.meta ? '<span class="item-meta">' + escapeHtml(it.meta) + '</span>' : '')
+                     + '</div>';
+                idx++;
+            }
+        }
+        if (idx === 0) html = '<div class="empty">No results.</div>';
+        results.innerHTML = html;
+
+        results.querySelectorAll('.item').forEach(el => {
+            el.addEventListener('click', () => {
+                const i = parseInt(el.dataset.idx, 10);
+                if (items[i] && items[i].action) items[i].action();
+            });
+            el.addEventListener('mouseenter', () => {
+                selectedIdx = parseInt(el.dataset.idx, 10);
+                results.querySelectorAll('.item').forEach((e2, j) => {
+                    e2.classList.toggle('selected', j === selectedIdx);
+                });
+            });
+        });
+    }
+
+    document.addEventListener('keydown', (e) => {
+        const cmdK = (e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey);
+        if (cmdK) { e.preventDefault(); open(); return; }
+
+        if (!isOpen()) {
+            // Page-level shortcut: '/' focuses search if not in an input
+            if (e.key === '/' && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) {
+                e.preventDefault(); open();
+            }
+            return;
+        }
+
+        if (e.key === 'Escape') { close(); return; }
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            selectedIdx = Math.min(items.length - 1, selectedIdx + 1);
+            updateSelection();
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            selectedIdx = Math.max(0, selectedIdx - 1);
+            updateSelection();
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (items[selectedIdx] && items[selectedIdx].action) items[selectedIdx].action();
+        }
+    });
+
+    function updateSelection() {
+        results.querySelectorAll('.item').forEach((el, i) => {
+            el.classList.toggle('selected', i === selectedIdx);
+            if (i === selectedIdx) el.scrollIntoView({block: 'nearest'});
+        });
+    }
+
+    input.addEventListener('input', () => {
+        selectedIdx = 0;
+        renderResults(input.value);
+    });
+
+    backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) close();
+    });
+
+    if (opener) opener.addEventListener('click', open);
+})();
 """
 
 
@@ -150,7 +668,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Briefing", "/briefing"),
         ("Ingest", "/ingest"),
     ]
-    nav = " ".join(
+    nav = "".join(
         f'<a href="{href}" class="{"active" if href.split("/")[1] == active else ""}">{escape(name)}</a>'
         for name, href in nav_items
     )
@@ -167,8 +685,26 @@ def _layout(title: str, body: str, active: str = "") -> str:
     <header>
         <div class="brand">second-brain</div>
         <nav>{nav}</nav>
+        <div class="spacer"></div>
+        <button class="kbd-hint" id="open-palette" title="Open command palette">
+            <span>Search</span> <span class="kbd">⌘K</span>
+        </button>
     </header>
     <main>{body}</main>
+
+    <!-- Command palette -->
+    <div id="palette-backdrop">
+        <div id="palette" role="dialog" aria-modal="true">
+            <input id="palette-input" placeholder="Search entities, files, pages…" autocomplete="off" spellcheck="false">
+            <div id="palette-results"></div>
+            <div id="palette-footer">
+                <span><span class="kbd">↑↓</span> navigate</span>
+                <span><span class="kbd">↵</span> open</span>
+                <span><span class="kbd">esc</span> close</span>
+            </div>
+        </div>
+    </div>
+    <script>{PALETTE_JS}</script>
 </body>
 </html>
 """
@@ -519,16 +1055,30 @@ def create_app():
         body = f"""
 <h1>Knowledge graph</h1>
 <form method="get" action="/graph" class="filters">
-    <label class="muted">Top entities:</label>
-    <input type="number" name="top_n" value="{top_n}" min="20" max="500" style="width: 90px;">
-    <label class="muted">Min co-occurrences:</label>
-    <input type="number" name="min_cooccur" value="{min_cooccur}" min="1" max="20" style="width: 70px;">
+    <label>Top entities</label>
+    <input type="number" name="top_n" value="{top_n}" min="20" max="500" style="width: 80px;">
+    <label>Min co-occurrences</label>
+    <input type="number" name="min_cooccur" value="{min_cooccur}" min="1" max="20" style="width: 60px;">
     <button type="submit">Reload</button>
-    <span class="muted">Click any node to drill into its entity page. Drag nodes to reposition. Scroll to zoom.</span>
+    <span class="muted">Hover to highlight neighbors · Click to open entity · Drag · Scroll to zoom</span>
 </form>
-<div id="cy"></div>
+<div class="graph-wrap">
+    <div id="cy"></div>
+    <div class="graph-overlay" id="legend">
+        <h4>Filter by label</h4>
+        <div id="legend-rows"></div>
+    </div>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
 <script>
+const LABEL_COLORS = {{
+    PERSON: '#7fff7f', ORG: '#ffb700',
+    GPE: '#5af0ff', LOC: '#5af0ff', FAC: '#5af0ff',
+    PRODUCT: '#ff5af0', WORK_OF_ART: '#ff5af0',
+    DATE: '#b8ffb8', MONEY: '#ffd566',
+    EVENT: '#ff4d4d', LAW: '#ff4d4d', NORP: '#ff4d4d', LANGUAGE: '#ff4d4d',
+}};
+
 fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json()).then(data => {{
     const cy = cytoscape({{
         container: document.getElementById('cy'),
@@ -537,49 +1087,111 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             {{ selector: 'node', style: {{
                 'background-color': 'data(color)',
                 'label': 'data(label)',
-                'color': '#e6e6ea',
+                'color': '#d4d4c8',
                 'font-size': 11,
-                'font-family': '-apple-system, "Segoe UI", sans-serif',
+                'font-weight': 600,
+                'font-family': "'JetBrains Mono', 'SF Mono', 'Consolas', monospace",
                 'width': 'data(size)',
                 'height': 'data(size)',
-                'text-outline-color': '#0e0e10',
-                'text-outline-width': 2,
-                'text-margin-y': -4,
+                'text-outline-color': '#050505',
+                'text-outline-width': 3,
+                'text-margin-y': -3,
+                'border-width': 0,
+                'transition-property': 'opacity, border-width, background-color',
+                'transition-duration': '180ms',
+                'transition-timing-function': 'ease',
             }} }},
             {{ selector: 'edge', style: {{
                 'width': 'data(weight)',
-                'line-color': '#3a3a45',
+                'line-color': '#2a2a2a',
                 'curve-style': 'haystack',
                 'opacity': 0.55,
+                'transition-property': 'opacity, line-color, width',
+                'transition-duration': '180ms',
+                'transition-timing-function': 'ease',
             }} }},
-            {{ selector: 'node:selected', style: {{
-                'border-width': 3,
-                'border-color': '#4d9fff',
+            {{ selector: '.dim',  style: {{ 'opacity': 0.06 }} }},
+            {{ selector: '.neighbor', style: {{
+                'opacity': 1.0,
+                'border-width': 2.5,
+                'border-color': '#7fff7f',
+            }} }},
+            {{ selector: 'edge.neighbor', style: {{
+                'opacity': 0.95,
+                'line-color': '#7fff7f',
+            }} }},
+            {{ selector: '.focus', style: {{
+                'border-width': 3.5,
+                'border-color': '#b8ffb8',
             }} }},
         ],
         layout: {{
             name: 'cose',
-            idealEdgeLength: 90,
-            nodeOverlap: 20,
+            idealEdgeLength: 110,
+            nodeOverlap: 25,
             refresh: 20,
             fit: true,
-            padding: 30,
+            padding: 50,
             randomize: true,
-            componentSpacing: 100,
-            nodeRepulsion: 400000,
-            edgeElasticity: 100,
-            nestingFactor: 5,
-            gravity: 80,
-            numIter: 1000,
-            initialTemp: 200,
-            coolingFactor: 0.95,
+            componentSpacing: 120,
+            nodeRepulsion: 500000,
+            edgeElasticity: 90,
+            gravity: 70,
+            numIter: 1200,
+            initialTemp: 220,
+            coolingFactor: 0.96,
             minTemp: 1.0,
+            animate: false,
         }},
-        wheelSensitivity: 0.2,
+        wheelSensitivity: 0.18,
+        minZoom: 0.15, maxZoom: 4,
     }});
+
+    // Hover-highlight: dim non-neighbors, color neighbor edges
+    cy.on('mouseover', 'node', (evt) => {{
+        const node = evt.target;
+        const neighbors = node.closedNeighborhood();
+        cy.elements().addClass('dim');
+        neighbors.removeClass('dim').addClass('neighbor');
+        node.removeClass('neighbor').addClass('focus');
+    }});
+    cy.on('mouseout', 'node', () => {{
+        cy.elements().removeClass('dim neighbor focus');
+    }});
+
     cy.on('tap', 'node', (evt) => {{
         const name = evt.target.data('raw_text');
         window.location.href = '/entity?name=' + encodeURIComponent(name);
+    }});
+
+    // Build legend with toggleable label filters
+    const presentLabels = new Set();
+    cy.nodes().forEach(n => presentLabels.add(n.data('ent_label')));
+    const legend = document.getElementById('legend-rows');
+    const labelOrder = ['PERSON','ORG','GPE','LOC','FAC','PRODUCT','WORK_OF_ART','DATE','MONEY','EVENT','LAW','NORP','LANGUAGE'];
+    const sorted = labelOrder.filter(l => presentLabels.has(l));
+    const hidden = new Set();
+    function rerender() {{
+        cy.batch(() => {{
+            cy.nodes().forEach(n => {{
+                const lab = n.data('ent_label');
+                n.style('display', hidden.has(lab) ? 'none' : 'element');
+            }});
+        }});
+    }}
+    legend.innerHTML = sorted.map(lab =>
+        `<div class="legend-row" data-label="${{lab}}">
+            <div class="swatch" style="background:${{LABEL_COLORS[lab] || '#888'}}"></div>
+            <span>${{lab}}</span>
+        </div>`
+    ).join('');
+    legend.querySelectorAll('.legend-row').forEach(row => {{
+        row.addEventListener('click', () => {{
+            const lab = row.dataset.label;
+            if (hidden.has(lab)) {{ hidden.delete(lab); row.classList.remove('disabled'); }}
+            else                 {{ hidden.add(lab); row.classList.add('disabled'); }}
+            rerender();
+        }});
     }});
 }});
 </script>"""
@@ -616,19 +1228,19 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         ).fetchall()
 
         label_color = {
-            "PERSON": "#4d6dff",
-            "ORG": "#ff8c4d",
-            "GPE": "#4dff8c",
-            "LOC": "#4dff8c",
-            "FAC": "#4dff8c",
-            "PRODUCT": "#c44dff",
-            "WORK_OF_ART": "#c44dff",
-            "DATE": "#4dffe6",
-            "MONEY": "#ffe14d",
-            "EVENT": "#ff4d6d",
-            "LAW": "#ff4d6d",
-            "NORP": "#ff4d6d",
-            "LANGUAGE": "#ff4d6d",
+            "PERSON": "#7fff7f",
+            "ORG": "#ffb700",
+            "GPE": "#5af0ff",
+            "LOC": "#5af0ff",
+            "FAC": "#5af0ff",
+            "PRODUCT": "#ff5af0",
+            "WORK_OF_ART": "#ff5af0",
+            "DATE": "#b8ffb8",
+            "MONEY": "#ffd566",
+            "EVENT": "#ff4d4d",
+            "LAW": "#ff4d4d",
+            "NORP": "#ff4d4d",
+            "LANGUAGE": "#ff4d4d",
         }
         max_n = max((r["n"] for r in ent_rows), default=1)
         # Drop nodes with no edges - they show up as orphans and clutter the layout.
@@ -774,6 +1386,49 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    @app.get("/api/palette")
+    def api_palette(q: str = ""):
+        """Mixed search for the command palette: entities + files matching q."""
+        cfg, conn, _, _ = get_state()
+        q = q.strip()
+        if len(q) < 2:
+            return {"entities": [], "files": []}
+
+        # Entities — case-insensitive substring on text_lower; rank by chunk count.
+        ent_rows = conn.execute(
+            "SELECT text, label, COUNT(DISTINCT chunk_id) AS n "
+            "FROM entities WHERE text_lower LIKE ? "
+            "GROUP BY text_lower, label ORDER BY n DESC LIMIT 8",
+            (f"%{q.lower()}%",),
+        ).fetchall()
+        entities = [
+            {
+                "icon": "※",
+                "label": r["text"],
+                "href": f"/entity?name={urllib.parse.quote_plus(r['text'])}",
+                "meta": f"{r['label']} · {r['n']}",
+            }
+            for r in ent_rows
+        ]
+
+        # Files — match by filename (last path segment) for now.
+        file_rows = conn.execute(
+            "SELECT path, kind FROM files "
+            "WHERE LOWER(path) LIKE ? ORDER BY mtime DESC LIMIT 8",
+            (f"%{q.lower()}%",),
+        ).fetchall()
+        files = [
+            {
+                "icon": "▣" if r["kind"] == "url" else "□",
+                "label": Path(r["path"]).name or r["path"],
+                "href": f"/file?path={urllib.parse.quote_plus(r['path'])}",
+                "meta": r["kind"],
+            }
+            for r in file_rows
+        ]
+
+        return {"entities": entities, "files": files}
 
     return app
 
