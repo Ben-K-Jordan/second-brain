@@ -273,6 +273,7 @@ def index_file(
     the image is also embedded via the multimodal model (if enabled) into a
     side table for semantic image search.
     """
+    log.info("indexing %s", path)
     ok, reason = should_index(
         path, cfg,
         transcriber=transcriber, ocr_engine=ocr_engine, image_embedder=image_embedder,
