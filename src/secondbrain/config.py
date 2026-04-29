@@ -125,9 +125,15 @@ class Config:
 
     # Search
     hybrid_alpha: float = 0.5  # weight: 0=keyword only, 1=vector only
+    adaptive_alpha: bool = True  # auto-tune alpha per query (proper nouns -> BM25, prose -> vector)
     rerank_enabled: bool = True
     rerank_model: str = "rerank-2-lite"
     rerank_overfetch: int = 50  # how many candidates to fetch before reranking down to k
+
+    # Time-decay scoring: gently boost recently-modified files. Half-life is in days.
+    time_decay_enabled: bool = True
+    time_decay_weight: float = 0.1  # 0=ignore time, 1=time only
+    time_decay_half_life_days: float = 365.0
 
     # Media transcription (audio/video -> text via faster-whisper)
     transcribe_enabled: bool = True
@@ -188,6 +194,17 @@ rerank_enabled = true
 rerank_model = "rerank-2-lite"
 rerank_overfetch = 50
 
+# Adaptive alpha: per-query tuning of vector vs keyword weight. Proper-noun-
+# heavy queries get more BM25; conceptual prose gets more vector.
+adaptive_alpha = true
+
+# Time-decay scoring: gently boost recently-modified files in ranking. With a
+# half-life of 365 days, a year-old file gets ~50% of the recency bonus a
+# brand-new file gets. Set time_decay_weight to 0 to disable entirely.
+time_decay_enabled = true
+time_decay_weight = 0.1
+time_decay_half_life_days = 365.0
+
 # Media transcription. When enabled, audio and video files are transcribed
 # locally via faster-whisper and the transcript flows into the regular index.
 # Requires the [whisper] extra: pip install -e .[whisper]
@@ -233,6 +250,14 @@ def load_config(path: Path | None = None) -> Config:
             cfg.rerank_model = data["rerank_model"]
         if "rerank_overfetch" in data:
             cfg.rerank_overfetch = int(data["rerank_overfetch"])
+        if "adaptive_alpha" in data:
+            cfg.adaptive_alpha = bool(data["adaptive_alpha"])
+        if "time_decay_enabled" in data:
+            cfg.time_decay_enabled = bool(data["time_decay_enabled"])
+        if "time_decay_weight" in data:
+            cfg.time_decay_weight = float(data["time_decay_weight"])
+        if "time_decay_half_life_days" in data:
+            cfg.time_decay_half_life_days = float(data["time_decay_half_life_days"])
         if "transcribe_enabled" in data:
             cfg.transcribe_enabled = bool(data["transcribe_enabled"])
         if "whisper_model_size" in data:

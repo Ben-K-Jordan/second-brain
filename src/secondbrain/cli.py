@@ -192,9 +192,14 @@ def search(
     conn, embedder = _open_state(cfg)
     reranker = None if no_rerank else make_reranker(cfg)
     a = alpha if alpha is not None else cfg.hybrid_alpha
+    # If the user pinned alpha explicitly via --alpha, skip adaptive override.
+    use_adaptive = cfg.adaptive_alpha and alpha is None
     results = hybrid_search(
         conn, embedder, query, k=k, alpha=a,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
+        use_adaptive_alpha=use_adaptive,
+        time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
+        time_decay_half_life_days=cfg.time_decay_half_life_days,
     )
     if not results:
         console.print("[yellow]No matches.[/]")

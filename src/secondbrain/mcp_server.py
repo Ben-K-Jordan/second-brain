@@ -53,13 +53,18 @@ def _format_results(results, header: str) -> str:
 def search_brain(query: str, k: int = 10) -> str:
     """Hybrid search across your indexed files (vector + keyword, fused, then reranked).
 
-    Returns matched text chunks with file paths so you can cite or open them.
+    Applies query-adaptive alpha (push toward BM25 for proper-noun queries,
+    toward vector for prose) and a gentle recency boost. Returns matched
+    text chunks with file paths so you can cite or open them.
     Best for most questions.
     """
     cfg, conn, embedder, reranker = _get_state()
     results = hybrid_search(
         conn, embedder, query, k=k, alpha=cfg.hybrid_alpha,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
+        use_adaptive_alpha=cfg.adaptive_alpha,
+        time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
+        time_decay_half_life_days=cfg.time_decay_half_life_days,
     )
     return _format_results(results, f"# Hybrid search: {query!r}")
 
