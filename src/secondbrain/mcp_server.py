@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -34,6 +35,34 @@ def _get_state():
         _conn = connect(_cfg.db_path)
         init_schema(_conn, _embedder.dim, _embedder.name)
     return _cfg, _conn, _embedder, _reranker
+
+
+def _matching_entity_keys(conn, query: str, fuzzy: bool) -> list[str]:
+    """Return entity text_lower values that match the query.
+
+    With ``fuzzy=False``, returns only the exact lowercase match. With
+    ``fuzzy=True``, also matches whole-word substrings in either direction
+    so 'Rowling' finds 'J.K. Rowling' and vice versa. This is the lightweight
+    end of canonicalisation - it doesn't merge entities in the DB, just
+    treats them as siblings at query time.
+    """
+    q_lower = " ".join(query.lower().split()).strip()
+    if not q_lower:
+        return []
+    if not fuzzy:
+        return [q_lower]
+    pattern = re.compile(r"\b" + re.escape(q_lower) + r"\b")
+    matches: set[str] = {q_lower}
+    rows = conn.execute("SELECT DISTINCT text_lower FROM entities").fetchall()
+    for r in rows:
+        t = r["text_lower"]
+        if t == q_lower:
+            continue
+        if pattern.search(t):
+            matches.add(t)
+        elif re.search(r"\b" + re.escape(t) + r"\b", q_lower):
+            matches.add(t)
+    return list(matches)
 
 
 def _format_results(results, header: str) -> str:
@@ -280,50 +309,61 @@ def list_entities(label: str | None = None, top_n: int = 30) -> str:
 
 
 @mcp.tool()
-def find_mentions(entity: str, k: int = 10) -> str:
-    """Find chunks that mention an entity (case-insensitive exact-text match).
+def find_mentions(entity: str, k: int = 10, fuzzy: bool = True) -> str:
+    """Find chunks that mention an entity. Fuzzy by default.
 
-    Returns up to k chunks with file paths so you can read context. Pair with
-    `list_entities` to discover what's worth searching.
+    With ``fuzzy=True`` (default), 'Rowling' matches 'J.K. Rowling' and vice
+    versa via whole-word substring matching in both directions. Pass
+    ``fuzzy=False`` to require an exact match.
     """
     _, conn, _, _ = _get_state()
+    keys = _matching_entity_keys(conn, entity, fuzzy)
+    if not keys:
+        return f"(no mentions of {entity!r})"
+    placeholders = ",".join("?" * len(keys))
     rows = conn.execute(
-        "SELECT c.text, c.chunk_index, f.path, f.mtime, e.label "
-        "FROM entities e "
-        "JOIN chunks c ON c.id = e.chunk_id "
-        "JOIN files f ON f.id = c.file_id "
-        "WHERE e.text_lower = ? "
-        "ORDER BY f.mtime DESC LIMIT ?",
-        (entity.lower(), k),
+        f"SELECT DISTINCT c.id AS chunk_id, c.text, c.chunk_index, f.path, f.mtime "
+        f"FROM entities e "
+        f"JOIN chunks c ON c.id = e.chunk_id "
+        f"JOIN files f ON f.id = c.file_id "
+        f"WHERE e.text_lower IN ({placeholders}) "
+        f"ORDER BY f.mtime DESC LIMIT ?",
+        [*keys, k],
     ).fetchall()
     if not rows:
         return f"(no mentions of {entity!r})"
-    lines = [f"# Mentions of {entity!r}", ""]
+    title = f"Mentions of {entity!r}"
+    if fuzzy and len(keys) > 1:
+        title += f"  (fuzzy matched {len(keys)} aliases)"
+    lines = [f"# {title}", ""]
     for r in rows:
         snippet = r["text"] if len(r["text"]) <= 600 else r["text"][:600] + "..."
-        lines.append(
-            f"### [{r['label']}] {r['path']} (chunk {r['chunk_index']})"
-        )
+        lines.append(f"### {r['path']} (chunk {r['chunk_index']})")
         lines.append(snippet)
         lines.append("")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def entity_timeline(entity: str, limit: int = 30) -> str:
+def entity_timeline(entity: str, limit: int = 30, fuzzy: bool = True) -> str:
     """Files that mention an entity, sorted by file mtime (newest first).
 
     A timeline view: when does this person/org/thing show up in your brain?
+    Fuzzy by default - 'Rowling' covers 'J.K. Rowling'.
     """
     _, conn, _, _ = _get_state()
+    keys = _matching_entity_keys(conn, entity, fuzzy)
+    if not keys:
+        return f"(no mentions of {entity!r})"
+    placeholders = ",".join("?" * len(keys))
     rows = conn.execute(
-        "SELECT DISTINCT f.path, f.mtime, f.kind "
-        "FROM entities e "
-        "JOIN chunks c ON c.id = e.chunk_id "
-        "JOIN files f ON f.id = c.file_id "
-        "WHERE e.text_lower = ? "
-        "ORDER BY f.mtime DESC LIMIT ?",
-        (entity.lower(), limit),
+        f"SELECT DISTINCT f.path, f.mtime, f.kind "
+        f"FROM entities e "
+        f"JOIN chunks c ON c.id = e.chunk_id "
+        f"JOIN files f ON f.id = c.file_id "
+        f"WHERE e.text_lower IN ({placeholders}) "
+        f"ORDER BY f.mtime DESC LIMIT ?",
+        [*keys, limit],
     ).fetchall()
     if not rows:
         return f"(no mentions of {entity!r})"
@@ -331,6 +371,42 @@ def entity_timeline(entity: str, limit: int = 30) -> str:
     for r in rows:
         age_days = (time.time() - r["mtime"]) / 86400
         lines.append(f"  {age_days:6.1f}d ago  [{r['kind']:12s}]  {r['path']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def entity_neighbors(entity: str, top_n: int = 20, fuzzy: bool = True) -> str:
+    """Entities that most often co-occur with the given entity in the same chunk.
+
+    This is the implicit knowledge graph in your brain: who shows up together,
+    which projects connect to which people, what topics cluster. Self-join on
+    chunk_id, ranked by distinct co-occurring chunks. Fuzzy default treats
+    'Rowling' / 'J.K. Rowling' as the same when collecting co-occurrences.
+    """
+    _, conn, _, _ = _get_state()
+    keys = _matching_entity_keys(conn, entity, fuzzy)
+    if not keys:
+        return f"(no entity matching {entity!r})"
+    placeholders = ",".join("?" * len(keys))
+    rows = conn.execute(
+        f"SELECT b.text AS text, b.label AS label, "
+        f"       COUNT(DISTINCT b.chunk_id) AS n "
+        f"FROM entities a "
+        f"JOIN entities b ON a.chunk_id = b.chunk_id "
+        f"WHERE a.text_lower IN ({placeholders}) "
+        f"  AND b.text_lower NOT IN ({placeholders}) "
+        f"GROUP BY b.text_lower, b.label "
+        f"ORDER BY n DESC LIMIT ?",
+        [*keys, *keys, top_n],
+    ).fetchall()
+    if not rows:
+        return f"(no co-occurrences for {entity!r})"
+    title = f"Neighbors of {entity!r}"
+    if fuzzy and len(keys) > 1:
+        title += f"  (fuzzy matched {len(keys)} aliases)"
+    lines = [f"# {title}", ""]
+    for r in rows:
+        lines.append(f"  {r['n']:4d}  [{r['label']:12s}]  {r['text']}")
     return "\n".join(lines)
 
 

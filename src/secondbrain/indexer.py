@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -45,6 +46,24 @@ class IndexResult:
     status: str  # "indexed" | "skipped" | "unchanged" | "deleted" | "error"
     chunks: int = 0
     reason: str | None = None
+
+
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+
+
+def strip_markdown_decorations(text: str) -> str:
+    """Remove markdown link/image syntax for cleaner downstream NER.
+
+    Markitdown emits e.g. '[Buzz Aldrin](/wiki/Buzz_Aldrin)' which spaCy then
+    sees as one token bag and produces garbage entities like
+    'Buzz Aldrin](/wiki/Buzz_Aldrin'. We keep the visible text, drop the URL.
+    Embeddings still see the original links because the structure is
+    informative there.
+    """
+    text = _MD_IMAGE.sub(r"\1", text)
+    text = _MD_LINK.sub(r"\1", text)
+    return text
 
 
 def file_hash(path: Path) -> str:
@@ -291,7 +310,8 @@ def index_file(
     if entity_extractor is not None:
         try:
             for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
-                ents = entity_extractor.extract(chunk_text_val)
+                # Strip markdown links/images so URLs don't bleed into entities.
+                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
                 if ents:
                     insert_entities(
                         conn,
@@ -439,7 +459,7 @@ def index_url(
     if entity_extractor is not None:
         try:
             for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
-                ents = entity_extractor.extract(chunk_text_val)
+                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
                 if ents:
                     insert_entities(
                         conn, chunk_id, [(e.text, e.label) for e in ents]
