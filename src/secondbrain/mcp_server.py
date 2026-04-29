@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -106,15 +107,83 @@ def get_file(path: str) -> str:
 
 
 @mcp.tool()
-def get_recent(n: int = 20) -> str:
-    """List the most recently modified files in the index."""
+def get_recent(n: int = 20, days: int | None = None) -> str:
+    """List the most recently modified files in the index.
+
+    If ``days`` is given, restrict to files modified within that window.
+    Useful for "what was I working on this week" queries.
+    """
+    _, conn, _, _ = _get_state()
+    if days is not None:
+        cutoff = time.time() - days * 86400
+        rows = conn.execute(
+            "SELECT path, mtime, kind FROM files WHERE mtime >= ? ORDER BY mtime DESC LIMIT ?",
+            (cutoff, n),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT path, mtime, kind FROM files ORDER BY mtime DESC LIMIT ?", (n,)
+        ).fetchall()
+    if not rows:
+        return "(no matching files)"
+    lines = []
+    for r in rows:
+        age_days = (time.time() - r["mtime"]) / 86400
+        lines.append(f"[{r['kind']:12s}] {r['path']}  ({age_days:.1f}d ago)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_folders(top_n: int = 30) -> str:
+    """List the distinct parent folders represented in the index, with file counts.
+
+    Useful for an assistant to discover the structure of your brain before
+    drilling in with `search_brain` or `files_in_folder`.
+    """
+    _, conn, _, _ = _get_state()
+    # Sqlite has no dirname; fall back to splitting in Python so it works
+    # uniformly across forward/back slashes.
+    rows = conn.execute("SELECT path FROM files").fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        p = Path(r["path"]).parent.as_posix()
+        counts[p] = counts.get(p, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])[:top_n]
+    if not ordered:
+        return "(index is empty)"
+    return "\n".join(f"{n:5d}  {folder}" for folder, n in ordered)
+
+
+@mcp.tool()
+def list_file_types() -> str:
+    """Counts of indexed files grouped by kind (document/code/audio_video/image)."""
     _, conn, _, _ = _get_state()
     rows = conn.execute(
-        "SELECT path, mtime, kind FROM files ORDER BY mtime DESC LIMIT ?", (n,)
+        "SELECT kind, COUNT(*) AS n FROM files GROUP BY kind ORDER BY n DESC"
     ).fetchall()
     if not rows:
         return "(index is empty)"
-    return "\n".join(f"[{r['kind']}] {r['path']}" for r in rows)
+    return "\n".join(f"{r['n']:5d}  {r['kind']}" for r in rows)
+
+
+@mcp.tool()
+def files_in_folder(folder_prefix: str, limit: int = 50) -> str:
+    """List indexed files whose path starts with ``folder_prefix``.
+
+    Path-prefix match (case-insensitive on Windows). Pair with `list_folders`
+    to discover viable prefixes.
+    """
+    _, conn, _, _ = _get_state()
+    pattern = folder_prefix.replace("\\", "/").rstrip("/") + "%"
+    rows = conn.execute(
+        "SELECT path, mtime, kind FROM files "
+        "WHERE REPLACE(path, '\\', '/') LIKE ? "
+        "ORDER BY mtime DESC LIMIT ?",
+        (pattern, limit),
+    ).fetchall()
+    if not rows:
+        return f"(no files matching prefix {folder_prefix!r})"
+    return "\n".join(f"[{r['kind']:12s}] {r['path']}" for r in rows)
 
 
 @mcp.tool()
