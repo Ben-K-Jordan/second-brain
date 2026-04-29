@@ -28,6 +28,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # Wait up to 5s for a lock before failing. The indexer's per-file write
+    # transactions (chunks + vectors + entities for one file) can take a few
+    # hundred ms; without this, a `status` query that hits one mid-flight
+    # raises "database is locked" instead of just briefly waiting.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
