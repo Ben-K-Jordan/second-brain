@@ -357,6 +357,24 @@ def ingest(
 
 
 @app.command()
+def briefing(
+    hours: int = typer.Option(24, "--hours", "-h", help="Look-back window in hours."),
+) -> None:
+    """Generate a Claude-written summary of what's entered your brain recently.
+
+    Requires ANTHROPIC_API_KEY. Uses Claude Opus 4.7 by default; configurable
+    via `briefing_model` in config.toml.
+    """
+    from .briefing import generate_briefing
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    text = generate_briefing(conn, cfg, hours=hours)
+    console.print(text)
+    conn.close()
+
+
+@app.command()
 def serve() -> None:
     """Start the MCP server over stdio (for Claude Desktop / Claude Code / Cursor)."""
     from .mcp_server import run

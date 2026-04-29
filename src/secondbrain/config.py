@@ -152,6 +152,12 @@ class Config:
     image_embed_enabled: bool = True
     multimodal_model: str = "voyage-multimodal-3"
 
+    # Daily briefing — Claude reads what's new and writes a summary.
+    # Requires ANTHROPIC_API_KEY. Default model is Opus 4.7 (most capable);
+    # swap to claude-sonnet-4-6 for lower cost or claude-haiku-4-5 for fastest.
+    briefing_model: str = "claude-opus-4-7"
+    briefing_max_tokens: int = 4096
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -242,6 +248,12 @@ spacy_model = "en_core_web_sm"
 # Requires VOYAGE_API_KEY (no extra needed - voyage SDK already pulled in).
 image_embed_enabled = true
 multimodal_model = "voyage-multimodal-3"
+
+# Daily briefing - Claude summarises what's new in your brain.
+# Requires ANTHROPIC_API_KEY. Switch to claude-sonnet-4-6 for cheaper runs,
+# or claude-haiku-4-5 for fastest.
+briefing_model = "claude-opus-4-7"
+briefing_max_tokens = 4096
 """
 
 
@@ -300,6 +312,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.image_embed_enabled = bool(data["image_embed_enabled"])
         if "multimodal_model" in data:
             cfg.multimodal_model = data["multimodal_model"]
+        if "briefing_model" in data:
+            cfg.briefing_model = data["briefing_model"]
+        if "briefing_max_tokens" in data:
+            cfg.briefing_max_tokens = int(data["briefing_max_tokens"])
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg

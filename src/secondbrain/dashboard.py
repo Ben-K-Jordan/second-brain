@@ -24,6 +24,7 @@ import webbrowser
 from html import escape
 from pathlib import Path
 
+from .briefing import generate_briefing
 from .config import load_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
@@ -141,6 +142,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Search", "/search"),
         ("Entities", "/entities"),
         ("Folders", "/folders"),
+        ("Briefing", "/briefing"),
         ("Ingest", "/ingest"),
     ]
     nav = " ".join(
@@ -509,6 +511,34 @@ def create_app():
 <p class="muted">{len(chunks)} chunks · {row["size"] / 1024:.1f} KB · {age:.1f}d ago</p>
 {body_chunks}"""
         return HTMLResponse(_layout(Path(path).name or path, body))
+
+    @app.get("/briefing", response_class=HTMLResponse)
+    def briefing_page(hours: int = 24):
+        body = f"""
+<h1>Daily briefing</h1>
+<form method="get" action="/briefing" class="filters">
+    <label class="muted">Look-back window:</label>
+    <input type="number" name="hours" value="{hours}" min="1" max="168" style="width: 90px;">
+    <button type="submit">Generate</button>
+    <span class="muted">Uses Claude Opus 4.7 + your ANTHROPIC_API_KEY. ~5–10s, fractions of a cent per call.</span>
+</form>
+<div id="briefing-result" hx-get="/briefing/run?hours={hours}" hx-trigger="load" hx-swap="innerHTML">
+    <div class="empty">Generating briefing — this can take 5–15 seconds…</div>
+</div>"""
+        return HTMLResponse(_layout("Briefing", body, "briefing"))
+
+    @app.get("/briefing/run", response_class=HTMLResponse)
+    def briefing_run(hours: int = 24):
+        cfg, conn, _, _ = get_state()
+        text = generate_briefing(conn, cfg, hours=hours)
+        # Render as a card with preserved newlines. Markdown is rendered as
+        # plain pre text — keeps the LLM output verbatim and avoids HTML escaping
+        # surprises if the model emits angle brackets.
+        return HTMLResponse(
+            f'<div class="card"><div class="snippet" style="max-height: none; '
+            f'background: var(--surface); padding: 0; font-family: var(--sans); '
+            f'font-size: 14.5px; white-space: pre-wrap;">{escape(text)}</div></div>'
+        )
 
     @app.get("/ingest", response_class=HTMLResponse)
     def ingest_page():

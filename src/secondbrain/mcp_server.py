@@ -146,6 +146,21 @@ def keyword_search(query: str, k: int = 10) -> str:
 
 
 @mcp.tool()
+def daily_briefing(hours: int = 24) -> str:
+    """Generate a Claude-written briefing of what's entered the brain recently.
+
+    Reads files indexed in the last N hours, pulls top entities and sample
+    chunks, and asks Claude Opus 4.7 to write a short, useful summary covering
+    what's new, recurring threads, and anomalies worth attention. Requires
+    ANTHROPIC_API_KEY in the environment.
+    """
+    from .briefing import generate_briefing
+
+    cfg, conn, _, _ = _get_state()
+    return generate_briefing(conn, cfg, hours=hours)
+
+
+@mcp.tool()
 def ingest_url(url: str) -> str:
     """Fetch a URL and add its contents to the brain (article, PDF, YouTube, ...).
 
