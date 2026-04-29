@@ -21,7 +21,7 @@ from rich.table import Table
 
 from . import __version__
 from .config import Config, load_config, write_default_config
-from .db import connect, init_schema, stats
+from .db import connect, connect_readonly, init_schema, stats
 from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
@@ -82,9 +82,14 @@ def init() -> None:
 
 @app.command()
 def status() -> None:
-    """Show what's currently in the index."""
+    """Show what's currently in the index. Read-only — safe to run while the
+    daemon is bulk-indexing."""
     cfg = load_config()
-    conn, _ = _open_state(cfg)
+    try:
+        conn = connect_readonly(cfg.db_path)
+    except FileNotFoundError as e:
+        console.print(f"[yellow]{e}[/]")
+        raise typer.Exit(code=1)
     s = stats(conn)
     table = Table(show_header=False, box=None)
     table.add_row("Files", str(s["files"]))

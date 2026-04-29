@@ -18,7 +18,7 @@ def serialize_f32(vec: Iterable[float]) -> bytes:
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open a connection with sqlite-vec loaded and sensible pragmas."""
+    """Open a read/write connection with sqlite-vec loaded and sensible pragmas."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -28,11 +28,30 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
-    # Wait up to 5s for a lock before failing. The indexer's per-file write
-    # transactions (chunks + vectors + entities for one file) can take a few
-    # hundred ms; without this, a `status` query that hits one mid-flight
-    # raises "database is locked" instead of just briefly waiting.
-    conn.execute("PRAGMA busy_timeout = 5000")
+    # Wait up to 30s for a lock before failing. The indexer's per-file write
+    # transactions on big spreadsheets (1500+ chunks + entities + vectors)
+    # can run for several seconds end-to-end; 5s left status queries failing.
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def connect_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open a read-only connection. Does not contend for the write lock - used
+    by `status`, `spend`, and search paths so they coexist cleanly with a busy
+    daemon. Skips init_schema; the caller is asserting the DB is already set up.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"No index at {db_path}. Run `secondbrain index <folder>` first."
+        )
+    uri = f"file:{db_path.as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute("PRAGMA query_only = 1")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
