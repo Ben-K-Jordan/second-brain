@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol, runtime_checkable
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .budget import check_budget, record_usage
 from .config import Config
+
+log = logging.getLogger(__name__)
+
+# Voyage caps a single embed request at 1000 inputs. Stay well under that to
+# avoid the limit flaring on edge cases, and to keep individual batches small
+# enough that a transient TPM rate-limit doesn't lose a huge file's worth of
+# work on a single retry. 128 is well-tested and gives smooth throttling.
+_VOYAGE_BATCH_SIZE = 128
 
 
 @runtime_checkable
@@ -39,20 +48,36 @@ class VoyageEmbedder:
         self.dim = _VOYAGE_DIMS[model]
         self._cfg = cfg
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(6),
+        wait=wait_exponential(min=2, max=120),
+    )
+    def _embed_batch(self, texts: list[str], input_type: str) -> tuple[list[list[float]], int]:
+        """Embed a single Voyage-sized batch (<= _VOYAGE_BATCH_SIZE)."""
+        result = self._client.embed(texts, model=self.name, input_type=input_type)
+        return [list(e) for e in result.embeddings], int(getattr(result, "total_tokens", 0))
+
     def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         if not texts:
             return []
         if self._cfg is not None:
             check_budget(self._cfg, "voyage")
-        result = self._client.embed(texts, model=self.name, input_type=input_type)
+
+        out: list[list[float]] = []
+        total_tokens = 0
+        for start in range(0, len(texts), _VOYAGE_BATCH_SIZE):
+            chunk = texts[start:start + _VOYAGE_BATCH_SIZE]
+            embeddings, tokens = self._embed_batch(chunk, input_type)
+            out.extend(embeddings)
+            total_tokens += tokens
+
         if self._cfg is not None:
             record_usage(
                 self._cfg, "voyage", self.name,
-                input_tokens=getattr(result, "total_tokens", 0),
-                note=f"embed/{input_type}",
+                input_tokens=total_tokens,
+                note=f"embed/{input_type}/{len(texts)}",
             )
-        return [list(e) for e in result.embeddings]
+        return out
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts, input_type="document")
