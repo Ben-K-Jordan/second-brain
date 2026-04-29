@@ -25,7 +25,7 @@ from .db import connect, init_schema, stats
 from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .imager import make_ocr_engine
-from .indexer import IndexResult, index_folder, walk_folder
+from .indexer import IndexResult, index_folder, index_url, walk_folder
 from .reranker import make_reranker
 from .search import hybrid_search
 from .transcriber import make_transcriber
@@ -203,6 +203,9 @@ def search(
     no_rerank: bool = typer.Option(
         False, "--no-rerank", help="Skip cross-encoder reranking."
     ),
+    folder: str = typer.Option(None, "--folder", help="Restrict to files under a path prefix."),
+    kind: str = typer.Option(None, "--kind", help="Restrict to a kind: document/code/audio_video/image/url."),
+    since_days: int = typer.Option(None, "--since-days", help="Restrict to files modified in the last N days."),
 ) -> None:
     """Search the index from the command line."""
     cfg = load_config()
@@ -217,6 +220,9 @@ def search(
         use_adaptive_alpha=use_adaptive,
         time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
         time_decay_half_life_days=cfg.time_decay_half_life_days,
+        path_prefix=folder,
+        kind=kind,
+        since_days=since_days,
     )
     if not results:
         console.print("[yellow]No matches.[/]")
@@ -296,6 +302,37 @@ def watch(
         console.print("\n[yellow]Stopping...[/]")
         watcher.stop()
         conn.close()
+
+
+@app.command()
+def ingest(
+    url: str = typer.Argument(..., help="URL to fetch and index (article, PDF, YouTube, ...)."),
+) -> None:
+    """Fetch a URL and index its content into the brain.
+
+    Markitdown handles HTML article extraction, PDF download+parse, and
+    YouTube transcript fetch. The URL is stored as a virtual file with
+    kind='url' so it shows up in `list_folders` / `search_brain` / etc.
+    """
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+        except (ImportError, RuntimeError) as e:
+            console.print(f"[yellow]Entity extraction disabled:[/] {e}")
+
+    console.print(f"Fetching [cyan]{url}[/] ...")
+    result = index_url(conn, embedder, cfg, url, entity_extractor=entity_extractor)
+    if result.status == "indexed":
+        console.print(f"[green]Indexed:[/] {url} ({result.chunks} chunks)")
+    elif result.status == "unchanged":
+        console.print(f"[dim]Unchanged:[/] {url}")
+    else:
+        console.print(f"[yellow]{result.status}:[/] {url} ({result.reason})")
+    conn.close()
 
 
 @app.command()

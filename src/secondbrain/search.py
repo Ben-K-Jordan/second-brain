@@ -141,6 +141,36 @@ def _hydrate(
     }
 
 
+def _eligible_chunk_ids(
+    conn: sqlite3.Connection,
+    path_prefix: str | None,
+    kind: str | None,
+    since_days: int | None,
+) -> set[int] | None:
+    """Pre-compute the set of chunk_ids matching the filter constraints.
+
+    Returns None if no filter is applied (callers should skip the filter step).
+    """
+    where: list[str] = []
+    params: list = []
+    if path_prefix:
+        where.append("REPLACE(f.path, '\\', '/') LIKE ?")
+        params.append(path_prefix.replace("\\", "/").rstrip("/") + "%")
+    if kind:
+        where.append("f.kind = ?")
+        params.append(kind)
+    if since_days is not None:
+        where.append("f.mtime >= ?")
+        params.append(time.time() - since_days * 86400)
+    if not where:
+        return None
+    sql = (
+        "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id "
+        f"WHERE {' AND '.join(where)}"
+    )
+    return {row["id"] for row in conn.execute(sql, params).fetchall()}
+
+
 def hybrid_search(
     conn: sqlite3.Connection,
     embedder: Embedder,
@@ -152,25 +182,40 @@ def hybrid_search(
     use_adaptive_alpha: bool = False,
     time_decay_weight: float = 0.0,
     time_decay_half_life_days: float = 365.0,
+    path_prefix: str | None = None,
+    kind: str | None = None,
+    since_days: int | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search and return up to k merged results.
 
-    - When ``use_adaptive_alpha`` is set, ``alpha`` is treated as the *default*
-      and per-query overrides may push it up (conceptual prose) or down
-      (proper-noun / ID-bearing queries).
-    - When ``time_decay_weight > 0``, ranking blends in a recency bonus with
-      the given exponential half-life.
+    - ``path_prefix`` / ``kind`` / ``since_days`` filter results to a folder,
+      file kind ('document' / 'code' / 'audio_video' / 'image' / 'url'), or
+      a recency window (in days). When any filter is set we over-fetch to
+      compensate for what the filter drops.
+    - When ``use_adaptive_alpha`` is set, ``alpha`` is the default and may be
+      overridden per-query (long prose -> vector, IDs -> BM25).
+    - When ``time_decay_weight > 0``, ranking blends in a recency bonus.
     - When ``reranker`` is supplied, the top ``rerank_overfetch`` candidates
-      from RRF are reranked by the cross-encoder before truncating to k.
+      are reranked by a cross-encoder before truncating to k.
     """
     effective_alpha = alpha if alpha is not None else 0.5
     if use_adaptive_alpha:
         effective_alpha = adaptive_alpha(query, default=effective_alpha)
 
-    candidate_count = max(rerank_overfetch if reranker else k * 3, 30)
+    eligible = _eligible_chunk_ids(conn, path_prefix, kind, since_days)
+    has_filter = eligible is not None
+    over_factor = 5 if has_filter else (1 if reranker else 1)
+    candidate_count = max(
+        (rerank_overfetch if reranker else k * 3) * over_factor, 30
+    )
     q_emb = embedder.embed_query(query)
     vec = _vector_search(conn, q_emb, candidate_count)
     fts = _fts_search(conn, query, candidate_count)
+
+    if eligible is not None:
+        vec = [(cid, d) for cid, d in vec if cid in eligible]
+        fts = [(cid, s) for cid, s in fts if cid in eligible]
+
     fused = _rrf_merge(vec, fts, alpha=effective_alpha)
 
     candidates = sorted(fused.items(), key=lambda kv: -kv[1][0])[:candidate_count]

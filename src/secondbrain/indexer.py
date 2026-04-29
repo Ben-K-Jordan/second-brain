@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -311,6 +312,143 @@ def remove_file(conn: sqlite3.Connection, path: Path) -> IndexResult:
     delete_file(conn, str(path))
     conn.commit()
     return IndexResult(path, "deleted")
+
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 second-brain/0.0.1"
+)
+
+
+def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
+    """Download a URL with a real user-agent so sites like Wikipedia don't 403 us.
+
+    Returns (local_path, content_type). Caller must clean up the temp file.
+    """
+    import os
+    import tempfile
+    from urllib.parse import urlparse
+
+    import requests
+
+    resp = requests.get(
+        url,
+        headers={"User-Agent": _USER_AGENT, "Accept": "*/*"},
+        timeout=60,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    ext_map = {
+        "text/html": ".html",
+        "application/xhtml+xml": ".html",
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/markdown": ".md",
+        "application/json": ".json",
+        "text/xml": ".xml",
+        "application/xml": ".xml",
+    }
+    ext = ext_map.get(ctype)
+    if not ext:
+        path = urlparse(url).path
+        _, suffix = os.path.splitext(path)
+        ext = suffix or ".html"
+    fd, tmp = tempfile.mkstemp(suffix=ext, prefix="sb-url-")
+    try:
+        os.write(fd, resp.content)
+    finally:
+        os.close(fd)
+    return tmp, ctype
+
+
+def index_url(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    cfg: Config,
+    url: str,
+    entity_extractor: EntityExtractor | None = None,
+) -> IndexResult:
+    """Fetch a URL, extract text via markitdown, and index it like a file.
+
+    HTML pages are pre-fetched with a real User-Agent (Wikipedia / many sites
+    reject the default markitdown UA), then converted from disk. YouTube URLs
+    go straight through markitdown so its transcript path is used. PDFs are
+    downloaded and parsed locally. The URL is stored as the "path" with
+    kind='url'; content_hash on extracted text means re-ingesting an
+    unchanged page is a no-op.
+    """
+    import os
+
+    label_path = Path(url)
+    md = _get_markitdown()
+    is_youtube = "youtube.com/watch" in url or "youtu.be/" in url
+    tmp_path: str | None = None
+    try:
+        if is_youtube:
+            result = md.convert(url)
+        else:
+            tmp_path, _ctype = _fetch_url_to_tempfile(url)
+            result = md.convert(tmp_path)
+    except Exception as e:
+        log.warning("URL fetch/convert failed for %s: %s", url, e)
+        return IndexResult(label_path, "error", reason=f"fetch/convert: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    text = (result.text_content or "").strip()
+    if not text:
+        return IndexResult(label_path, "skipped", reason="no extractable text")
+
+    chash = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+    existing = get_file_by_path(conn, url)
+    if existing and existing["content_hash"] == chash:
+        return IndexResult(label_path, "unchanged")
+
+    chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+    if not chunked:
+        return IndexResult(label_path, "skipped", reason="no chunks produced")
+
+    chunk_texts = [c for c, _ in chunked]
+    title = getattr(result, "title", None) or url
+    contextualized = [
+        f"Source: URL\nURL: {url}\nTitle: {title}\n\n{c}" for c in chunk_texts
+    ]
+    try:
+        embeddings = embedder.embed_documents(contextualized)
+    except Exception as e:
+        log.warning("embedding failed for url %s: %s", url, e)
+        return IndexResult(label_path, "error", reason=f"embedding: {e}")
+
+    file_id = upsert_file(
+        conn,
+        path=url,
+        mtime=time.time(),
+        size=len(text.encode("utf-8", errors="replace")),
+        kind="url",
+        content_hash=chash,
+    )
+    chunk_ids = replace_chunks(
+        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+    )
+
+    if entity_extractor is not None:
+        try:
+            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
+                ents = entity_extractor.extract(chunk_text_val)
+                if ents:
+                    insert_entities(
+                        conn, chunk_id, [(e.text, e.label) for e in ents]
+                    )
+        except Exception as e:
+            log.warning("entity extraction failed for url %s: %s", url, e)
+
+    conn.commit()
+    return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
 
 
 def walk_folder(folder: Path, cfg: Config) -> Iterator[Path]:

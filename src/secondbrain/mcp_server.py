@@ -51,13 +51,23 @@ def _format_results(results, header: str) -> str:
 
 
 @mcp.tool()
-def search_brain(query: str, k: int = 10) -> str:
+def search_brain(
+    query: str,
+    k: int = 10,
+    folder: str | None = None,
+    kind: str | None = None,
+    since_days: int | None = None,
+) -> str:
     """Hybrid search across your indexed files (vector + keyword, fused, then reranked).
 
     Applies query-adaptive alpha (push toward BM25 for proper-noun queries,
     toward vector for prose) and a gentle recency boost. Returns matched
     text chunks with file paths so you can cite or open them.
-    Best for most questions.
+
+    Optional filters scope the search:
+      - ``folder``: path-prefix match. Pair with `list_folders` to discover prefixes.
+      - ``kind``: 'document' / 'code' / 'audio_video' / 'image' / 'url'.
+      - ``since_days``: only files modified within the last N days.
     """
     cfg, conn, embedder, reranker = _get_state()
     results = hybrid_search(
@@ -66,8 +76,21 @@ def search_brain(query: str, k: int = 10) -> str:
         use_adaptive_alpha=cfg.adaptive_alpha,
         time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
         time_decay_half_life_days=cfg.time_decay_half_life_days,
+        path_prefix=folder,
+        kind=kind,
+        since_days=since_days,
     )
-    return _format_results(results, f"# Hybrid search: {query!r}")
+    header = f"# Hybrid search: {query!r}"
+    if folder or kind or since_days is not None:
+        bits = []
+        if folder:
+            bits.append(f"folder={folder}")
+        if kind:
+            bits.append(f"kind={kind}")
+        if since_days is not None:
+            bits.append(f"since={since_days}d")
+        header += "  [filters: " + ", ".join(bits) + "]"
+    return _format_results(results, header)
 
 
 @mcp.tool()
@@ -90,6 +113,30 @@ def keyword_search(query: str, k: int = 10) -> str:
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
     )
     return _format_results(results, f"# Keyword search: {query!r}")
+
+
+@mcp.tool()
+def ingest_url(url: str) -> str:
+    """Fetch a URL and add its contents to the brain (article, PDF, YouTube, ...).
+
+    Returns a one-line status. Re-ingesting an unchanged URL is a no-op.
+    """
+    from .entities import make_entity_extractor
+    from .indexer import index_url
+
+    cfg, conn, embedder, _ = _get_state()
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+        except (ImportError, RuntimeError):
+            entity_extractor = None
+    result = index_url(conn, embedder, cfg, url, entity_extractor=entity_extractor)
+    if result.status == "indexed":
+        return f"Indexed {url} ({result.chunks} chunks)"
+    if result.status == "unchanged":
+        return f"Unchanged: {url}"
+    return f"{result.status}: {url} ({result.reason})"
 
 
 @mcp.tool()
