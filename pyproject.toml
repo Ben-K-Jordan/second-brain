@@ -26,6 +26,9 @@ dependencies = [
 local = [
     "sentence-transformers>=3.0",
 ]
+whisper = [
+    "faster-whisper>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

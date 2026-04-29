@@ -18,6 +18,7 @@ from .config import (
 )
 from .db import delete_file, get_file_by_path, replace_chunks, upsert_file
 from .embedder import Embedder
+from .transcriber import Transcriber
 
 log = logging.getLogger(__name__)
 
@@ -52,8 +53,9 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def extract_text(path: Path) -> str:
-    """Pull text out of a file. Plain reads for text/code; markitdown for documents."""
+def extract_text(path: Path, transcriber: Transcriber | None = None) -> str:
+    """Pull text out of a file. Plain reads for text/code; markitdown for documents;
+    Whisper transcription for audio/video when a transcriber is supplied."""
     kind = classify_file(path)
     ext = path.suffix.lower()
 
@@ -66,7 +68,11 @@ def extract_text(path: Path) -> str:
         return result.text_content or ""
 
     if kind == "media":
-        # Phase 1 will add Whisper transcription / OCR. For Phase 0 we skip.
+        # Audio/video: transcribe with Whisper. Images currently fall through
+        # to the empty return; OCR/CLIP arrives in Phase 1.4.
+        if transcriber is not None and ext in _AUDIO_VIDEO_EXTS:
+            log.info("transcribing %s with %s", path.name, transcriber.name)
+            return transcriber.transcribe(path)
         return ""
 
     # Last-ditch attempt for unknown types
@@ -74,6 +80,12 @@ def extract_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+
+_AUDIO_VIDEO_EXTS = frozenset({
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+})
 
 
 def chunk_text(
@@ -171,7 +183,7 @@ def build_context_prefix(path: Path, full_text: str, chunk_offset: int) -> str:
     return "\n".join(parts) + "\n\n"
 
 
-def should_index(path: Path, cfg: Config) -> tuple[bool, str | None]:
+def should_index(path: Path, cfg: Config, transcriber: Transcriber | None = None) -> tuple[bool, str | None]:
     """Decide whether a path is eligible for indexing."""
     if not path.exists() or not path.is_file():
         return False, "not a file"
@@ -180,9 +192,14 @@ def should_index(path: Path, cfg: Config) -> tuple[bool, str | None]:
     kind = classify_file(path)
     if kind == "other":
         return False, "unrecognized file type"
+    ext = path.suffix.lower()
     if kind == "media":
-        # Phase 0 skips media; will be handled in Phase 1 via transcription.
-        return False, "media (transcription not yet implemented)"
+        if ext in _AUDIO_VIDEO_EXTS:
+            if transcriber is None:
+                return False, "audio/video skipped (transcriber disabled)"
+        else:
+            # Image: OCR/CLIP arrives in Phase 1.4.
+            return False, "image (OCR/CLIP not yet implemented)"
     try:
         size = path.stat().st_size
     except OSError as e:
@@ -191,7 +208,7 @@ def should_index(path: Path, cfg: Config) -> tuple[bool, str | None]:
         return False, f"file too large ({size} bytes)"
     if size == 0:
         return False, "empty file"
-    if kind in {"document", "code"} and path.suffix.lower() not in (
+    if kind in {"document", "code"} and ext not in (
         DOCUMENT_EXTENSIONS | CODE_EXTENSIONS
     ):
         return False, "extension not in allow list"
@@ -203,9 +220,10 @@ def index_file(
     embedder: Embedder,
     cfg: Config,
     path: Path,
+    transcriber: Transcriber | None = None,
 ) -> IndexResult:
     """Index a single file (extract -> chunk -> embed -> store)."""
-    ok, reason = should_index(path, cfg)
+    ok, reason = should_index(path, cfg, transcriber=transcriber)
     if not ok:
         return IndexResult(path, "skipped", reason=reason)
 
@@ -220,7 +238,7 @@ def index_file(
         return IndexResult(path, "unchanged")
 
     try:
-        text = extract_text(path)
+        text = extract_text(path, transcriber=transcriber)
     except Exception as e:
         log.warning("extraction failed for %s: %s", path, e)
         return IndexResult(path, "error", reason=f"extraction: {e}")
@@ -280,11 +298,12 @@ def index_folder(
     cfg: Config,
     folder: Path,
     progress=None,
+    transcriber: Transcriber | None = None,
 ) -> dict[str, int]:
     """Walk a folder and index all eligible files. Returns counts."""
     counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0}
     for p in walk_folder(folder, cfg):
-        result = index_file(conn, embedder, cfg, p)
+        result = index_file(conn, embedder, cfg, p, transcriber=transcriber)
         counts[result.status] = counts.get(result.status, 0) + 1
         if progress:
             progress(result)

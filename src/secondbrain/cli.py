@@ -26,6 +26,7 @@ from .embedder import make_embedder
 from .indexer import IndexResult, index_folder, walk_folder
 from .reranker import make_reranker
 from .search import hybrid_search
+from .transcriber import make_transcriber
 
 app = typer.Typer(
     name="secondbrain",
@@ -96,6 +97,9 @@ def status() -> None:
 def index(
     folder: Path = typer.Argument(..., help="Folder to index (recursively)."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    no_transcribe: bool = typer.Option(
+        False, "--no-transcribe", help="Skip Whisper transcription for audio/video."
+    ),
 ) -> None:
     """One-shot index a folder. Skips files whose content is unchanged."""
     _setup_logging(verbose)
@@ -105,7 +109,22 @@ def index(
         raise typer.Exit(code=1)
 
     cfg = load_config()
+    if no_transcribe:
+        cfg.transcribe_enabled = False
     conn, embedder = _open_state(cfg)
+
+    transcriber = None
+    if cfg.transcribe_enabled:
+        try:
+            transcriber = make_transcriber(cfg)
+            if transcriber:
+                console.print(
+                    f"[dim]Transcriber:[/] {transcriber.name} "
+                    f"(loads on first audio/video file)"
+                )
+        except ImportError as e:
+            console.print(f"[yellow]Transcription disabled:[/] {e}")
+            transcriber = None
 
     candidates = list(walk_folder(folder, cfg))
     console.print(
@@ -129,7 +148,7 @@ def index(
             if verbose and r.status in {"skipped", "error"}:
                 console.print(f"  [yellow]{r.status}[/] {r.path}: {r.reason}")
 
-        index_folder(conn, embedder, cfg, folder, progress=on_result)
+        index_folder(conn, embedder, cfg, folder, progress=on_result, transcriber=transcriber)
 
     console.print(
         f"[green]Done.[/] indexed={counts.get('indexed', 0)} "
@@ -188,16 +207,23 @@ def watch(
     cfg = load_config()
     conn, embedder = _open_state(cfg)
 
+    transcriber = None
+    if cfg.transcribe_enabled:
+        try:
+            transcriber = make_transcriber(cfg)
+        except ImportError as e:
+            console.print(f"[yellow]Transcription disabled:[/] {e}")
+
     if bootstrap:
         console.print(f"Bootstrapping index for [cyan]{folder}[/]...")
-        index_folder(conn, embedder, cfg, folder)
+        index_folder(conn, embedder, cfg, folder, transcriber=transcriber)
         console.print("[green]Bootstrap complete.[/]")
 
     def on_event(r: IndexResult) -> None:
         if r.status in {"indexed", "deleted"}:
             console.print(f"[dim]{r.status}[/] {r.path}")
 
-    watcher = Watcher(cfg, conn, embedder, on_event=on_event)
+    watcher = Watcher(cfg, conn, embedder, on_event=on_event, transcriber=transcriber)
     watcher.start([folder])
     console.print(f"[green]Watching[/] {folder}. Press Ctrl-C to stop.")
     try:

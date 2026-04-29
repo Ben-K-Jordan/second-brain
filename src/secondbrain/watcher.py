@@ -15,6 +15,7 @@ from watchdog.observers import Observer
 from .config import Config, is_ignored
 from .embedder import Embedder
 from .indexer import IndexResult, index_file, remove_file
+from .transcriber import Transcriber
 
 log = logging.getLogger(__name__)
 
@@ -74,10 +75,12 @@ class Watcher:
         conn: sqlite3.Connection,
         embedder: Embedder,
         on_event: Callable[[IndexResult], None] | None = None,
+        transcriber: Transcriber | None = None,
     ):
         self._cfg = cfg
         self._conn = conn
         self._embedder = embedder
+        self._transcriber = transcriber
         self._on_event = on_event or (lambda r: None)
         self._handler = _DebouncedHandler(cfg)
         self._observer = Observer()
@@ -90,7 +93,10 @@ class Watcher:
                 if action == "delete":
                     result = remove_file(self._conn, path)
                 else:
-                    result = index_file(self._conn, self._embedder, self._cfg, path)
+                    result = index_file(
+                        self._conn, self._embedder, self._cfg, path,
+                        transcriber=self._transcriber,
+                    )
                 self._on_event(result)
             except Exception as e:
                 log.exception("watcher failed on %s: %s", path, e)

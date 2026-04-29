@@ -123,6 +123,10 @@ class Config:
     rerank_model: str = "rerank-2-lite"
     rerank_overfetch: int = 50  # how many candidates to fetch before reranking down to k
 
+    # Media transcription (audio/video -> text via faster-whisper)
+    transcribe_enabled: bool = True
+    whisper_model_size: str = "small"  # tiny/base/small/medium/large-v3
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -170,6 +174,12 @@ hybrid_alpha = 0.5
 rerank_enabled = true
 rerank_model = "rerank-2-lite"
 rerank_overfetch = 50
+
+# Media transcription. When enabled, audio and video files are transcribed
+# locally via faster-whisper and the transcript flows into the regular index.
+# Requires the [whisper] extra: pip install -e .[whisper]
+transcribe_enabled = true
+whisper_model_size = "small"  # tiny/base/small/medium/large-v3
 """
 
 
@@ -204,6 +214,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.rerank_model = data["rerank_model"]
         if "rerank_overfetch" in data:
             cfg.rerank_overfetch = int(data["rerank_overfetch"])
+        if "transcribe_enabled" in data:
+            cfg.transcribe_enabled = bool(data["transcribe_enabled"])
+        if "whisper_model_size" in data:
+            cfg.whisper_model_size = data["whisper_model_size"]
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg
