@@ -357,6 +357,37 @@ def ingest(
 
 
 @app.command()
+def spend() -> None:
+    """Show today's API spend per provider with current daily caps."""
+    from .budget import spend_summary
+
+    cfg = load_config()
+    summary = spend_summary(cfg)
+    table = Table(show_header=True, box=None)
+    table.add_column("Provider")
+    table.add_column("Calls", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Spent ($)", justify="right")
+    table.add_column("Cap ($)", justify="right")
+    for provider, bucket in summary.items():
+        cap = (
+            cfg.daily_budget_cents_voyage if provider == "voyage"
+            else cfg.daily_budget_cents_anthropic if provider == "anthropic"
+            else 0
+        )
+        cap_str = "disabled" if cap == 0 else f"{cap / 100:.2f}"
+        table.add_row(
+            provider,
+            str(bucket["calls"]),
+            f"{bucket['tokens']:,}",
+            f"{bucket['cents'] / 100:.4f}",
+            cap_str,
+        )
+    console.print(table)
+    console.print(f"\n[dim]Ledger:[/] {cfg.data_dir / 'spend.jsonl'}")
+
+
+@app.command()
 def briefing(
     hours: int = typer.Option(24, "--hours", "-h", help="Look-back window in hours."),
 ) -> None:

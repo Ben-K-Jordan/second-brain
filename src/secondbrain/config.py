@@ -158,6 +158,12 @@ class Config:
     briefing_model: str = "claude-opus-4-7"
     briefing_max_tokens: int = 4096
 
+    # Daily spend caps in cents (so $5 = 500). Refuses paid calls once today's
+    # cumulative spend hits the cap. Set to 0 to disable. Defense in depth -
+    # catches runaway loops fast; not a substitute for provider-side billing limits.
+    daily_budget_cents_voyage: int = 500
+    daily_budget_cents_anthropic: int = 500
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -254,6 +260,13 @@ multimodal_model = "voyage-multimodal-3"
 # or claude-haiku-4-5 for fastest.
 briefing_model = "claude-opus-4-7"
 briefing_max_tokens = 4096
+
+# Daily spend caps in cents ($5 = 500). Refuses paid API calls once today's
+# spend hits the cap. Set to 0 to disable. Defense in depth - catches runaway
+# loops fast. Not a substitute for provider-side billing limits, but a useful
+# floor on damage when something misbehaves.
+daily_budget_cents_voyage = 500
+daily_budget_cents_anthropic = 500
 """
 
 
@@ -316,6 +329,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.briefing_model = data["briefing_model"]
         if "briefing_max_tokens" in data:
             cfg.briefing_max_tokens = int(data["briefing_max_tokens"])
+        if "daily_budget_cents_voyage" in data:
+            cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
+        if "daily_budget_cents_anthropic" in data:
+            cfg.daily_budget_cents_anthropic = int(data["daily_budget_cents_anthropic"])
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg

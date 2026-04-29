@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from .budget import check_budget, record_usage
 from .config import Config
 
 
@@ -28,7 +29,7 @@ _VOYAGE_DIMS: dict[str, int] = {
 
 
 class VoyageEmbedder:
-    def __init__(self, api_key: str, model: str = "voyage-3"):
+    def __init__(self, api_key: str, model: str = "voyage-3", cfg: Config | None = None):
         import voyageai
 
         if model not in _VOYAGE_DIMS:
@@ -36,12 +37,21 @@ class VoyageEmbedder:
         self._client = voyageai.Client(api_key=api_key)
         self.name = model
         self.dim = _VOYAGE_DIMS[model]
+        self._cfg = cfg
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         if not texts:
             return []
+        if self._cfg is not None:
+            check_budget(self._cfg, "voyage")
         result = self._client.embed(texts, model=self.name, input_type=input_type)
+        if self._cfg is not None:
+            record_usage(
+                self._cfg, "voyage", self.name,
+                input_tokens=getattr(result, "total_tokens", 0),
+                note=f"embed/{input_type}",
+            )
         return [list(e) for e in result.embeddings]
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -86,7 +96,7 @@ def make_embedder(cfg: Config) -> Embedder:
                 "embedder_provider='voyage' but VOYAGE_API_KEY is not set. "
                 "Export it or set embedder_provider='local'."
             )
-        return VoyageEmbedder(cfg.voyage_api_key, model=cfg.voyage_model)
+        return VoyageEmbedder(cfg.voyage_api_key, model=cfg.voyage_model, cfg=cfg)
 
     if provider == "local":
         return LocalEmbedder(cfg.local_model)

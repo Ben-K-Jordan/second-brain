@@ -25,6 +25,7 @@ from html import escape
 from pathlib import Path
 
 from .briefing import generate_briefing
+from .budget import spend_summary
 from .config import load_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
@@ -133,6 +134,9 @@ th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--bor
 th { color: var(--text-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; }
 td.num { font-family: var(--mono); text-align: right; color: var(--text-dim); }
 .empty { padding: 40px 20px; text-align: center; color: var(--text-dim); }
+.warn { color: var(--warn); }
+#cy { width: 100%; height: 80vh; background: var(--surface); border-radius: 8px;
+    border: 1px solid var(--border); }
 """
 
 
@@ -140,6 +144,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
     nav_items = [
         ("Overview", "/"),
         ("Search", "/search"),
+        ("Graph", "/graph"),
         ("Entities", "/entities"),
         ("Folders", "/folders"),
         ("Briefing", "/briefing"),
@@ -249,6 +254,25 @@ def create_app():
         ) or '<div class="muted">(no entities yet — install [ner] extra and reindex)</div>'
 
         rerank = reranker.name if reranker else "disabled"
+        spend = spend_summary(cfg)
+        spend_lines = []
+        for provider, bucket in spend.items():
+            if provider not in ("voyage", "anthropic"):
+                continue
+            cap_cents = (
+                cfg.daily_budget_cents_voyage if provider == "voyage"
+                else cfg.daily_budget_cents_anthropic
+            )
+            cap_str = "no cap" if cap_cents == 0 else f"of ${cap_cents / 100:.2f}"
+            warn = "warn" if cap_cents > 0 and bucket["cents"] >= cap_cents * 0.8 else ""
+            spend_lines.append(
+                f'<div class="stat"><span class="k">{provider}</span>'
+                f'<span class="v {warn}">${bucket["cents"] / 100:.4f} {cap_str} '
+                f'<span class="muted">· {bucket["calls"]} calls · '
+                f'{bucket["tokens"]:,} tok</span></span></div>'
+            )
+        spend_html = "".join(spend_lines) or '<div class="muted">(no spend recorded yet)</div>'
+
         body = f"""
 <h1>Overview</h1>
 <div class="grid">
@@ -259,6 +283,13 @@ def create_app():
         <div class="stat"><span class="k">Entities</span><span class="v">{s.get('entities', 0)}</span></div>
         <div class="stat"><span class="k">Embedder</span><span class="v">{escape(str(s['embedder']))} (dim {s['embedding_dim']})</span></div>
         <div class="stat"><span class="k">Reranker</span><span class="v">{escape(rerank)}</span></div>
+    </div>
+    <div class="card">
+        <h2>Today's spend (last 24h)</h2>
+        {spend_html}
+        <div class="muted" style="margin-top:8px;font-size:12px;">
+            Caps refuse new paid calls once hit. Edit `daily_budget_cents_*` in config.toml.
+        </div>
     </div>
     <div class="card">
         <h2>Quick search</h2>
@@ -481,6 +512,158 @@ def create_app():
     <tbody>{rows_html}</tbody>
 </table></div>"""
         return HTMLResponse(_layout("Folders", body, "folders"))
+
+    @app.get("/graph", response_class=HTMLResponse)
+    def graph_page(top_n: int = 100, min_cooccur: int = 2):
+        body = f"""
+<h1>Knowledge graph</h1>
+<form method="get" action="/graph" class="filters">
+    <label class="muted">Top entities:</label>
+    <input type="number" name="top_n" value="{top_n}" min="20" max="500" style="width: 90px;">
+    <label class="muted">Min co-occurrences:</label>
+    <input type="number" name="min_cooccur" value="{min_cooccur}" min="1" max="20" style="width: 70px;">
+    <button type="submit">Reload</button>
+    <span class="muted">Click any node to drill into its entity page. Drag nodes to reposition. Scroll to zoom.</span>
+</form>
+<div id="cy"></div>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+<script>
+fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json()).then(data => {{
+    const cy = cytoscape({{
+        container: document.getElementById('cy'),
+        elements: [...data.nodes, ...data.edges],
+        style: [
+            {{ selector: 'node', style: {{
+                'background-color': 'data(color)',
+                'label': 'data(label)',
+                'color': '#e6e6ea',
+                'font-size': 11,
+                'font-family': '-apple-system, "Segoe UI", sans-serif',
+                'width': 'data(size)',
+                'height': 'data(size)',
+                'text-outline-color': '#0e0e10',
+                'text-outline-width': 2,
+                'text-margin-y': -4,
+            }} }},
+            {{ selector: 'edge', style: {{
+                'width': 'data(weight)',
+                'line-color': '#3a3a45',
+                'curve-style': 'haystack',
+                'opacity': 0.55,
+            }} }},
+            {{ selector: 'node:selected', style: {{
+                'border-width': 3,
+                'border-color': '#4d9fff',
+            }} }},
+        ],
+        layout: {{
+            name: 'cose',
+            idealEdgeLength: 90,
+            nodeOverlap: 20,
+            refresh: 20,
+            fit: true,
+            padding: 30,
+            randomize: true,
+            componentSpacing: 100,
+            nodeRepulsion: 400000,
+            edgeElasticity: 100,
+            nestingFactor: 5,
+            gravity: 80,
+            numIter: 1000,
+            initialTemp: 200,
+            coolingFactor: 0.95,
+            minTemp: 1.0,
+        }},
+        wheelSensitivity: 0.2,
+    }});
+    cy.on('tap', 'node', (evt) => {{
+        const name = evt.target.data('raw_text');
+        window.location.href = '/entity?name=' + encodeURIComponent(name);
+    }});
+}});
+</script>"""
+        return HTMLResponse(_layout("Graph", body, "graph"))
+
+    @app.get("/graph/data")
+    def graph_data(top_n: int = 100, min_cooccur: int = 2):
+        cfg, conn, _, _ = get_state()
+        # Step 1: pick top_n entities by chunk count.
+        ent_rows = conn.execute(
+            "SELECT text, label, text_lower, COUNT(DISTINCT chunk_id) AS n "
+            "FROM entities GROUP BY text_lower, label "
+            "ORDER BY n DESC LIMIT ?",
+            (top_n,),
+        ).fetchall()
+        # Step 2: pull co-occurrences, filtered to that entity set, above the
+        # threshold. Self-join on chunk_id; use casefold-lower as the canonical
+        # identity so 'Apollo 11' and 'apollo 11' merge.
+        keys = {r["text_lower"] for r in ent_rows}
+        if not keys or len(keys) < 2:
+            return {"nodes": [], "edges": []}
+        placeholders = ",".join("?" * len(keys))
+        edge_rows = conn.execute(
+            f"SELECT a.text_lower AS a, b.text_lower AS b, "
+            f"       COUNT(DISTINCT a.chunk_id) AS w "
+            f"FROM entities a "
+            f"JOIN entities b ON a.chunk_id = b.chunk_id AND a.text_lower < b.text_lower "
+            f"WHERE a.text_lower IN ({placeholders}) "
+            f"  AND b.text_lower IN ({placeholders}) "
+            f"GROUP BY a.text_lower, b.text_lower "
+            f"HAVING w >= ? "
+            f"ORDER BY w DESC",
+            [*keys, *keys, min_cooccur],
+        ).fetchall()
+
+        label_color = {
+            "PERSON": "#4d6dff",
+            "ORG": "#ff8c4d",
+            "GPE": "#4dff8c",
+            "LOC": "#4dff8c",
+            "FAC": "#4dff8c",
+            "PRODUCT": "#c44dff",
+            "WORK_OF_ART": "#c44dff",
+            "DATE": "#4dffe6",
+            "MONEY": "#ffe14d",
+            "EVENT": "#ff4d6d",
+            "LAW": "#ff4d6d",
+            "NORP": "#ff4d6d",
+            "LANGUAGE": "#ff4d6d",
+        }
+        max_n = max((r["n"] for r in ent_rows), default=1)
+        # Drop nodes with no edges - they show up as orphans and clutter the layout.
+        connected: set[str] = set()
+        for e in edge_rows:
+            connected.add(e["a"])
+            connected.add(e["b"])
+        nodes = []
+        for r in ent_rows:
+            if r["text_lower"] not in connected:
+                continue
+            size = 16 + 38 * (r["n"] / max_n)
+            nodes.append({
+                "data": {
+                    "id": r["text_lower"],
+                    "label": r["text"],
+                    "raw_text": r["text"],
+                    "color": label_color.get(r["label"], "#888"),
+                    "size": round(size),
+                    "n": r["n"],
+                    "ent_label": r["label"],
+                }
+            })
+        max_w = max((r["w"] for r in edge_rows), default=1)
+        edges = []
+        for r in edge_rows:
+            edges.append({
+                "data": {
+                    "id": f"{r['a']}__{r['b']}",
+                    "source": r["a"],
+                    "target": r["b"],
+                    "weight": round(1 + 6 * (r["w"] / max_w), 1),
+                    "raw_w": r["w"],
+                }
+            })
+        return {"nodes": nodes, "edges": edges}
 
     @app.get("/file", response_class=HTMLResponse)
     def file_view(path: str):

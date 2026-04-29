@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 
+from .budget import BudgetExceededError, check_budget, record_usage
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -185,8 +186,13 @@ def generate_briefing(
         return f"# Daily briefing\n\nNothing new in the last {hours} hours."
 
     user_content = _format_digest_for_llm(digest)
-    client = anthropic.Anthropic()
 
+    try:
+        check_budget(cfg, "anthropic")
+    except BudgetExceededError as e:
+        return f"(briefing skipped: {e})"
+
+    client = anthropic.Anthropic()
     try:
         response = client.messages.create(
             model=cfg.briefing_model,
@@ -202,6 +208,13 @@ def generate_briefing(
     except anthropic.APIError as e:
         log.warning("briefing API call failed: %s", e)
         return f"(briefing failed: {e})"
+
+    record_usage(
+        cfg, "anthropic", cfg.briefing_model,
+        input_tokens=response.usage.input_tokens + response.usage.cache_read_input_tokens,
+        output_tokens=response.usage.output_tokens,
+        note=f"briefing/{digest.hours}h",
+    )
 
     text_parts: list[str] = []
     for block in response.content:

@@ -18,6 +18,7 @@ from typing import Protocol, runtime_checkable
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from .budget import check_budget, record_usage
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -41,7 +42,12 @@ class ImageEmbedder(Protocol):
 class VoyageMultimodalEmbedder:
     """voyage-multimodal-3: text and images share the same 1024-dim vector space."""
 
-    def __init__(self, api_key: str, model: str = "voyage-multimodal-3"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "voyage-multimodal-3",
+        cfg: Config | None = None,
+    ):
         import voyageai
 
         if model not in _VOYAGE_MM_DIMS:
@@ -51,6 +57,7 @@ class VoyageMultimodalEmbedder:
         self._client = voyageai.Client(api_key=api_key)
         self.name = model
         self.dim = _VOYAGE_MM_DIMS[model]
+        self._cfg = cfg
 
     def _open_image(self, path: Path):
         from PIL import Image
@@ -64,21 +71,37 @@ class VoyageMultimodalEmbedder:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def embed_image(self, path: Path) -> list[float]:
+        if self._cfg is not None:
+            check_budget(self._cfg, "voyage")
         img = self._open_image(path)
         result = self._client.multimodal_embed(
             inputs=[[img]],
             model=self.name,
             input_type="document",
         )
+        if self._cfg is not None:
+            record_usage(
+                self._cfg, "voyage", self.name,
+                input_tokens=getattr(result, "total_tokens", 0),
+                note=f"image/{path.name}",
+            )
         return list(result.embeddings[0])
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def embed_text_query(self, text: str) -> list[float]:
+        if self._cfg is not None:
+            check_budget(self._cfg, "voyage")
         result = self._client.multimodal_embed(
             inputs=[[text]],
             model=self.name,
             input_type="query",
         )
+        if self._cfg is not None:
+            record_usage(
+                self._cfg, "voyage", self.name,
+                input_tokens=getattr(result, "total_tokens", 0),
+                note="image/query",
+            )
         return list(result.embeddings[0])
 
 
@@ -88,4 +111,4 @@ def make_image_embedder(cfg: Config) -> ImageEmbedder | None:
         return None
     if not cfg.voyage_api_key:
         return None
-    return VoyageMultimodalEmbedder(cfg.voyage_api_key, model=cfg.multimodal_model)
+    return VoyageMultimodalEmbedder(cfg.voyage_api_key, model=cfg.multimodal_model, cfg=cfg)
