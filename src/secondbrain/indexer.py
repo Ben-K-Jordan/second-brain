@@ -18,6 +18,7 @@ from .config import (
 )
 from .db import delete_file, get_file_by_path, replace_chunks, upsert_file
 from .embedder import Embedder
+from .imager import OCREngine
 from .transcriber import Transcriber
 
 log = logging.getLogger(__name__)
@@ -53,9 +54,18 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def extract_text(path: Path, transcriber: Transcriber | None = None) -> str:
-    """Pull text out of a file. Plain reads for text/code; markitdown for documents;
-    Whisper transcription for audio/video when a transcriber is supplied."""
+def extract_text(
+    path: Path,
+    transcriber: Transcriber | None = None,
+    ocr_engine: OCREngine | None = None,
+) -> str:
+    """Pull text out of a file.
+
+    - text/code/markdown: plain read
+    - documents (PDF, DOCX, etc.): markitdown
+    - audio/video: Whisper transcription (if transcriber supplied)
+    - images: OCR (if ocr_engine supplied)
+    """
     kind = classify_file(path)
     ext = path.suffix.lower()
 
@@ -67,12 +77,16 @@ def extract_text(path: Path, transcriber: Transcriber | None = None) -> str:
         result = md.convert(str(path))
         return result.text_content or ""
 
-    if kind == "media":
-        # Audio/video: transcribe with Whisper. Images currently fall through
-        # to the empty return; OCR/CLIP arrives in Phase 1.4.
-        if transcriber is not None and ext in _AUDIO_VIDEO_EXTS:
+    if kind == "audio_video":
+        if transcriber is not None:
             log.info("transcribing %s with %s", path.name, transcriber.name)
             return transcriber.transcribe(path)
+        return ""
+
+    if kind == "image":
+        if ocr_engine is not None:
+            log.info("OCR'ing %s with %s", path.name, ocr_engine.name)
+            return ocr_engine.ocr(path)
         return ""
 
     # Last-ditch attempt for unknown types
@@ -80,12 +94,6 @@ def extract_text(path: Path, transcriber: Transcriber | None = None) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
-
-
-_AUDIO_VIDEO_EXTS = frozenset({
-    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus",
-    ".mp4", ".mov", ".avi", ".mkv", ".webm",
-})
 
 
 def chunk_text(
@@ -183,7 +191,12 @@ def build_context_prefix(path: Path, full_text: str, chunk_offset: int) -> str:
     return "\n".join(parts) + "\n\n"
 
 
-def should_index(path: Path, cfg: Config, transcriber: Transcriber | None = None) -> tuple[bool, str | None]:
+def should_index(
+    path: Path,
+    cfg: Config,
+    transcriber: Transcriber | None = None,
+    ocr_engine: OCREngine | None = None,
+) -> tuple[bool, str | None]:
     """Decide whether a path is eligible for indexing."""
     if not path.exists() or not path.is_file():
         return False, "not a file"
@@ -193,13 +206,10 @@ def should_index(path: Path, cfg: Config, transcriber: Transcriber | None = None
     if kind == "other":
         return False, "unrecognized file type"
     ext = path.suffix.lower()
-    if kind == "media":
-        if ext in _AUDIO_VIDEO_EXTS:
-            if transcriber is None:
-                return False, "audio/video skipped (transcriber disabled)"
-        else:
-            # Image: OCR/CLIP arrives in Phase 1.4.
-            return False, "image (OCR/CLIP not yet implemented)"
+    if kind == "audio_video" and transcriber is None:
+        return False, "audio/video skipped (transcriber disabled)"
+    if kind == "image" and ocr_engine is None:
+        return False, "image skipped (OCR disabled)"
     try:
         size = path.stat().st_size
     except OSError as e:
@@ -221,9 +231,10 @@ def index_file(
     cfg: Config,
     path: Path,
     transcriber: Transcriber | None = None,
+    ocr_engine: OCREngine | None = None,
 ) -> IndexResult:
     """Index a single file (extract -> chunk -> embed -> store)."""
-    ok, reason = should_index(path, cfg, transcriber=transcriber)
+    ok, reason = should_index(path, cfg, transcriber=transcriber, ocr_engine=ocr_engine)
     if not ok:
         return IndexResult(path, "skipped", reason=reason)
 
@@ -238,7 +249,7 @@ def index_file(
         return IndexResult(path, "unchanged")
 
     try:
-        text = extract_text(path, transcriber=transcriber)
+        text = extract_text(path, transcriber=transcriber, ocr_engine=ocr_engine)
     except Exception as e:
         log.warning("extraction failed for %s: %s", path, e)
         return IndexResult(path, "error", reason=f"extraction: {e}")
@@ -299,11 +310,15 @@ def index_folder(
     folder: Path,
     progress=None,
     transcriber: Transcriber | None = None,
+    ocr_engine: OCREngine | None = None,
 ) -> dict[str, int]:
     """Walk a folder and index all eligible files. Returns counts."""
     counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0}
     for p in walk_folder(folder, cfg):
-        result = index_file(conn, embedder, cfg, p, transcriber=transcriber)
+        result = index_file(
+            conn, embedder, cfg, p,
+            transcriber=transcriber, ocr_engine=ocr_engine,
+        )
         counts[result.status] = counts.get(result.status, 0) + 1
         if progress:
             progress(result)

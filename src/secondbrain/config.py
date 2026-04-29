@@ -84,11 +84,17 @@ CODE_EXTENSIONS: frozenset[str] = frozenset({
     ".sql", ".r", ".scala", ".clj", ".ex", ".exs", ".elm",
 })
 
-MEDIA_EXTENSIONS: frozenset[str] = frozenset({
+AUDIO_VIDEO_EXTENSIONS: frozenset[str] = frozenset({
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus",
     ".mp4", ".mov", ".avi", ".mkv", ".webm",
+})
+
+IMAGE_EXTENSIONS: frozenset[str] = frozenset({
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".heic",
 })
+
+# Backwards-compatibility alias; remove after one release if nothing depends on it.
+MEDIA_EXTENSIONS: frozenset[str] = AUDIO_VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
 
 
 def app_data_dir() -> Path:
@@ -126,6 +132,10 @@ class Config:
     # Media transcription (audio/video -> text via faster-whisper)
     transcribe_enabled: bool = True
     whisper_model_size: str = "small"  # tiny/base/small/medium/large-v3
+
+    # Image OCR (text-in-image -> text via Tesseract)
+    ocr_enabled: bool = True
+    ocr_lang: str = "eng"
 
     @property
     def db_path(self) -> Path:
@@ -180,6 +190,12 @@ rerank_overfetch = 50
 # Requires the [whisper] extra: pip install -e .[whisper]
 transcribe_enabled = true
 whisper_model_size = "small"  # tiny/base/small/medium/large-v3
+
+# Image OCR. When enabled, image files are OCR'd via Tesseract and the text
+# flows into the regular index. Requires the [ocr] extra AND a Tesseract
+# binary on PATH (see README for install).
+ocr_enabled = true
+ocr_lang = "eng"
 """
 
 
@@ -218,6 +234,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.transcribe_enabled = bool(data["transcribe_enabled"])
         if "whisper_model_size" in data:
             cfg.whisper_model_size = data["whisper_model_size"]
+        if "ocr_enabled" in data:
+            cfg.ocr_enabled = bool(data["ocr_enabled"])
+        if "ocr_lang" in data:
+            cfg.ocr_lang = data["ocr_lang"]
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg
@@ -241,12 +261,14 @@ def is_ignored(path: Path, ignore_globs: tuple[str, ...]) -> bool:
 
 
 def classify_file(path: Path) -> str:
-    """Return one of: 'document', 'code', 'media', 'other'."""
+    """Return one of: 'document', 'code', 'audio_video', 'image', 'other'."""
     ext = path.suffix.lower()
     if ext in DOCUMENT_EXTENSIONS:
         return "document"
     if ext in CODE_EXTENSIONS:
         return "code"
-    if ext in MEDIA_EXTENSIONS:
-        return "media"
+    if ext in AUDIO_VIDEO_EXTENSIONS:
+        return "audio_video"
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
     return "other"

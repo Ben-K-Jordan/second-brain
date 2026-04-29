@@ -29,6 +29,9 @@ local = [
 whisper = [
     "faster-whisper>=1.0",
 ]
+ocr = [
+    "pytesseract>=0.3",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
