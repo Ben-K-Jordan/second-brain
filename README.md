@@ -16,38 +16,57 @@ Existing "second brain" tools each pick one axis and ignore the others:
 | Local-first + optional sync    | ✓ | ✓ | — | — | — | ✓ |
 | Plugin architecture            | ✓ | ✓ | — | — | — | (planned) |
 
-## What it does today (Phase 0)
+## What it does today
 
 - **Watches folders** you point it at and re-indexes files whose contents change.
 - **Extracts text** from PDF, DOCX, PPTX, XLSX, HTML, EPUB, Markdown, code, JSON/YAML/TOML, and more (via `markitdown`).
-- **Embeds** chunks with [Voyage AI](https://www.voyageai.com/) by default (best-in-class retrieval quality, ~$0.18/1M tokens) or local `sentence-transformers` if you'd rather not use an API.
-- **Hybrid search** (vector + BM25, fused with Reciprocal Rank Fusion) — recall that pure-vector search misses.
+- **Transcribes audio and video** (.mp3, .mp4, .m4a, .mov, etc.) locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — voice memos and recordings become searchable text.
+- **OCRs images** (.png, .jpg, screenshots, photos of whiteboards) via Tesseract.
+- **Embeds** chunks with [Voyage AI](https://www.voyageai.com/) by default (`voyage-3`, ~$0.18/1M tokens) or local `sentence-transformers` for offline operation.
+- **Contextual chunking** — each chunk is embedded with a `Document: …\nSection: …` preamble so the embedder sees document context, not bare fragments. Measurably improves recall on slides, code, and other fragmented content.
+- **Hybrid search** (vector + BM25, fused with Reciprocal Rank Fusion) plus **cross-encoder reranking** (`voyage-rerank-2-lite`) for precision on top results.
 - **Skips secrets and binaries** by default (`.env`, `*.key`, `*.pem`, executables, archives, `node_modules/`, `.git/`, etc.).
-- **MCP server** with five tools: `search_brain`, `vector_search`, `keyword_search`, `get_file`, `get_recent`, `index_status`. Plug into Claude Desktop, Claude Code, Cursor, Cline, or anything else that speaks MCP.
+- **MCP server** with `search_brain`, `vector_search`, `keyword_search`, `get_file`, `get_recent`, `index_status`. Plug into Claude Desktop, Claude Code, Cursor, Cline, or anything else that speaks MCP.
 
 ## Roadmap
 
-- **Phase 0 (current)** — spine: ingest → chunk → embed → hybrid search → MCP.
-- **Phase 1** — Whisper transcription for audio/video, OCR for images and screenshots, browser history, clipboard daemon, Slack/Discord/Notion importers.
-- **Phase 2** — cross-encoder reranking (Voyage rerank-2), HyDE query rewriting, time-decay scoring.
+- **Phase 0** — spine: ingest → chunk → embed → hybrid search → MCP. ✅
+- **Phase 1.1** — cross-encoder reranking. ✅
+- **Phase 1.2** — contextual chunking. ✅
+- **Phase 1.3** — Whisper transcription for audio/video. ✅
+- **Phase 1.4** — image OCR via Tesseract. ✅
+- **Phase 1.5** — background daemon + system tray icon (drop-and-forget UX).
+- **Phase 2** — CLIP / voyage-multimodal-3 for semantic image search; HyDE query rewriting; time-decay scoring; query-adaptive hybrid alpha.
 - **Phase 3** — entity extraction, knowledge graph, graph queries exposed as MCP tools.
 - **Phase 4** — Tauri desktop UI: search, browse, daily timeline, graph view.
 - **Phase 5** — encrypted multi-device sync.
-- **Phase 6** — plugin SDK and reference plugins.
+- **Phase 6** — plugin SDK and reference plugins (Notion / Slack / Anki).
 
 ## Install
 
 ```bash
-git clone https://github.com/benj9/second-brain.git
+git clone https://github.com/Ben-K-Jordan/second-brain.git
 cd second-brain
 python -m venv .venv && source .venv/bin/activate    # or .venv\Scripts\activate on Windows
 pip install -e .
 
-# Optional: local embedder fallback (~2 GB of torch + models)
-pip install -e .[local]
+# Optional extras (any combination):
+pip install -e .[local]    # local embedder fallback (sentence-transformers + torch, ~2 GB)
+pip install -e .[whisper]  # audio/video transcription via faster-whisper
+pip install -e .[ocr]      # OCR for images via pytesseract (also requires Tesseract binary)
 ```
 
 Requires Python 3.11+.
+
+### Tesseract install (for `[ocr]`)
+
+The `pytesseract` Python package shells out to a Tesseract binary, which must be installed separately:
+
+```bash
+winget install UB-Mannheim.TesseractOCR    # Windows
+brew install tesseract                      # macOS
+sudo apt install tesseract-ocr              # Linux (Debian/Ubuntu)
+```
 
 ## Quick start
 
