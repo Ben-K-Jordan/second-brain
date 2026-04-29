@@ -147,6 +147,11 @@ class Config:
     entities_enabled: bool = True
     spacy_model: str = "en_core_web_sm"
 
+    # Multimodal image embeddings: semantic image search via voyage-multimodal-3.
+    # Images are also OCR'd in parallel; the two paths complement each other.
+    image_embed_enabled: bool = True
+    multimodal_model: str = "voyage-multimodal-3"
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -225,8 +230,18 @@ ocr_lang = "eng"
 # places, dates, money, etc. per chunk and stores them for graph queries.
 # Requires the [ner] extra AND a one-time model download:
 #   python -m spacy download en_core_web_sm
+# For higher-quality NER on prose, swap to en_core_web_lg (~750MB):
+#   python -m spacy download en_core_web_lg
+#   then set spacy_model = "en_core_web_lg" below
 entities_enabled = true
 spacy_model = "en_core_web_sm"
+
+# Multimodal image embeddings. When enabled, images are embedded via
+# voyage-multimodal-3 alongside being OCR'd, so semantic image search
+# ("the diagram of X") works in addition to text-in-image search.
+# Requires VOYAGE_API_KEY (no extra needed - voyage SDK already pulled in).
+image_embed_enabled = true
+multimodal_model = "voyage-multimodal-3"
 """
 
 
@@ -281,6 +296,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.entities_enabled = bool(data["entities_enabled"])
         if "spacy_model" in data:
             cfg.spacy_model = data["spacy_model"]
+        if "image_embed_enabled" in data:
+            cfg.image_embed_enabled = bool(data["image_embed_enabled"])
+        if "multimodal_model" in data:
+            cfg.multimodal_model = data["multimodal_model"]
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     return cfg

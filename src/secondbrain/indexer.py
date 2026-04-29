@@ -18,9 +18,17 @@ from .config import (
     classify_file,
     is_ignored,
 )
-from .db import delete_file, get_file_by_path, insert_entities, replace_chunks, upsert_file
+from .db import (
+    delete_file,
+    get_file_by_path,
+    insert_entities,
+    replace_chunks,
+    upsert_file,
+    upsert_image_embedding,
+)
 from .embedder import Embedder
 from .entities import EntityExtractor
+from .image_embedder import ImageEmbedder
 from .imager import OCREngine
 from .transcriber import Transcriber
 
@@ -217,6 +225,7 @@ def should_index(
     cfg: Config,
     transcriber: Transcriber | None = None,
     ocr_engine: OCREngine | None = None,
+    image_embedder: ImageEmbedder | None = None,
 ) -> tuple[bool, str | None]:
     """Decide whether a path is eligible for indexing."""
     if not path.exists() or not path.is_file():
@@ -229,8 +238,8 @@ def should_index(
     ext = path.suffix.lower()
     if kind == "audio_video" and transcriber is None:
         return False, "audio/video skipped (transcriber disabled)"
-    if kind == "image" and ocr_engine is None:
-        return False, "image skipped (OCR disabled)"
+    if kind == "image" and ocr_engine is None and image_embedder is None:
+        return False, "image skipped (OCR and multimodal disabled)"
     try:
         size = path.stat().st_size
     except OSError as e:
@@ -254,9 +263,18 @@ def index_file(
     transcriber: Transcriber | None = None,
     ocr_engine: OCREngine | None = None,
     entity_extractor: EntityExtractor | None = None,
+    image_embedder: ImageEmbedder | None = None,
 ) -> IndexResult:
-    """Index a single file (extract -> chunk -> embed -> entities -> store)."""
-    ok, reason = should_index(path, cfg, transcriber=transcriber, ocr_engine=ocr_engine)
+    """Index a single file (extract -> chunk -> embed -> entities -> store).
+
+    For images, OCR text (if enabled) flows through the regular pipeline AND
+    the image is also embedded via the multimodal model (if enabled) into a
+    side table for semantic image search.
+    """
+    ok, reason = should_index(
+        path, cfg,
+        transcriber=transcriber, ocr_engine=ocr_engine, image_embedder=image_embedder,
+    )
     if not ok:
         return IndexResult(path, "skipped", reason=reason)
 
@@ -276,25 +294,29 @@ def index_file(
         log.warning("extraction failed for %s: %s", path, e)
         return IndexResult(path, "error", reason=f"extraction: {e}")
 
-    if not text.strip():
+    kind = classify_file(path)
+    has_text = bool(text.strip())
+    will_embed_image = kind == "image" and image_embedder is not None
+
+    if not has_text and not will_embed_image:
         return IndexResult(path, "skipped", reason="no extractable text")
 
-    chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
-    if not chunked:
-        return IndexResult(path, "skipped", reason="no chunks produced")
+    chunk_texts: list[str] = []
+    embeddings: list[list[float]] = []
 
-    chunk_texts = [c for c, _ in chunked]
-    contextualized = [
-        build_context_prefix(path, text, offset) + c for c, offset in chunked
-    ]
+    if has_text:
+        chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+        if chunked:
+            chunk_texts = [c for c, _ in chunked]
+            contextualized = [
+                build_context_prefix(path, text, offset) + c for c, offset in chunked
+            ]
+            try:
+                embeddings = embedder.embed_documents(contextualized)
+            except Exception as e:
+                log.warning("embedding failed for %s: %s", path, e)
+                return IndexResult(path, "error", reason=f"embedding: {e}")
 
-    try:
-        embeddings = embedder.embed_documents(contextualized)
-    except Exception as e:
-        log.warning("embedding failed for %s: %s", path, e)
-        return IndexResult(path, "error", reason=f"embedding: {e}")
-
-    kind = classify_file(path)
     file_id = upsert_file(
         conn,
         path=str(path),
@@ -303,11 +325,23 @@ def index_file(
         kind=kind,
         content_hash=chash,
     )
-    chunk_ids = replace_chunks(
-        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
-    )
+    chunk_ids: list[int] = []
+    if chunk_texts:
+        chunk_ids = replace_chunks(
+            conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+        )
 
-    if entity_extractor is not None:
+    if will_embed_image:
+        try:
+            img_emb = image_embedder.embed_image(path)
+            upsert_image_embedding(
+                conn, file_id, image_embedder.name, image_embedder.dim, img_emb
+            )
+        except Exception as e:
+            # Don't fail the whole file - OCR (if any) is already stored.
+            log.warning("image embedding failed for %s: %s", path, e)
+
+    if entity_extractor is not None and chunk_ids:
         try:
             for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
                 # Strip markdown links/images so URLs don't bleed into entities.
@@ -490,6 +524,7 @@ def index_folder(
     transcriber: Transcriber | None = None,
     ocr_engine: OCREngine | None = None,
     entity_extractor: EntityExtractor | None = None,
+    image_embedder: ImageEmbedder | None = None,
 ) -> dict[str, int]:
     """Walk a folder and index all eligible files. Returns counts."""
     counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "error": 0}
@@ -498,6 +533,7 @@ def index_folder(
             conn, embedder, cfg, p,
             transcriber=transcriber, ocr_engine=ocr_engine,
             entity_extractor=entity_extractor,
+            image_embedder=image_embedder,
         )
         counts[result.status] = counts.get(result.status, 0) + 1
         if progress:

@@ -10,8 +10,9 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config, load_config
-from .db import connect, init_schema, stats
+from .db import connect, init_schema, search_images, stats
 from .embedder import make_embedder
+from .image_embedder import make_image_embedder
 from .reranker import make_reranker
 from .search import hybrid_search, keyword_only, vector_only
 
@@ -166,6 +167,32 @@ def ingest_url(url: str) -> str:
     if result.status == "unchanged":
         return f"Unchanged: {url}"
     return f"{result.status}: {url} ({result.reason})"
+
+
+@mcp.tool()
+def image_search(query: str, k: int = 10) -> str:
+    """Semantic search over your indexed images via voyage-multimodal-3.
+
+    Embeds the query as text and finds visually similar images. Works for
+    "the diagram of system architecture", "screenshot with a chart",
+    "photo of my whiteboard", etc. Pair with `get_file` to view the
+    matching image's path.
+    """
+    cfg, conn, _, _ = _get_state()
+    if not cfg.image_embed_enabled:
+        return "(image embedding disabled in config)"
+    img_embedder = make_image_embedder(cfg)
+    if img_embedder is None:
+        return "(no multimodal embedder available - set VOYAGE_API_KEY)"
+    q_emb = img_embedder.embed_text_query(query)
+    rows = search_images(conn, q_emb, k=k)
+    if not rows:
+        return "(no images indexed yet)"
+    lines = [f"# Image search: {query!r}", ""]
+    for _img_id, path, mtime, distance in rows:
+        age_days = (time.time() - mtime) / 86400 if mtime else 0
+        lines.append(f"  distance={distance:.4f}  ({age_days:.1f}d ago)  {path}")
+    return "\n".join(lines)
 
 
 @mcp.tool()

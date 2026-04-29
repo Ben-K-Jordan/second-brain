@@ -38,6 +38,10 @@ tray = [
 ner = [
     "spacy>=3.7",
 ]
+dashboard = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

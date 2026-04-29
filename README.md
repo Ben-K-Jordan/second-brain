@@ -18,15 +18,20 @@ Existing "second brain" tools each pick one axis and ignore the others:
 
 ## What it does today
 
-- **Watches folders** you point it at and re-indexes files whose contents change.
+- **Watches folders** you point it at and re-indexes files whose contents change. Run `secondbrain daemon` (headless) or `secondbrain tray` (system tray) for ambient ingestion.
 - **Extracts text** from PDF, DOCX, PPTX, XLSX, HTML, EPUB, Markdown, code, JSON/YAML/TOML, and more (via `markitdown`).
 - **Transcribes audio and video** (.mp3, .mp4, .m4a, .mov, etc.) locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — voice memos and recordings become searchable text.
-- **OCRs images** (.png, .jpg, screenshots, photos of whiteboards) via Tesseract.
-- **Embeds** chunks with [Voyage AI](https://www.voyageai.com/) by default (`voyage-3`, ~$0.18/1M tokens) or local `sentence-transformers` for offline operation.
-- **Contextual chunking** — each chunk is embedded with a `Document: …\nSection: …` preamble so the embedder sees document context, not bare fragments. Measurably improves recall on slides, code, and other fragmented content.
-- **Hybrid search** (vector + BM25, fused with Reciprocal Rank Fusion) plus **cross-encoder reranking** (`voyage-rerank-2-lite`) for precision on top results.
+- **OCRs images** (.png, .jpg, screenshots, photos of whiteboards) via Tesseract for in-image text.
+- **Semantic image search** via Voyage `voyage-multimodal-3` — find images by what they depict ("the diagram of system architecture", "screenshot showing a chart"), not just by OCR'd text.
+- **Ingests URLs** with `secondbrain ingest <url>` — handles HTML articles (with proper User-Agent so Wikipedia / news sites don't 403), PDF URLs, and YouTube transcripts.
+- **Embeds** chunks with Voyage by default (`voyage-3`, ~$0.18/1M tokens) or local `sentence-transformers` for offline operation.
+- **Contextual chunking** — each chunk is embedded with a `Document: …\nSection: …` preamble so the embedder sees document context, not bare fragments.
+- **Hybrid search** (vector + BM25, fused with Reciprocal Rank Fusion) plus **cross-encoder reranking** (`voyage-rerank-2-lite`), **query-adaptive alpha** (proper-noun queries lean BM25, prose leans vector), and a **gentle recency boost** (configurable half-life).
+- **Search filters**: `search_brain(query, folder=, kind=, since_days=)` for scoped queries.
+- **Knowledge graph layer**: spaCy NER pulls people / orgs / places / dates / money per chunk, queryable via `list_entities`, `find_mentions`, `entity_timeline`, and `entity_neighbors` (co-occurrence). Fuzzy matching: "Rowling" finds "J.K. Rowling" and vice versa.
+- **Local web dashboard** at http://localhost:8765 (`secondbrain dashboard`) — overview, search, entity browser, folder tree, file viewer, URL ingest form.
 - **Skips secrets and binaries** by default (`.env`, `*.key`, `*.pem`, executables, archives, `node_modules/`, `.git/`, etc.).
-- **MCP server** with `search_brain`, `vector_search`, `keyword_search`, `get_file`, `get_recent`, `index_status`. Plug into Claude Desktop, Claude Code, Cursor, Cline, or anything else that speaks MCP.
+- **MCP server** with 14 tools for AI assistants: `search_brain`, `vector_search`, `keyword_search`, `image_search`, `get_file`, `get_recent`, `list_folders`, `list_file_types`, `files_in_folder`, `index_status`, `list_entities`, `find_mentions`, `entity_timeline`, `entity_neighbors`, `ingest_url`. Plug into Claude Desktop, Claude Code, Cursor, Cline, or anything else that speaks MCP.
 
 ## Roadmap
 
@@ -35,12 +40,20 @@ Existing "second brain" tools each pick one axis and ignore the others:
 - **Phase 1.2** — contextual chunking. ✅
 - **Phase 1.3** — Whisper transcription for audio/video. ✅
 - **Phase 1.4** — image OCR via Tesseract. ✅
-- **Phase 1.5** — background daemon + system tray icon (drop-and-forget UX).
-- **Phase 2** — CLIP / voyage-multimodal-3 for semantic image search; HyDE query rewriting; time-decay scoring; query-adaptive hybrid alpha.
-- **Phase 3** — entity extraction, knowledge graph, graph queries exposed as MCP tools.
-- **Phase 4** — Tauri desktop UI: search, browse, daily timeline, graph view.
+- **Phase 1.5** — background daemon + system tray icon. ✅
+- **Phase 1.6** — smart URL ingest (HTML / PDF / YouTube). ✅
+- **Phase 1.7** — semantic image search via voyage-multimodal-3. ✅
+- **Phase 2.1** — time-decay scoring. ✅
+- **Phase 2.2** — query-adaptive hybrid alpha. ✅
+- **Phase 2.3** — discovery MCP tools (browse the brain). ✅
+- **Phase 2.4** — search filters (folder / kind / since_days). ✅
+- **Phase 3.1** — entity extraction. ✅
+- **Phase 3.2** — fuzzy entity matching. ✅
+- **Phase 3.3** — entity co-occurrence graph queries. ✅
+- **Phase 4** — local web dashboard. ✅
 - **Phase 5** — encrypted multi-device sync.
 - **Phase 6** — plugin SDK and reference plugins (Notion / Slack / Anki).
+- **Phase 7** — HyDE query rewriting; daily briefing (needs LLM key); tests + CI.
 
 ## Install
 
@@ -51,9 +64,20 @@ python -m venv .venv && source .venv/bin/activate    # or .venv\Scripts\activate
 pip install -e .
 
 # Optional extras (any combination):
-pip install -e .[local]    # local embedder fallback (sentence-transformers + torch, ~2 GB)
-pip install -e .[whisper]  # audio/video transcription via faster-whisper
-pip install -e .[ocr]      # OCR for images via pytesseract (also requires Tesseract binary)
+pip install -e .[local]      # local embedder fallback (sentence-transformers + torch, ~2 GB)
+pip install -e .[whisper]    # audio/video transcription via faster-whisper
+pip install -e .[ocr]        # OCR for images via pytesseract (also requires Tesseract binary)
+pip install -e .[ner]        # entity extraction via spaCy (also: python -m spacy download en_core_web_sm)
+pip install -e .[dashboard]  # local web dashboard (FastAPI + uvicorn)
+pip install -e .[tray]       # system tray app (pystray)
+```
+
+For higher-quality NER on prose, swap the spaCy model after install:
+
+```bash
+python -m spacy download en_core_web_lg     # ~750 MB, noticeably better
+# then in ~/.secondbrain/config.toml:
+# spacy_model = "en_core_web_lg"
 ```
 
 Requires Python 3.11+.

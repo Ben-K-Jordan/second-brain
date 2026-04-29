@@ -15,6 +15,7 @@ from watchdog.observers import Observer
 from .config import Config, is_ignored
 from .embedder import Embedder
 from .entities import EntityExtractor
+from .image_embedder import ImageEmbedder
 from .imager import OCREngine
 from .indexer import IndexResult, index_file, remove_file
 from .transcriber import Transcriber
@@ -80,6 +81,7 @@ class Watcher:
         transcriber: Transcriber | None = None,
         ocr_engine: OCREngine | None = None,
         entity_extractor: EntityExtractor | None = None,
+        image_embedder: ImageEmbedder | None = None,
     ):
         self._cfg = cfg
         self._conn = conn
@@ -87,6 +89,7 @@ class Watcher:
         self._transcriber = transcriber
         self._ocr_engine = ocr_engine
         self._entity_extractor = entity_extractor
+        self._image_embedder = image_embedder
         self._on_event = on_event or (lambda r: None)
         self._handler = _DebouncedHandler(cfg)
         self._observer = Observer()
@@ -104,6 +107,7 @@ class Watcher:
                         transcriber=self._transcriber,
                         ocr_engine=self._ocr_engine,
                         entity_extractor=self._entity_extractor,
+                        image_embedder=self._image_embedder,
                     )
                 self._on_event(result)
             except Exception as e:

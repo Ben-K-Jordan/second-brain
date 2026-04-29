@@ -19,6 +19,7 @@ from .config import Config
 from .db import connect, init_schema
 from .embedder import make_embedder
 from .entities import make_entity_extractor
+from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder
 from .transcriber import make_transcriber
@@ -53,7 +54,14 @@ def _setup_state(cfg: Config):
         except (ImportError, RuntimeError) as e:
             log.warning("entity extraction disabled: %s", e)
 
-    return conn, embedder, transcriber, ocr_engine, entity_extractor
+    image_embedder = None
+    if cfg.image_embed_enabled:
+        try:
+            image_embedder = make_image_embedder(cfg)
+        except Exception as e:
+            log.warning("multimodal image embedder disabled: %s", e)
+
+    return conn, embedder, transcriber, ocr_engine, entity_extractor, image_embedder
 
 
 class _Stats:
@@ -92,7 +100,7 @@ def _resolve_folders(cfg: Config) -> list[Path]:
     return [f for f in folders if f.exists()]
 
 
-def _bootstrap(cfg: Config, conn, embedder, transcriber, ocr_engine, entity_extractor, folders, stats: _Stats):
+def _bootstrap(cfg: Config, conn, embedder, transcriber, ocr_engine, entity_extractor, image_embedder, folders, stats: _Stats):
     """Index each folder once on startup so changes since last run are caught."""
     for folder in folders:
         log.info("bootstrap indexing %s", folder)
@@ -102,6 +110,7 @@ def _bootstrap(cfg: Config, conn, embedder, transcriber, ocr_engine, entity_extr
             transcriber=transcriber,
             ocr_engine=ocr_engine,
             entity_extractor=entity_extractor,
+            image_embedder=image_embedder,
         )
 
 
@@ -129,10 +138,13 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
         return
 
     log.info("starting daemon, watching: %s", [str(f) for f in folders])
-    conn, embedder, transcriber, ocr_engine, entity_extractor = _setup_state(cfg)
+    conn, embedder, transcriber, ocr_engine, entity_extractor, image_embedder = _setup_state(cfg)
     stats = _Stats()
 
-    _bootstrap(cfg, conn, embedder, transcriber, ocr_engine, entity_extractor, folders, stats)
+    _bootstrap(
+        cfg, conn, embedder, transcriber, ocr_engine, entity_extractor,
+        image_embedder, folders, stats,
+    )
     log.info("bootstrap done (indexed=%d errors=%d)", stats.indexed, stats.errors)
 
     watcher = Watcher(
@@ -140,6 +152,7 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
         on_event=stats.record,
         transcriber=transcriber, ocr_engine=ocr_engine,
         entity_extractor=entity_extractor,
+        image_embedder=image_embedder,
     )
     watcher.start(folders)
     log.info("watcher running. Ctrl-C to stop.")
@@ -196,17 +209,21 @@ def run_tray(cfg: Config) -> None:
     )
     log.info("starting tray, watching: %s", [str(f) for f in folders])
 
-    conn, embedder, transcriber, ocr_engine, entity_extractor = _setup_state(cfg)
+    conn, embedder, transcriber, ocr_engine, entity_extractor, image_embedder = _setup_state(cfg)
     stats = _Stats()
     watcher = Watcher(
         cfg, conn, embedder,
         on_event=stats.record,
         transcriber=transcriber, ocr_engine=ocr_engine,
         entity_extractor=entity_extractor,
+        image_embedder=image_embedder,
     )
 
     def bootstrap_async():
-        _bootstrap(cfg, conn, embedder, transcriber, ocr_engine, entity_extractor, folders, stats)
+        _bootstrap(
+            cfg, conn, embedder, transcriber, ocr_engine, entity_extractor,
+            image_embedder, folders, stats,
+        )
         log.info("bootstrap done")
 
     threading.Thread(target=bootstrap_async, name="sb-bootstrap", daemon=True).start()

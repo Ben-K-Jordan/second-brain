@@ -24,6 +24,7 @@ from .config import Config, load_config, write_default_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
 from .entities import make_entity_extractor
+from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder, index_url, walk_folder
 from .reranker import make_reranker
@@ -156,6 +157,16 @@ def index(
             console.print(f"[yellow]Entity extraction disabled:[/] {e}")
             entity_extractor = None
 
+    image_embedder = None
+    if cfg.image_embed_enabled:
+        try:
+            image_embedder = make_image_embedder(cfg)
+            if image_embedder:
+                console.print(f"[dim]Image embedder:[/] {image_embedder.name}")
+        except Exception as e:
+            console.print(f"[yellow]Multimodal image embedder disabled:[/] {e}")
+            image_embedder = None
+
     candidates = list(walk_folder(folder, cfg))
     console.print(
         f"Scanning [cyan]{folder}[/]: {len(candidates)} candidate file(s) "
@@ -182,6 +193,7 @@ def index(
             conn, embedder, cfg, folder, progress=on_result,
             transcriber=transcriber, ocr_engine=ocr_engine,
             entity_extractor=entity_extractor,
+            image_embedder=image_embedder,
         )
 
     console.print(
@@ -273,12 +285,20 @@ def watch(
         except (ImportError, RuntimeError) as e:
             console.print(f"[yellow]Entity extraction disabled:[/] {e}")
 
+    image_embedder = None
+    if cfg.image_embed_enabled:
+        try:
+            image_embedder = make_image_embedder(cfg)
+        except Exception as e:
+            console.print(f"[yellow]Multimodal image embedder disabled:[/] {e}")
+
     if bootstrap:
         console.print(f"Bootstrapping index for [cyan]{folder}[/]...")
         index_folder(
             conn, embedder, cfg, folder,
             transcriber=transcriber, ocr_engine=ocr_engine,
             entity_extractor=entity_extractor,
+            image_embedder=image_embedder,
         )
         console.print("[green]Bootstrap complete.[/]")
 
@@ -290,6 +310,7 @@ def watch(
         cfg, conn, embedder, on_event=on_event,
         transcriber=transcriber, ocr_engine=ocr_engine,
         entity_extractor=entity_extractor,
+        image_embedder=image_embedder,
     )
     watcher.start([folder])
     console.print(f"[green]Watching[/] {folder}. Press Ctrl-C to stop.")
@@ -341,6 +362,23 @@ def serve() -> None:
     from .mcp_server import run
 
     run()
+
+
+@app.command()
+def dashboard(
+    port: int = typer.Option(8765, "--port", "-p", help="HTTP port."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address (keep on localhost)."),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't open the browser."),
+) -> None:
+    """Launch the local web dashboard at http://localhost:8765 by default.
+
+    Browse stats, recent files, top entities, search with filters, ingest
+    URLs, and drill into any entity's mentions and co-occurring entities.
+    Requires the [dashboard] extra: pip install -e .[dashboard]
+    """
+    from .dashboard import run_dashboard
+
+    run_dashboard(host=host, port=port, open_browser=not no_open)
 
 
 @app.command()

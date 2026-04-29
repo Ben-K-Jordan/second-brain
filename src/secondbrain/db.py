@@ -95,6 +95,29 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{embedding_dim}])"
     )
 
+    # Image embedding side-table. Independent dimension because the multimodal
+    # model is separate from the text embedder; default voyage-multimodal-3
+    # is 1024-dim. The dim is captured per-row at insert time via the vec0
+    # virtual-table syntax we already use; we just need a stable schema here.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS images ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,"
+        "  embedder TEXT NOT NULL,"
+        "  embedding_dim INTEGER NOT NULL,"
+        "  indexed_at REAL NOT NULL,"
+        "  UNIQUE(file_id, embedder)"
+        ")"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_images_file_id ON images(file_id)")
+    # Default to 1024 (voyage-multimodal-3). If a user later switches to a
+    # different-dim multimodal model, we'll need a `secondbrain reset --images`
+    # equivalent; for now this matches all known multimodal options.
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_images USING vec0("
+        "image_id INTEGER PRIMARY KEY, embedding FLOAT[1024])"
+    )
+
     existing_dim = get_meta(conn, "embedding_dim")
     existing_embedder = get_meta(conn, "embedder_name")
     if existing_dim and int(existing_dim) != embedding_dim:
@@ -195,6 +218,52 @@ def replace_chunks(
             (chunk_id, serialize_f32(embedding)),
         )
     return new_ids
+
+
+def upsert_image_embedding(
+    conn: sqlite3.Connection,
+    file_id: int,
+    embedder_name: str,
+    embedding_dim: int,
+    embedding: list[float],
+) -> int:
+    """Replace any existing image embedding for this file+embedder, return image_id."""
+    import time as _time
+
+    old = conn.execute(
+        "SELECT id FROM images WHERE file_id = ? AND embedder = ?",
+        (file_id, embedder_name),
+    ).fetchone()
+    if old:
+        conn.execute("DELETE FROM vec_images WHERE image_id = ?", (old["id"],))
+        conn.execute("DELETE FROM images WHERE id = ?", (old["id"],))
+    cur = conn.execute(
+        "INSERT INTO images(file_id, embedder, embedding_dim, indexed_at) "
+        "VALUES (?, ?, ?, ?) RETURNING id",
+        (file_id, embedder_name, embedding_dim, _time.time()),
+    )
+    image_id = cur.fetchone()["id"]
+    conn.execute(
+        "INSERT INTO vec_images(image_id, embedding) VALUES (?, ?)",
+        (image_id, serialize_f32(embedding)),
+    )
+    return image_id
+
+
+def search_images(
+    conn: sqlite3.Connection, query_embedding: list[float], k: int
+) -> list[tuple[int, str, float, float]]:
+    """Return [(image_id, file_path, mtime, distance)] for the k nearest images."""
+    rows = conn.execute(
+        "SELECT v.image_id, v.distance, f.path, f.mtime "
+        "FROM vec_images v "
+        "JOIN images i ON i.id = v.image_id "
+        "JOIN files f ON f.id = i.file_id "
+        "WHERE v.embedding MATCH ? AND v.k = ? "
+        "ORDER BY v.distance",
+        (serialize_f32(query_embedding), k),
+    ).fetchall()
+    return [(r["image_id"], r["path"], r["mtime"], r["distance"]) for r in rows]
 
 
 def insert_entities(
