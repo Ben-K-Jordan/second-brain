@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 import typer
+
+# Force UTF-8 for stdout/stderr so non-ASCII content (smart quotes, em-dashes,
+# Unicode punctuation in extracted text) renders correctly on Windows consoles
+# that default to cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
