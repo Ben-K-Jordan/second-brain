@@ -1,0 +1,222 @@
+"""Configuration, paths, and ignore rules for second-brain."""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from platformdirs import user_data_path
+
+APP_NAME = "secondbrain"
+
+DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
+    ".git/*",
+    "*/.git/*",
+    "node_modules/*",
+    "*/node_modules/*",
+    ".venv/*",
+    "*/.venv/*",
+    "venv/*",
+    "*/venv/*",
+    "__pycache__/*",
+    "*/__pycache__/*",
+    ".pytest_cache/*",
+    "*/.pytest_cache/*",
+    ".mypy_cache/*",
+    "*/.mypy_cache/*",
+    ".ruff_cache/*",
+    "*/.ruff_cache/*",
+    "AppData/*",
+    "*/AppData/*",
+    ".cache/*",
+    "*/.cache/*",
+    ".secondbrain/*",
+    "*/.secondbrain/*",
+    "*.env",
+    "*.env.*",
+    ".env",
+    ".env.*",
+    "*.key",
+    "*.pem",
+    "*.p12",
+    "*.pfx",
+    "id_rsa*",
+    "id_ed25519*",
+    "*secret*",
+    "*credentials*",
+    "*password*",
+    "*.exe",
+    "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.msi",
+    "*.iso",
+    "*.dmg",
+    "*.zip",
+    "*.7z",
+    "*.tar",
+    "*.tar.gz",
+    "*.tgz",
+    "*.rar",
+    "*.bin",
+    "*.dat",
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+)
+
+DOCUMENT_EXTENSIONS: frozenset[str] = frozenset({
+    ".md", ".markdown", ".txt", ".rst", ".org",
+    ".pdf", ".docx", ".doc", ".odt", ".rtf",
+    ".pptx", ".ppt", ".odp",
+    ".xlsx", ".xls", ".csv", ".ods", ".tsv",
+    ".html", ".htm", ".xml", ".epub",
+    ".json", ".yaml", ".yml", ".toml", ".ini",
+})
+
+CODE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".rs", ".go", ".java",
+    ".kt", ".swift", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb",
+    ".php", ".lua", ".sh", ".bash", ".zsh", ".fish", ".ps1",
+    ".sql", ".r", ".scala", ".clj", ".ex", ".exs", ".elm",
+})
+
+MEDIA_EXTENSIONS: frozenset[str] = frozenset({
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".heic",
+})
+
+
+def app_data_dir() -> Path:
+    """Return the cross-platform app data directory."""
+    p = user_data_path(APP_NAME, appauthor=False, ensure_exists=True)
+    return Path(p)
+
+
+@dataclass
+class Config:
+    """Runtime configuration."""
+
+    # Paths
+    data_dir: Path = field(default_factory=app_data_dir)
+    watched_folders: list[Path] = field(default_factory=list)
+
+    # Embedder
+    embedder_provider: str = "auto"  # "auto" | "voyage" | "local"
+    voyage_model: str = "voyage-3"
+    voyage_api_key: str | None = None
+    local_model: str = "all-MiniLM-L6-v2"
+
+    # Indexing
+    chunk_size: int = 800
+    chunk_overlap: int = 150
+    max_file_bytes: int = 200 * 1024 * 1024  # 200 MB; media bypasses this when transcribed
+    extra_ignore_globs: tuple[str, ...] = ()
+
+    # Search
+    hybrid_alpha: float = 0.5  # weight: 0=keyword only, 1=vector only
+    rerank_enabled: bool = False  # Phase 2
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "index.db"
+
+    @property
+    def config_path(self) -> Path:
+        return self.data_dir / "config.toml"
+
+    @property
+    def ignore_globs(self) -> tuple[str, ...]:
+        return DEFAULT_IGNORE_GLOBS + tuple(self.extra_ignore_globs)
+
+
+def default_config_toml() -> str:
+    return """\
+# second-brain config
+# Edit this file to customize behavior. Restart any running daemon to apply.
+
+# Folders to watch and index. Paths can be absolute or use ~ for home.
+watched_folders = []
+
+# Embedder: "auto" picks Voyage if VOYAGE_API_KEY is set, else local.
+# Override with "voyage" or "local".
+embedder_provider = "auto"
+voyage_model = "voyage-3"
+local_model = "all-MiniLM-L6-v2"
+
+# Chunking
+chunk_size = 800
+chunk_overlap = 150
+
+# Hard cap; files this large will be skipped unless they're media (which get transcribed).
+max_file_bytes = 209715200  # 200 MB
+
+# Extra glob patterns to skip (added to built-in defaults).
+extra_ignore_globs = []
+
+# Hybrid search: 0.0 = keyword only, 1.0 = vector only.
+hybrid_alpha = 0.5
+"""
+
+
+def load_config(path: Path | None = None) -> Config:
+    """Load config from disk, falling back to defaults."""
+    cfg = Config()
+    config_path = path or cfg.config_path
+    if config_path.exists():
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+        if "watched_folders" in data:
+            cfg.watched_folders = [Path(p).expanduser() for p in data["watched_folders"]]
+        if "embedder_provider" in data:
+            cfg.embedder_provider = data["embedder_provider"]
+        if "voyage_model" in data:
+            cfg.voyage_model = data["voyage_model"]
+        if "local_model" in data:
+            cfg.local_model = data["local_model"]
+        if "chunk_size" in data:
+            cfg.chunk_size = int(data["chunk_size"])
+        if "chunk_overlap" in data:
+            cfg.chunk_overlap = int(data["chunk_overlap"])
+        if "max_file_bytes" in data:
+            cfg.max_file_bytes = int(data["max_file_bytes"])
+        if "extra_ignore_globs" in data:
+            cfg.extra_ignore_globs = tuple(data["extra_ignore_globs"])
+        if "hybrid_alpha" in data:
+            cfg.hybrid_alpha = float(data["hybrid_alpha"])
+
+    cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
+    return cfg
+
+
+def write_default_config(cfg: Config) -> None:
+    """Write a default config.toml if none exists."""
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    if not cfg.config_path.exists():
+        cfg.config_path.write_text(default_config_toml(), encoding="utf-8")
+
+
+def is_ignored(path: Path, ignore_globs: tuple[str, ...]) -> bool:
+    """Test whether a path matches any ignore glob."""
+    s = path.as_posix()
+    name = path.name
+    for pattern in ignore_globs:
+        if fnmatch.fnmatch(s, pattern) or fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def classify_file(path: Path) -> str:
+    """Return one of: 'document', 'code', 'media', 'other'."""
+    ext = path.suffix.lower()
+    if ext in DOCUMENT_EXTENSIONS:
+        return "document"
+    if ext in CODE_EXTENSIONS:
+        return "code"
+    if ext in MEDIA_EXTENSIONS:
+        return "media"
+    return "other"
