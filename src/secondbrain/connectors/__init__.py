@@ -61,16 +61,24 @@ def all_connectors() -> list[type[Connector]]:
     from .gmail import GmailConnector
     from .google_calendar import GoogleCalendarConnector
     from .google_drive import GoogleDriveConnector
+    from .hacker_news import HackerNewsConnector
     from .linear import LinearConnector
     from .notion import NotionConnector
+    from .pocket import PocketConnector
+    from .reddit import RedditConnector
     from .slack import SlackConnector
+    from .x_archive import XArchiveConnector
 
     return [
         BrowserHistoryConnector,
+        XArchiveConnector,        # local zip read; fast
         GitHubConnector,
         LinearConnector,
         NotionConnector,
         SlackConnector,
+        RedditConnector,
+        HackerNewsConnector,
+        PocketConnector,
         CalendarConnector,
         GoogleCalendarConnector,
         GmailConnector,
