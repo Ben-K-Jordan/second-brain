@@ -6,6 +6,12 @@ Calendar → Settings → "Secret address in iCal format") and set it as
 ``CALENDAR_ICS_URL`` in your environment.
 
 Events become time-stamped documents searchable like anything else.
+
+Caveat: if you run *both* this ICS connector and the Google Calendar API
+connector against the same Google account, the same events get indexed
+twice (different virtual_paths, identical content). The hash-dedup salts
+by source so they stay distinct rows in `files`; pick one or the other to
+avoid the noise.
 """
 
 from __future__ import annotations

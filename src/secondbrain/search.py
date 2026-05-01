@@ -275,6 +275,12 @@ def _eligible_chunk_ids(
     """Pre-compute the set of chunk_ids matching the filter constraints.
 
     Returns None if no filter is applied (callers should skip the filter step).
+
+    Materialises the full eligible set into a Python set, then post-filters
+    candidates from FTS/vec by membership. Fine at our scale (~10k-100k
+    chunks); becomes a hot path at 10M+, where we'd want to inline the
+    filter as a subquery in the FTS/vec SQL. sqlite-vec's MATCH operator
+    is touchy about extra WHERE clauses, which is why we do it this way today.
     """
     where: list[str] = []
     params: list = []

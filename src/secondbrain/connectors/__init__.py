@@ -63,6 +63,12 @@ class ConnectorDocument:
     The ``virtual_path`` becomes the file's path in the index — must be
     globally unique. Convention: ``<source>://<stable-identifier>``, e.g.
     ``github://owner/repo/issues/42`` or ``notion://<page-uuid>``.
+
+    ``kind`` becomes ``files.kind`` in the index (which feeds the search
+    filter taxonomy). Defaults to ``"url"`` for connector docs because the
+    finer-grained per-source classification (saved / own_post / favorite /
+    bookmark) lives in ``metadata`` instead - the index's kind is intended
+    to be a small closed vocabulary.
     """
 
     source: str
@@ -70,6 +76,9 @@ class ConnectorDocument:
     title: str
     content: str
     mtime: float
+    # All defaulted fields after non-defaulted - moved metadata adjacent to
+    # kind so adding a new required field in future is less likely to fall
+    # foul of the dataclass ordering rule.
     kind: str = "url"
     metadata: dict = field(default_factory=dict)
 

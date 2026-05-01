@@ -113,18 +113,35 @@ def status() -> None:
 
 
 @app.command()
-def dedupe() -> None:
+def dedupe(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Report what would be aliased without changing anything.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="List every (canonical, duplicate) pair that gets converted.",
+    ),
+) -> None:
     """Find files in the index sharing a content hash and convert duplicates
     to aliases. Frees their chunks/entities/vectors, keeps the path.
 
     Idempotent. Safe to run repeatedly. Worth running once after bulk-indexing
-    folders with overlap (e.g. Downloads + OneDrive)."""
+    folders with overlap (e.g. Downloads + OneDrive). Acquires a write lock,
+    so it's safest to run with the daemon stopped."""
     cfg = load_config()
     conn, _ = _open_state(cfg)
+    if dry_run:
+        console.print("[yellow]DRY RUN[/] - nothing will be modified")
     console.print("Scanning for content-hash duplicates...")
-    result = dedupe_existing(conn)
+    result = dedupe_existing(conn, dry_run=dry_run)
+    aliased = result.get("aliased") or []
+    if verbose and aliased:
+        for canonical, dup in aliased:
+            console.print(f"  [dim]alias[/] {dup}\n         [dim]→[/] {canonical}")
+    suffix = " (dry-run)" if dry_run else ""
     console.print(
-        f"[green]Done.[/] groups={result['groups_with_duplicates']} "
+        f"[green]Done.[/]{suffix} groups={result['groups_with_duplicates']} "
         f"converted={result['duplicate_files_converted']} "
         f"chunks_freed={result['chunks_freed']}"
     )

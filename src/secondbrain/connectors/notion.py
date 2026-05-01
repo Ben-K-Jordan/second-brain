@@ -146,7 +146,7 @@ class NotionConnector:
 
     def _extract_title(self, page: dict) -> str:
         # Pages either expose `properties.<title-prop>.title` or `properties.title.title`
-        for _, prop in (page.get("properties") or {}).items():
+        for prop in (page.get("properties") or {}).values():
             if prop.get("type") == "title":
                 t = _rich_text(prop.get("title", []))
                 if t:

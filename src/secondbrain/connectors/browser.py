@@ -77,16 +77,22 @@ class BrowserHistoryConnector:
 
             try:
                 conn = sqlite3.connect(str(tmp_path))
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT url, title, visit_count, last_visit_time "
-                    "FROM urls "
-                    "WHERE last_visit_time > 0 AND title != '' "
-                    "ORDER BY last_visit_time DESC "
-                    "LIMIT ?",
-                    (_MAX_URLS,),
-                ).fetchall()
-                conn.close()
+                try:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT url, title, visit_count, last_visit_time "
+                        "FROM urls "
+                        "WHERE last_visit_time > 0 AND title != '' "
+                        "ORDER BY last_visit_time DESC "
+                        "LIMIT ?",
+                        (_MAX_URLS,),
+                    ).fetchall()
+                finally:
+                    # On Windows the temp file stays locked until the conn is
+                    # closed; without try/finally a DatabaseError mid-query
+                    # would leak the lock and the unlink in the outer finally
+                    # would silently fail.
+                    conn.close()
             except sqlite3.DatabaseError as e:
                 log.warning("could not read %s history db: %s", label, e)
                 return

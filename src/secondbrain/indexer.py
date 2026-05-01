@@ -127,6 +127,17 @@ def extract_text(
         return ""
 
 
+def _virtual_path_scheme(virtual_path: str) -> str:
+    """Extract the ``<scheme>`` from ``<scheme>://<rest>``; "" if none.
+
+    Used as a fallback hash salt for connector docs that didn't pass an
+    explicit ``source=``. Keeps Reddit/Linear/HN/etc. from ever pretending
+    to be the same content as one another.
+    """
+    idx = virtual_path.find("://")
+    return virtual_path[:idx] if idx > 0 else ""
+
+
 def chunk_text(
     text: str, target_size: int = 800, overlap: int = 150
 ) -> list[tuple[str, int]]:
@@ -370,21 +381,46 @@ def remove_file(conn: sqlite3.Connection, path: Path) -> IndexResult:
     return IndexResult(path, "deleted")
 
 
-def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
+def dedupe_existing(
+    conn: sqlite3.Connection, dry_run: bool = False
+) -> dict[str, int | list[tuple[str, str]]]:
     """Walk the existing index, find files sharing a content_hash, and convert
     duplicates to aliases.
 
     Keeps the oldest indexed file as canonical; the rest get their chunks /
     entities / image embeddings dropped (cascade) and their path moved into
-    `file_aliases`. Returns counts for reporting.
+    `file_aliases`. Returns counts plus an ``aliased`` list of
+    ``(canonical_path, dup_path)`` tuples for reporting / verification.
 
     Idempotent. Safe to run on a populated index even after the indexer-side
     dedup is in place - it cleans up duplicates added before that fix shipped.
+
+    Set ``dry_run=True`` to inspect what *would* be aliased without changing
+    anything (useful for sanity-checking before committing).
+
+    Acquires a write lock with ``BEGIN IMMEDIATE`` so a concurrent daemon
+    write doesn't interleave with our delete-then-add-alias sequence. Without
+    this, a busy_timeout retry storm could leave a duplicate's chunks
+    half-deleted while the daemon was holding the writer.
     """
     # We need (id, indexed_at) per group to pick the *oldest indexed* row as
     # canonical. Earlier this used MIN(id) as a proxy, but ids only correlate
     # with insertion order, not indexed_at - after a reset / re-embed the
     # truly oldest ingest can have a higher id.
+    if not dry_run:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            log.warning(
+                "dedupe could not acquire writer lock; another writer holds it: %s",
+                e,
+            )
+            return {
+                "groups_with_duplicates": 0,
+                "duplicate_files_converted": 0,
+                "chunks_freed": 0,
+                "aliased": [],
+            }
     rows = conn.execute(
         "SELECT content_hash, COUNT(*) AS n "
         "FROM files WHERE content_hash IS NOT NULL "
@@ -393,6 +429,7 @@ def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
 
     converted = 0
     chunks_freed = 0
+    aliased: list[tuple[str, str]] = []
     for r in rows:
         chash = r["content_hash"]
         members = conn.execute(
@@ -410,16 +447,25 @@ def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
                 "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ?", (dup_id,)
             ).fetchone()["c"]
             chunks_freed += chunk_count
+            aliased.append((canonical["path"], dup["path"]))
+            if dry_run:
+                converted += 1
+                continue
             # Cascade drops chunks, entities, image rows, and vec_ rows via
             # the explicit cleanup we already do in delete_file - reuse it.
             delete_file(conn, dup["path"])
             add_alias(conn, canonical_id, dup["path"])
             converted += 1
-    conn.commit()
+    if dry_run:
+        # No commit / rollback needed - we never wrote anything.
+        pass
+    else:
+        conn.commit()
     return {
         "groups_with_duplicates": len(rows),
         "duplicate_files_converted": converted,
         "chunks_freed": chunks_freed,
+        "aliased": aliased,
     }
 
 
@@ -535,7 +581,16 @@ def index_text(
     if not text:
         return IndexResult(label_path, "skipped", reason="empty content")
 
-    chash = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+    # Salt the hash with the source (e.g. "reddit", "linear") so a connector
+    # doc never accidentally aliases to an unrelated local file that happens
+    # to share text. Cross-source dedup is too coarse: a Reddit selftext and
+    # a downloaded PDF with the same body are different *things* the user
+    # might query for, even if their text is identical. Same-source dedup
+    # (Reddit re-fetched, the same Linear issue at a new URL) still works.
+    src_for_hash = source or _virtual_path_scheme(virtual_path)
+    chash = hashlib.sha1(
+        f"{src_for_hash}\n{text}".encode("utf-8", errors="replace")
+    ).hexdigest()
     existing = get_file_by_path(conn, virtual_path)
     if existing and existing["content_hash"] == chash:
         return IndexResult(label_path, "unchanged")
