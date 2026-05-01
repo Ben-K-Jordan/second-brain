@@ -475,6 +475,85 @@ def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
     return tmp, ctype
 
 
+def index_text(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    cfg: Config,
+    virtual_path: str,
+    title: str,
+    content: str,
+    mtime: float,
+    kind: str = "url",
+    source: str = "",
+    entity_extractor: EntityExtractor | None = None,
+) -> IndexResult:
+    """Index a pre-extracted document from a connector or other non-filesystem source.
+
+    Parallels ``index_url`` but takes the body in-memory instead of fetching it.
+    Honors the same hash-dedup, contextual-prefix, and entity-extraction paths
+    as filesystem ingest, so connector-sourced documents become first-class
+    citizens of the index alongside files.
+    """
+    label_path = Path(virtual_path)
+    text = (content or "").strip()
+    if not text:
+        return IndexResult(label_path, "skipped", reason="empty content")
+
+    chash = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+    existing = get_file_by_path(conn, virtual_path)
+    if existing and existing["content_hash"] == chash:
+        return IndexResult(label_path, "unchanged")
+
+    if existing is None:
+        twin = find_file_by_hash(conn, chash)
+        if twin is not None:
+            add_alias(conn, twin["id"], virtual_path)
+            conn.commit()
+            return IndexResult(label_path, "alias", reason=f"duplicate of {twin['path']}")
+
+    chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+    if not chunked:
+        return IndexResult(label_path, "skipped", reason="no chunks produced")
+
+    chunk_texts = [c for c, _ in chunked]
+    src_label = source or kind
+    contextualized = [
+        f"Source: {src_label}\nTitle: {title}\nPath: {virtual_path}\n\n{c}"
+        for c in chunk_texts
+    ]
+    try:
+        embeddings = embedder.embed_documents(contextualized)
+    except Exception as e:
+        log.warning("embedding failed for %s: %s", virtual_path, e)
+        return IndexResult(label_path, "error", reason=f"embedding: {e}")
+
+    file_id = upsert_file(
+        conn,
+        path=virtual_path,
+        mtime=mtime,
+        size=len(text.encode("utf-8", errors="replace")),
+        kind=kind,
+        content_hash=chash,
+    )
+    chunk_ids = replace_chunks(
+        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+    )
+
+    if entity_extractor is not None:
+        try:
+            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
+                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
+                if ents:
+                    insert_entities(
+                        conn, chunk_id, [(e.text, e.label) for e in ents]
+                    )
+        except Exception as e:
+            log.warning("entity extraction failed for %s: %s", virtual_path, e)
+
+    conn.commit()
+    return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
+
+
 def index_url(
     conn: sqlite3.Connection,
     embedder: Embedder,

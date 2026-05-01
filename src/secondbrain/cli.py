@@ -26,7 +26,14 @@ from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
-from .indexer import IndexResult, dedupe_existing, index_folder, index_url, walk_folder
+from .indexer import (
+    IndexResult,
+    dedupe_existing,
+    index_folder,
+    index_text,
+    index_url,
+    walk_folder,
+)
 from .reranker import make_reranker
 from .search import hybrid_search
 from .transcriber import make_transcriber
@@ -349,6 +356,96 @@ def watch(
         console.print("\n[yellow]Stopping...[/]")
         watcher.stop()
         conn.close()
+
+
+@app.command()
+def sync(
+    source: str = typer.Argument(
+        "all",
+        help="Connector name (github / notion / browser / calendar) or 'all'.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Pull documents from cloud connectors into the index.
+
+    Each connector reads its credentials from environment variables:
+        GITHUB_TOKEN, NOTION_TOKEN, CALENDAR_ICS_URL.
+    The browser connector needs no auth; it reads Chrome/Edge SQLite history.
+
+    Run periodically to keep the index fresh — connectors are idempotent
+    via hash-based dedup, so re-runs are cheap.
+    """
+    _setup_logging(verbose)
+    from .connectors import all_connectors, get_connector
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+        except (ImportError, RuntimeError) as e:
+            console.print(f"[yellow]Entity extraction disabled:[/] {e}")
+
+    if source == "all":
+        connector_classes = all_connectors()
+    else:
+        cls = get_connector(source)
+        if cls is None:
+            console.print(f"[red]Unknown connector:[/] {source}")
+            raise typer.Exit(code=1)
+        connector_classes = [cls]
+
+    grand_totals: dict[str, int] = {}
+    for cls in connector_classes:
+        c = cls()
+        if not c.is_enabled(cfg):
+            console.print(f"[dim]skip[/]  {c.name:10s}  (not configured — see `secondbrain --help`)")
+            continue
+        console.print(f"[cyan]sync[/]  {c.name:10s}  fetching...")
+        counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "alias": 0, "error": 0}
+        try:
+            for doc in c.fetch(cfg):
+                result = index_text(
+                    conn, embedder, cfg,
+                    virtual_path=doc.virtual_path,
+                    title=doc.title,
+                    content=doc.content,
+                    mtime=doc.mtime,
+                    kind=doc.kind,
+                    source=doc.source,
+                    entity_extractor=entity_extractor,
+                )
+                counts[result.status] = counts.get(result.status, 0) + 1
+                total = sum(counts.values())
+                if verbose or total % 25 == 0:
+                    console.print(
+                        f"  [{c.name}] {total:4d}: "
+                        f"indexed={counts.get('indexed',0)} "
+                        f"unchanged={counts.get('unchanged',0)} "
+                        f"alias={counts.get('alias',0)} "
+                        f"err={counts.get('error',0)}"
+                    )
+        except Exception as e:
+            console.print(f"[red]error in {c.name}:[/] {e}")
+        for k, v in counts.items():
+            grand_totals[k] = grand_totals.get(k, 0) + v
+        console.print(
+            f"[green]done[/]  {c.name:10s}  "
+            f"indexed={counts.get('indexed',0)} "
+            f"unchanged={counts.get('unchanged',0)} "
+            f"alias={counts.get('alias',0)} "
+            f"errors={counts.get('error',0)}"
+        )
+
+    console.print()
+    console.print(
+        f"[bold]Total:[/] indexed={grand_totals.get('indexed', 0)} "
+        f"unchanged={grand_totals.get('unchanged', 0)} "
+        f"alias={grand_totals.get('alias', 0)} "
+        f"errors={grand_totals.get('error', 0)}"
+    )
+    conn.close()
 
 
 @app.command()

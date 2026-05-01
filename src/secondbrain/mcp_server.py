@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -36,6 +37,33 @@ def _get_state():
         _conn = connect(_cfg.db_path)
         init_schema(_conn, _embedder.dim, _embedder.name)
     return _cfg, _conn, _embedder, _reranker
+
+
+def _query_log_path(cfg) -> Path:
+    return cfg.data_dir / "queries.jsonl"
+
+
+def _log_query(cfg, query: str, tool: str, results: list) -> None:
+    """Append a record of an AI-driven search to the query log so the user
+    can audit what's been retrieved on their behalf. Best-effort - logging
+    failure must not break the search.
+    """
+    path = _query_log_path(cfg)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Capture what was returned, not just that a query happened.
+        top_paths = [r.file_path for r in results[:10]]
+        row = {
+            "ts": time.time(),
+            "tool": tool,
+            "query": query,
+            "k": len(results),
+            "top_paths": top_paths,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except OSError as e:
+        log.warning("query log write failed: %s", e)
 
 
 def _matching_entity_keys(conn, query: str, fuzzy: bool) -> list[str]:
@@ -110,6 +138,7 @@ def search_brain(
         kind=kind,
         since_days=since_days,
     )
+    _log_query(cfg, query, "search_brain", results)
     header = f"# Hybrid search: {query!r}"
     if folder or kind or since_days is not None:
         bits = []
@@ -158,6 +187,106 @@ def daily_briefing(hours: int = 24) -> str:
 
     cfg, conn, _, _ = _get_state()
     return generate_briefing(conn, cfg, hours=hours)
+
+
+@mcp.tool()
+def sync_source(source: str = "all") -> str:
+    """Pull recent documents from a connector (github / notion / browser /
+    calendar) into the index. Use 'all' to run every configured connector.
+
+    Connectors read credentials from env vars (GITHUB_TOKEN, NOTION_TOKEN,
+    CALENDAR_ICS_URL); browser reads local Chrome/Edge SQLite history. If a
+    connector isn't configured, it's silently skipped.
+    """
+    from .connectors import all_connectors, get_connector
+    from .entities import make_entity_extractor
+    from .indexer import index_text
+
+    cfg, conn, embedder, _ = _get_state()
+    entity_extractor = None
+    if cfg.entities_enabled:
+        try:
+            entity_extractor = make_entity_extractor(cfg)
+        except (ImportError, RuntimeError):
+            entity_extractor = None
+
+    if source == "all":
+        connector_classes = all_connectors()
+    else:
+        cls = get_connector(source)
+        if cls is None:
+            return f"Unknown connector: {source!r}"
+        connector_classes = [cls]
+
+    lines = []
+    for cls in connector_classes:
+        c = cls()
+        if not c.is_enabled(cfg):
+            lines.append(f"skip   {c.name}: not configured")
+            continue
+        counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "alias": 0, "error": 0}
+        try:
+            for doc in c.fetch(cfg):
+                result = index_text(
+                    conn, embedder, cfg,
+                    virtual_path=doc.virtual_path,
+                    title=doc.title,
+                    content=doc.content,
+                    mtime=doc.mtime,
+                    kind=doc.kind,
+                    source=doc.source,
+                    entity_extractor=entity_extractor,
+                )
+                counts[result.status] = counts.get(result.status, 0) + 1
+        except Exception as e:
+            lines.append(f"error  {c.name}: {e}")
+            continue
+        lines.append(
+            f"done   {c.name}: indexed={counts['indexed']} unchanged={counts['unchanged']} "
+            f"alias={counts['alias']} errors={counts['error']}"
+        )
+    return "\n".join(lines) if lines else "(no connectors ran)"
+
+
+@mcp.tool()
+def recent_queries(n: int = 30) -> str:
+    """Show the most recent queries the AI has run against your brain.
+
+    Useful for auditing what context has been retrieved on your behalf.
+    Reads from ~/.secondbrain/queries.jsonl.
+    """
+    cfg, _, _, _ = _get_state()
+    path = _query_log_path(cfg)
+    if not path.exists():
+        return "(no queries logged yet)"
+    rows: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as e:
+        return f"(log read failed: {e})"
+
+    rows = rows[-n:]
+    rows.reverse()
+    if not rows:
+        return "(no queries logged yet)"
+    lines = []
+    for r in rows:
+        ts = r.get("ts", 0)
+        age_min = (time.time() - ts) / 60 if ts else 0
+        lines.append(
+            f"[{age_min:6.1f}m ago] {r.get('tool', '?'):14s} k={r.get('k', 0):2d}  {r.get('query', '')!r}"
+        )
+        for p in r.get("top_paths", [])[:3]:
+            lines.append(f"             -> {p}")
+    return "\n".join(lines)
 
 
 @mcp.tool()

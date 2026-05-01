@@ -666,6 +666,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Entities", "/entities"),
         ("Folders", "/folders"),
         ("Briefing", "/briefing"),
+        ("Queries", "/queries"),
         ("Ingest", "/ingest"),
     ]
     nav = "".join(
@@ -1335,6 +1336,74 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             f'background: var(--surface); padding: 0; font-family: var(--sans); '
             f'font-size: 14.5px; white-space: pre-wrap;">{escape(text)}</div></div>'
         )
+
+    @app.get("/queries", response_class=HTMLResponse)
+    def queries_page(limit: int = 100):
+        """Audit panel: shows recent AI-driven searches against your brain."""
+        import json as _json
+
+        cfg, _, _, _ = get_state()
+        log_path = cfg.data_dir / "queries.jsonl"
+        rows: list[dict] = []
+        if log_path.exists():
+            try:
+                with open(log_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rows.append(_json.loads(line))
+                        except _json.JSONDecodeError:
+                            continue
+            except OSError:
+                pass
+        rows = rows[-limit:]
+        rows.reverse()
+
+        if not rows:
+            body = """
+<h1>Query log</h1>
+<div class="empty">
+    No queries logged yet. AI assistants that call <code>search_brain</code>
+    via MCP will show up here so you can see what's being retrieved.
+</div>"""
+            return HTMLResponse(_layout("Queries", body, "queries"))
+
+        # Aggregate stats
+        total = len(rows)
+        by_tool: dict[str, int] = {}
+        for r in rows:
+            tool = r.get("tool", "?")
+            by_tool[tool] = by_tool.get(tool, 0) + 1
+        tool_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_tool.items()))
+
+        # Render rows
+        items = []
+        for r in rows:
+            ts = r.get("ts", 0)
+            age_min = (time.time() - ts) / 60 if ts else 0
+            age_str = (
+                f"{age_min:.1f}m ago" if age_min < 60
+                else f"{age_min/60:.1f}h ago" if age_min < 1440
+                else f"{age_min/1440:.1f}d ago"
+            )
+            paths_html = "".join(
+                f'<div class="path"><a href="/file?path={urllib.parse.quote_plus(p)}">{escape(p)}</a></div>'
+                for p in r.get("top_paths", [])[:5]
+            ) or '<div class="muted">(no results)</div>'
+            items.append(f"""
+<article class="result">
+    <h3>{escape(r.get('query', ''))!s}</h3>
+    <div class="meta">{escape(r.get('tool', '?'))} · k={r.get('k', 0)} · {age_str}</div>
+    {paths_html}
+</article>""")
+
+        body = f"""
+<h1>Query log <span class="muted" style="font-size:13px;">({total} recent · {escape(tool_summary)})</span></h1>
+<p class="muted" style="margin-bottom:24px;">Every <code>search_brain</code> call from any MCP-connected AI gets logged here. The query, the tool, and the file paths returned — so you know what's leaving the brain.</p>
+{''.join(items)}"""
+        return HTMLResponse(_layout("Queries", body, "queries"))
 
     @app.get("/ingest", response_class=HTMLResponse)
     def ingest_page():
