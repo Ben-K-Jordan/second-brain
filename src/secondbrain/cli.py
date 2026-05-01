@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -268,6 +270,12 @@ def search(
         path_prefix=folder,
         kind=kind,
         since_days=since_days,
+        use_hyde=cfg.hyde_enabled,
+        hyde_model=cfg.hyde_model,
+        personal_prefixes=cfg.personal_path_prefixes,
+        personal_boost=cfg.personal_path_boost,
+        download_prefixes=cfg.download_path_prefixes,
+        download_demote=cfg.download_path_demote,
     )
     if not results:
         console.print("[yellow]No matches.[/]")
@@ -549,6 +557,78 @@ def spend() -> None:
         )
     console.print(table)
     console.print(f"\n[dim]Ledger:[/] {cfg.data_dir / 'spend.jsonl'}")
+
+
+@app.command()
+def tag(
+    since_days: int = typer.Option(
+        None, "--since-days",
+        help="Only tag chunks from files indexed in the last N days. Default: tag all untagged chunks.",
+    ),
+    limit: int = typer.Option(
+        None, "--limit",
+        help="Hard cap on chunks to tag this run. Useful for testing cost.",
+    ),
+    model: str = typer.Option(
+        None, "--model",
+        help="Override the model. Default: cfg.tag_model (claude-haiku-4-5).",
+    ),
+) -> None:
+    """Use Claude to assign 1-3 topic tags per chunk. Idempotent — chunks
+    that already have tags are skipped. Run periodically after big ingests.
+
+    Cost: ~$0.0003 per chunk on Haiku 4.5. A 6,000-chunk index ≈ $2."""
+    from .tagger import generate_tags
+
+    cfg = load_config()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        console.print("[red]ANTHROPIC_API_KEY not set.[/]")
+        raise typer.Exit(code=1)
+
+    conn, _ = _open_state(cfg)
+
+    # Find untagged chunks. Optionally scope by file.indexed_at.
+    query = (
+        "SELECT c.id, c.text FROM chunks c "
+        "JOIN files f ON f.id = c.file_id "
+        "LEFT JOIN chunk_tags t ON t.chunk_id = c.id "
+        "WHERE t.id IS NULL "
+    )
+    params: list = []
+    if since_days is not None:
+        query += "AND f.indexed_at >= ? "
+        params.append(time.time() - since_days * 86400)
+    query += "GROUP BY c.id ORDER BY c.id "
+    if limit is not None:
+        query += "LIMIT ? "
+        params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    total = len(rows)
+    if total == 0:
+        console.print("[yellow]Nothing to tag.[/] All matching chunks already have tags.")
+        return
+
+    console.print(f"Tagging [cyan]{total}[/] chunks via [cyan]{model or cfg.tag_model}[/]...")
+    tagged = 0
+    failed = 0
+    for i, r in enumerate(rows, 1):
+        tags = generate_tags(r["text"], cfg, model=model)
+        if not tags:
+            failed += 1
+        else:
+            for t in tags:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunk_tags(chunk_id, tag) VALUES (?, ?)",
+                    (r["id"], t),
+                )
+            tagged += 1
+        if i % 25 == 0:
+            conn.commit()
+            console.print(f"  [{i}/{total}] tagged={tagged} failed={failed}")
+    conn.commit()
+    conn.close()
+    console.print(f"[green]Done.[/] tagged={tagged} failed={failed}")
 
 
 @app.command()

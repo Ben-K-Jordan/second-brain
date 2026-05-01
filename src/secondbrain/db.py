@@ -79,6 +79,7 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             text TEXT NOT NULL,
+            start_offset INTEGER,
             UNIQUE(file_id, chunk_index)
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
@@ -108,6 +109,17 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_entities_chunk_id ON entities(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_entities_text_lower ON entities(text_lower);
         CREATE INDEX IF NOT EXISTS idx_entities_label ON entities(label);
+
+        -- LLM-generated topic tags. Populated by `secondbrain tag` (opt-in).
+        -- Tags are stored lowercased; queries match case-insensitively.
+        CREATE TABLE IF NOT EXISTS chunk_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            UNIQUE(chunk_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_tags_tag ON chunk_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_chunk_tags_chunk_id ON chunk_tags(chunk_id);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
             text,
@@ -155,6 +167,13 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_images USING vec0("
         "image_id INTEGER PRIMARY KEY, embedding FLOAT[1024])"
     )
+
+    # Migration: add chunks.start_offset on databases created before that
+    # column existed. SQLite's CREATE TABLE IF NOT EXISTS won't add it to a
+    # pre-existing table; we add it via ALTER if absent.
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
+    if "start_offset" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN start_offset INTEGER")
 
     existing_dim = get_meta(conn, "embedding_dim")
     existing_embedder = get_meta(conn, "embedder_name")
@@ -275,12 +294,13 @@ def delete_file(conn: sqlite3.Connection, path: str) -> None:
 def replace_chunks(
     conn: sqlite3.Connection,
     file_id: int,
-    chunks: list[tuple[str, list[float]]],
+    chunks: list[tuple[str, list[float]]] | list[tuple[str, list[float], int | None]],
 ) -> list[int]:
     """Atomically replace all chunks (and their vectors) for a file.
 
-    Returns the new chunk IDs in order so callers can attach derivative data
-    (entities, citations, etc.) without re-querying.
+    Accepts ``(text, embedding)`` or ``(text, embedding, start_offset)`` tuples
+    — the latter is used by callers that track byte offsets back into the
+    original file (citation provenance). Returns the new chunk IDs in order.
     """
     old_ids = [
         r["id"] for r in conn.execute("SELECT id FROM chunks WHERE file_id = ?", (file_id,))
@@ -291,10 +311,16 @@ def replace_chunks(
     conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
 
     new_ids: list[int] = []
-    for idx, (text, embedding) in enumerate(chunks):
+    for idx, item in enumerate(chunks):
+        if len(item) == 3:
+            text, embedding, start_offset = item
+        else:
+            text, embedding = item
+            start_offset = None
         cur = conn.execute(
-            "INSERT INTO chunks(file_id, chunk_index, text) VALUES (?, ?, ?) RETURNING id",
-            (file_id, idx, text),
+            "INSERT INTO chunks(file_id, chunk_index, text, start_offset) "
+            "VALUES (?, ?, ?, ?) RETURNING id",
+            (file_id, idx, text, start_offset),
         )
         chunk_id = cur.fetchone()["id"]
         new_ids.append(chunk_id)

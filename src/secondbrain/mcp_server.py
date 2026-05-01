@@ -137,6 +137,12 @@ def search_brain(
         path_prefix=folder,
         kind=kind,
         since_days=since_days,
+        use_hyde=cfg.hyde_enabled,
+        hyde_model=cfg.hyde_model,
+        personal_prefixes=cfg.personal_path_prefixes,
+        personal_boost=cfg.personal_path_boost,
+        download_prefixes=cfg.download_path_prefixes,
+        download_demote=cfg.download_path_demote,
     )
     _log_query(cfg, query, "search_brain", results)
     header = f"# Hybrid search: {query!r}"
@@ -172,6 +178,49 @@ def keyword_search(query: str, k: int = 10) -> str:
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
     )
     return _format_results(results, f"# Keyword search: {query!r}")
+
+
+@mcp.tool()
+def find_by_tag(tag: str, k: int = 20) -> str:
+    """Find chunks with a given LLM-assigned topic tag.
+
+    Tags come from `secondbrain tag` (opt-in CLI command). Use this when
+    you remember the topic of something but not the exact wording — e.g.
+    "everything tagged 'capital budgeting'".
+    """
+    _, conn, _, _ = _get_state()
+    rows = conn.execute(
+        "SELECT c.text, c.chunk_index, f.path, f.mtime "
+        "FROM chunk_tags t "
+        "JOIN chunks c ON c.id = t.chunk_id "
+        "JOIN files f ON f.id = c.file_id "
+        "WHERE LOWER(t.tag) = ? "
+        "ORDER BY f.mtime DESC LIMIT ?",
+        (tag.strip().lower(), k),
+    ).fetchall()
+    if not rows:
+        return f"(no chunks tagged {tag!r}; run `secondbrain tag` to populate tags)"
+    lines = [f"# Chunks tagged {tag!r}", ""]
+    for r in rows:
+        snippet = r["text"] if len(r["text"]) <= 600 else r["text"][:600] + "..."
+        lines.append(f"### {r['path']} (chunk {r['chunk_index']})")
+        lines.append(snippet)
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_tags(top_n: int = 50) -> str:
+    """List the most-used topic tags with counts. Pair with `find_by_tag`."""
+    _, conn, _, _ = _get_state()
+    rows = conn.execute(
+        "SELECT tag, COUNT(DISTINCT chunk_id) AS n "
+        "FROM chunk_tags GROUP BY tag ORDER BY n DESC LIMIT ?",
+        (top_n,),
+    ).fetchall()
+    if not rows:
+        return "(no tags yet — run `secondbrain tag` to populate)"
+    return "\n".join(f"  {r['n']:5d}  {r['tag']}" for r in rows)
 
 
 @mcp.tool()

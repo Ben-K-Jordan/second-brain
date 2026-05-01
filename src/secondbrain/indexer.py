@@ -315,12 +315,14 @@ def index_file(
         return IndexResult(path, "skipped", reason="no extractable text")
 
     chunk_texts: list[str] = []
+    chunk_offsets: list[int] = []
     embeddings: list[list[float]] = []
 
     if has_text:
         chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
         if chunked:
             chunk_texts = [c for c, _ in chunked]
+            chunk_offsets = [off for _, off in chunked]
             contextualized = [
                 build_context_prefix(path, text, offset) + c for c, offset in chunked
             ]
@@ -341,7 +343,8 @@ def index_file(
     chunk_ids: list[int] = []
     if chunk_texts:
         chunk_ids = replace_chunks(
-            conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+            conn, file_id,
+            list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
         )
 
     if will_embed_image:
@@ -516,6 +519,7 @@ def index_text(
         return IndexResult(label_path, "skipped", reason="no chunks produced")
 
     chunk_texts = [c for c, _ in chunked]
+    chunk_offsets = [off for _, off in chunked]
     src_label = source or kind
     contextualized = [
         f"Source: {src_label}\nTitle: {title}\nPath: {virtual_path}\n\n{c}"
@@ -536,7 +540,8 @@ def index_text(
         content_hash=chash,
     )
     chunk_ids = replace_chunks(
-        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+        conn, file_id,
+        list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
     )
 
     if entity_extractor is not None:
@@ -606,6 +611,7 @@ def index_url(
         return IndexResult(label_path, "skipped", reason="no chunks produced")
 
     chunk_texts = [c for c, _ in chunked]
+    chunk_offsets = [off for _, off in chunked]
     title = getattr(result, "title", None) or url
     contextualized = [
         f"Source: URL\nURL: {url}\nTitle: {title}\n\n{c}" for c in chunk_texts
@@ -625,7 +631,8 @@ def index_url(
         content_hash=chash,
     )
     chunk_ids = replace_chunks(
-        conn, file_id, list(zip(chunk_texts, embeddings, strict=True))
+        conn, file_id,
+        list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
     )
 
     if entity_extractor is not None:

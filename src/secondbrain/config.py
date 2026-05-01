@@ -135,6 +135,21 @@ class Config:
     time_decay_weight: float = 0.1  # 0=ignore time, 1=time only
     time_decay_half_life_days: float = 365.0
 
+    # HyDE query rewriting: for vague conceptual queries, draft a hypothetical
+    # answer and embed *that*. Big retrieval bump on "what was that thing about X"
+    # style searches. Requires ANTHROPIC_API_KEY; falls back silently to raw
+    # query when unavailable. ~1ยข per query at default Haiku 4.5 model.
+    hyde_enabled: bool = False
+    hyde_model: str = "claude-haiku-4-5"
+
+    # Source-aware ranking: lift personal-content paths over passive downloads.
+    # Match is case-insensitive substring, so "/Documents/" hits any path
+    # containing that segment. Multiplier of 1.0 = no change.
+    personal_path_prefixes: tuple[str, ...] = ("/Documents/", "/notes/", "/OneDrive/")
+    personal_path_boost: float = 1.3
+    download_path_prefixes: tuple[str, ...] = ("/Downloads/",)
+    download_path_demote: float = 0.85
+
     # Media transcription (audio/video -> text via faster-whisper)
     transcribe_enabled: bool = True
     whisper_model_size: str = "small"  # tiny/base/small/medium/large-v3
@@ -157,6 +172,10 @@ class Config:
     # swap to claude-sonnet-4-6 for lower cost or claude-haiku-4-5 for fastest.
     briefing_model: str = "claude-opus-4-7"
     briefing_max_tokens: int = 4096
+
+    # Auto-tagging — Claude assigns 1-3 topic tags per chunk.
+    # Run on demand via `secondbrain tag`; defaults to Haiku 4.5 (~$0.0003/chunk).
+    tag_model: str = "claude-haiku-4-5"
 
     # Daily spend caps in cents (so $5 = 500). Refuses paid calls once today's
     # cumulative spend hits the cap. Set to 0 to disable. Defense in depth -
@@ -226,6 +245,22 @@ time_decay_enabled = true
 time_decay_weight = 0.1
 time_decay_half_life_days = 365.0
 
+# HyDE query rewriting: for vague conceptual queries, ask Claude Haiku to
+# draft a hypothetical answer and embed that for vector search. Big quality
+# bump on "what was that thing about X" queries. Requires ANTHROPIC_API_KEY;
+# silently falls back to raw query when unavailable. Costs ~1c per qualifying
+# query (most short queries skip HyDE entirely - see should_use_hyde).
+hyde_enabled = false
+hyde_model = "claude-haiku-4-5"
+
+# Source-aware ranking: lift personal-content paths over passive downloads.
+# Match is case-insensitive substring. Multiplier of 1.0 means no change.
+# Tweak the path lists to fit how YOU organize your stuff.
+personal_path_prefixes = ["/Documents/", "/notes/", "/OneDrive/"]
+personal_path_boost = 1.3
+download_path_prefixes = ["/Downloads/"]
+download_path_demote = 0.85
+
 # Media transcription. When enabled, audio and video files are transcribed
 # locally via faster-whisper and the transcript flows into the regular index.
 # Requires the [whisper] extra: pip install -e .[whisper]
@@ -260,6 +295,11 @@ multimodal_model = "voyage-multimodal-3"
 # or claude-haiku-4-5 for fastest.
 briefing_model = "claude-opus-4-7"
 briefing_max_tokens = 4096
+
+# Auto-tagging - Claude assigns 1-3 topic tags per chunk on demand.
+# Run via `secondbrain tag`. Haiku 4.5 is cheap enough to tag a 6K-chunk
+# index for ~$2; bump to claude-sonnet-4-6 for nicer tags at higher cost.
+tag_model = "claude-haiku-4-5"
 
 # Daily spend caps in cents ($5 = 500). Refuses paid API calls once today's
 # spend hits the cap. Set to 0 to disable. Defense in depth - catches runaway
@@ -309,6 +349,18 @@ def load_config(path: Path | None = None) -> Config:
             cfg.time_decay_weight = float(data["time_decay_weight"])
         if "time_decay_half_life_days" in data:
             cfg.time_decay_half_life_days = float(data["time_decay_half_life_days"])
+        if "hyde_enabled" in data:
+            cfg.hyde_enabled = bool(data["hyde_enabled"])
+        if "hyde_model" in data:
+            cfg.hyde_model = data["hyde_model"]
+        if "personal_path_prefixes" in data:
+            cfg.personal_path_prefixes = tuple(data["personal_path_prefixes"])
+        if "personal_path_boost" in data:
+            cfg.personal_path_boost = float(data["personal_path_boost"])
+        if "download_path_prefixes" in data:
+            cfg.download_path_prefixes = tuple(data["download_path_prefixes"])
+        if "download_path_demote" in data:
+            cfg.download_path_demote = float(data["download_path_demote"])
         if "transcribe_enabled" in data:
             cfg.transcribe_enabled = bool(data["transcribe_enabled"])
         if "whisper_model_size" in data:
@@ -329,6 +381,8 @@ def load_config(path: Path | None = None) -> Config:
             cfg.briefing_model = data["briefing_model"]
         if "briefing_max_tokens" in data:
             cfg.briefing_max_tokens = int(data["briefing_max_tokens"])
+        if "tag_model" in data:
+            cfg.tag_model = data["tag_model"]
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:
