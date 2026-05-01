@@ -388,9 +388,10 @@ def auth(
     from .connectors._google_oauth import GoogleAuthError, run_oauth_flow
     from .connectors.gmail import GMAIL_SCOPES
     from .connectors.google_calendar import GOOGLE_CALENDAR_SCOPES
+    from .connectors.google_drive import GOOGLE_DRIVE_SCOPES
 
     cfg = load_config()
-    scopes = list({*GMAIL_SCOPES, *GOOGLE_CALENDAR_SCOPES})
+    scopes = list({*GMAIL_SCOPES, *GOOGLE_CALENDAR_SCOPES, *GOOGLE_DRIVE_SCOPES})
     try:
         creds = run_oauth_flow(cfg, scopes, open_browser=True)
     except GoogleAuthError as e:
