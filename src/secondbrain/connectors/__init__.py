@@ -49,17 +49,25 @@ class Connector(Protocol):
 
 
 def all_connectors() -> list[type[Connector]]:
-    """Registry of connector classes. Order = run order for `sync all`."""
+    """Registry of connector classes. Order = run order for `sync all`.
+
+    Cheap/local connectors first (browser is just a SQLite read), then
+    network-bound ones. Gmail last because it's the slowest on first sync.
+    """
     from .browser import BrowserHistoryConnector
     from .calendar import CalendarConnector
     from .github import GitHubConnector
+    from .gmail import GmailConnector
+    from .google_calendar import GoogleCalendarConnector
     from .notion import NotionConnector
 
     return [
+        BrowserHistoryConnector,
         GitHubConnector,
         NotionConnector,
-        BrowserHistoryConnector,
         CalendarConnector,
+        GoogleCalendarConnector,
+        GmailConnector,
     ]
 
 

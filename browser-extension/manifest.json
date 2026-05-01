@@ -1,0 +1,51 @@
+{
+    "manifest_version": 3,
+    "name": "second-brain context bridge",
+    "version": "0.0.1",
+    "description": "Inject context from your local second-brain into ChatGPT, Gemini, Perplexity, Grok, and DeepSeek prompts.",
+    "permissions": ["storage"],
+    "host_permissions": [
+        "http://127.0.0.1:8765/*",
+        "http://localhost:8765/*"
+    ],
+    "action": {
+        "default_popup": "popup.html",
+        "default_title": "second-brain context bridge"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://chat.openai.com/*",
+                "https://chatgpt.com/*"
+            ],
+            "js": ["content/common.js", "content/chatgpt.js"],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": ["https://gemini.google.com/*"],
+            "js": ["content/common.js", "content/gemini.js"],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": [
+                "https://www.perplexity.ai/*",
+                "https://perplexity.ai/*"
+            ],
+            "js": ["content/common.js", "content/perplexity.js"],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": ["https://x.com/*", "https://grok.com/*"],
+            "js": ["content/common.js", "content/grok.js"],
+            "run_at": "document_idle"
+        },
+        {
+            "matches": ["https://chat.deepseek.com/*"],
+            "js": ["content/common.js", "content/deepseek.js"],
+            "run_at": "document_idle"
+        }
+    ]
+}

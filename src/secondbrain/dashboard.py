@@ -1456,6 +1456,84 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     def health():
         return {"ok": True}
 
+    # --- Browser extension API ----------------------------------------
+    # These endpoints are consumed by the multi-AI bridge browser
+    # extension. CORS is allowed for the AI hosts so a content script
+    # running on chat.openai.com / gemini.google.com / etc. can fetch
+    # context from the local dashboard. The dashboard binds to 127.0.0.1
+    # only, so these endpoints are not reachable from elsewhere on the
+    # network.
+
+    _EXTENSION_ALLOWED_ORIGINS = {
+        "https://chat.openai.com",
+        "https://chatgpt.com",
+        "https://gemini.google.com",
+        "https://www.perplexity.ai",
+        "https://perplexity.ai",
+        "https://x.com",
+        "https://grok.com",
+        "https://chat.deepseek.com",
+    }
+
+    def _extension_cors(origin: str | None) -> dict[str, str]:
+        if origin and origin in _EXTENSION_ALLOWED_ORIGINS:
+            return {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Vary": "Origin",
+            }
+        return {}
+
+    @app.options("/api/extension/{path:path}")
+    def extension_preflight(request: Request, path: str):  # noqa: ARG001
+        from fastapi.responses import Response as _Resp
+
+        return _Resp(headers=_extension_cors(request.headers.get("origin")))
+
+    @app.get("/api/extension/health")
+    def extension_health(request: Request):
+        from fastapi.responses import JSONResponse as _JSON
+
+        return _JSON(
+            {"ok": True, "name": "second-brain"},
+            headers=_extension_cors(request.headers.get("origin")),
+        )
+
+    @app.get("/api/extension/search")
+    def extension_search(request: Request, q: str = "", k: int = 5):
+        """Return compact context blocks for the browser extension to inject
+        before a user's prompt to ChatGPT / Gemini / etc."""
+        from fastapi.responses import JSONResponse as _JSON
+
+        cors = _extension_cors(request.headers.get("origin"))
+        if not q.strip():
+            return _JSON({"results": []}, headers=cors)
+        cfg, conn, embedder, reranker = get_state()
+        results = hybrid_search(
+            conn, embedder, q, k=min(max(k, 1), 10),
+            alpha=cfg.hybrid_alpha,
+            reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
+            use_adaptive_alpha=cfg.adaptive_alpha,
+            time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
+            time_decay_half_life_days=cfg.time_decay_half_life_days,
+        )
+        # Log this query in the same audit trail as MCP-driven queries.
+        try:
+            from .mcp_server import _log_query
+            _log_query(cfg, q, "extension", results)
+        except Exception:
+            pass
+        out = []
+        for r in results:
+            out.append({
+                "path": r.file_path,
+                "chunk_index": r.chunk_index,
+                "snippet": r.text if len(r.text) <= 1500 else r.text[:1500] + "...",
+                "score": round(r.score, 4),
+            })
+        return _JSON({"results": out, "query": q}, headers=cors)
+
     @app.get("/api/palette")
     def api_palette(q: str = ""):
         """Mixed search for the command palette: entities + files matching q."""

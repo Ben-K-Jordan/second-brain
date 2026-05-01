@@ -359,6 +359,47 @@ def watch(
 
 
 @app.command()
+def auth(
+    provider: str = typer.Argument(
+        "google",
+        help="Auth provider to set up (currently: 'google').",
+    ),
+) -> None:
+    """One-time OAuth flow for a cloud provider.
+
+    For 'google': make sure you've created an OAuth Desktop client in
+    https://console.cloud.google.com and saved the JSON as
+    ~/.secondbrain/google_client_secret.json. Then this command opens a
+    browser, captures the redirect, and stores credentials. Subsequent
+    Gmail / Google Calendar syncs auto-refresh.
+    """
+    if provider != "google":
+        console.print(f"[red]Unknown auth provider:[/] {provider}")
+        raise typer.Exit(code=1)
+
+    from .connectors._google_oauth import GoogleAuthError, run_oauth_flow
+    from .connectors.gmail import GMAIL_SCOPES
+    from .connectors.google_calendar import GOOGLE_CALENDAR_SCOPES
+
+    cfg = load_config()
+    scopes = list({*GMAIL_SCOPES, *GOOGLE_CALENDAR_SCOPES})
+    try:
+        creds = run_oauth_flow(cfg, scopes, open_browser=True)
+    except GoogleAuthError as e:
+        console.print(f"[red]Auth failed:[/] {e}")
+        raise typer.Exit(code=1) from e
+    console.print(
+        f"[green]Authorized.[/] Stored credentials at "
+        f"{cfg.data_dir / 'google_credentials.json'}"
+    )
+    console.print(f"  scopes: {', '.join(creds.scopes)}")
+    console.print()
+    console.print("Now run:")
+    console.print('  [cyan]secondbrain sync gmail[/]')
+    console.print('  [cyan]secondbrain sync google_calendar[/]')
+
+
+@app.command()
 def sync(
     source: str = typer.Argument(
         "all",

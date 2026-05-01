@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>second-brain</title>
+    <style>
+        :root {
+            --bg: #0a0a0a; --fg: #d4d4c8; --green: #7fff7f;
+            --green-dim: #4abe4a; --border: #2c2c2c;
+        }
+        body {
+            width: 320px; margin: 0; padding: 16px;
+            background: var(--bg); color: var(--fg);
+            font-family: 'JetBrains Mono', 'SF Mono', monospace; font-size: 13px;
+        }
+        h1 {
+            margin: 0 0 12px; font-size: 14px; color: var(--green);
+            text-shadow: 0 0 8px rgba(127,255,127,0.4);
+        }
+        h1::before { content: "▮ "; }
+        .row {
+            display: flex; justify-content: space-between;
+            padding: 6px 0; border-bottom: 1px dashed var(--border);
+            font-size: 12px;
+        }
+        .row:last-child { border-bottom: none; }
+        .row .k { color: #888; }
+        .row .v.ok  { color: var(--green); }
+        .row .v.bad { color: #ff5c5c; }
+        a { color: var(--green); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .hint {
+            margin-top: 12px; padding: 8px 10px;
+            background: #111; border: 1px solid var(--border);
+            border-radius: 2px; font-size: 11px; color: #aaa; line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <h1>second-brain bridge</h1>
+    <div class="row"><span class="k">local API</span><span class="v" id="status">checking…</span></div>
+    <div class="row"><span class="k">version</span><span class="v">0.0.1</span></div>
+    <div class="row"><span class="k">supported sites</span><span class="v">5</span></div>
+    <div class="hint">
+        On any supported AI site, type your question, then click the
+        <b>🧠 brain</b> pill to inject relevant context from your local brain.
+        Make sure <code>secondbrain dashboard</code> is running.
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>
