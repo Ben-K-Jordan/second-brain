@@ -15,8 +15,11 @@ Defense in depth - this isn't a substitute for provider-side billing limits
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +28,36 @@ from pathlib import Path
 from .config import Config
 
 log = logging.getLogger(__name__)
+
+
+# Cross-process exclusive file lock using stdlib only. The daemon, dashboard,
+# and MCP server can all be writing the spend ledger from different processes;
+# threading.Lock is not enough.
+if sys.platform == "win32":
+    import msvcrt
+
+    @contextlib.contextmanager
+    def _flock(f):  # type: ignore[no-untyped-def]
+        # Lock 1 byte at offset 0; LK_LOCK blocks until acquired.
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            try:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+else:
+    import fcntl
+
+    @contextlib.contextmanager
+    def _flock(f):  # type: ignore[no-untyped-def]
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 # USD per 1M tokens. Most embedders only have an input price; chat/rerank
@@ -108,9 +141,23 @@ def record_usage(
     }
     path = _ledger_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(row) + "\n"
+    # In-process lock for thread safety, file lock for cross-process safety
+    # (daemon + dashboard + MCP can all write concurrently). fsync ensures
+    # the row survives a crash - otherwise the cap under-reports, the next
+    # call passes, and the loop blows the budget for real.
     with _LEDGER_LOCK:
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+            with _flock(f):
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # Some filesystems / WSL on certain mounts can refuse
+                    # fsync on append-only writes. The flush already made it
+                    # to OS buffers; that's the best we can do.
+                    pass
     return estimate
 
 
@@ -151,15 +198,21 @@ def check_budget(cfg: Config, provider: str) -> None:
 
     Caps live in config: ``daily_budget_cents_voyage`` and
     ``daily_budget_cents_anthropic`` (cents because integer cents avoid float
-    parsing surprises in TOML). Set to 0 or a very large number to effectively
-    disable.
+    parsing surprises in TOML). Set to 0 to **explicitly disable** the cap.
+
+    Fails closed: if the config field is missing or None, we refuse the call
+    rather than silently allowing unlimited spend. The user previously hit a
+    case where None bypassed the cap and a runaway loop spent $6.47 against
+    a $5 cap. Better to halt and ask "why is the cap None?" than to leak.
     """
     cap = (
         cfg.daily_budget_cents_voyage if provider == "voyage"
         else cfg.daily_budget_cents_anthropic
     )
+    if cap is None:
+        raise BudgetExceededError(provider, 0.0, 0.0)
     if cap <= 0:
-        return
+        return  # explicit "disabled" sentinel
     spent = daily_spend_cents(cfg, provider=provider)
     if spent >= cap:
         raise BudgetExceededError(provider, spent, cap)

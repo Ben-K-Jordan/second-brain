@@ -35,7 +35,9 @@ log = logging.getLogger(__name__)
 
 _AUTH_URL = "https://www.reddit.com/api/v1/access_token"
 _API = "https://oauth.reddit.com"
-_USER_AGENT = "second-brain/0.0.1 (personal indexer)"
+# Reddit asks for a descriptive UA per https://github.com/reddit-archive/reddit/wiki/API
+_USER_AGENT = "second-brain (personal indexer; https://github.com/Ben-K-Jordan/second-brain)"
+_DEFAULT_LIMIT = 500
 
 
 def _required_env() -> tuple[str, str, str, str] | None:
@@ -81,7 +83,13 @@ class RedditConnector:
             timeout=30,
         )
         if token_resp.status_code != 200:
-            log.warning("Reddit token fetch failed: %s %s", token_resp.status_code, token_resp.text[:200])
+            # Never log token_resp.text - the password-grant endpoint can echo
+            # form fields (including the password) into error responses.
+            log.warning(
+                "Reddit token fetch failed: HTTP %s "
+                "(check REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD)",
+                token_resp.status_code,
+            )
             return
         token = (token_resp.json() or {}).get("access_token")
         if not token:
@@ -94,17 +102,18 @@ class RedditConnector:
             "User-Agent": _USER_AGENT,
         })
 
+        cap = int(os.environ.get("SB_REDDIT_MAX", _DEFAULT_LIMIT))
         try:
-            yield from self._iter_listing(s, f"/user/{user}/saved", source_label="saved")
-            yield from self._iter_listing(s, f"/user/{user}/submitted", source_label="own_post")
-            yield from self._iter_listing(s, f"/user/{user}/comments", source_label="own_comment")
+            yield from self._iter_listing(s, f"/user/{user}/saved", source_label="saved", limit=cap)
+            yield from self._iter_listing(s, f"/user/{user}/submitted", source_label="own_post", limit=cap)
+            yield from self._iter_listing(s, f"/user/{user}/comments", source_label="own_comment", limit=cap)
         finally:
             s.close()
 
     # --- helpers --------------------------------------------------------
 
     def _iter_listing(
-        self, s: requests.Session, path: str, source_label: str, limit: int = 500
+        self, s: requests.Session, path: str, source_label: str, limit: int = _DEFAULT_LIMIT
     ) -> Iterator[ConnectorDocument]:
         after: str | None = None
         emitted = 0
@@ -113,8 +122,12 @@ class RedditConnector:
             if after:
                 params["after"] = after
             r = s.get(f"{_API}{path}", params=params, timeout=30)
+            if r.status_code == 429:
+                from . import respect_retry_after
+                if respect_retry_after(r):
+                    continue
             if r.status_code != 200:
-                log.warning("Reddit %s failed: %s", path, r.status_code)
+                log.warning("Reddit %s failed: HTTP %s", path, r.status_code)
                 return
             data = (r.json() or {}).get("data") or {}
             children = data.get("children") or []

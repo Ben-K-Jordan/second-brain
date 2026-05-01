@@ -8,6 +8,7 @@ so the user just edits config.toml once.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .db import connect, init_schema
+from .db import checkpoint_wal, connect, init_schema
 from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
@@ -26,6 +27,22 @@ from .transcriber import make_transcriber
 from .watcher import Watcher
 
 log = logging.getLogger(__name__)
+
+
+# How often the daemon should checkpoint the WAL (and how often the tray's
+# bootstrap loop should as well). 10 minutes is comfortable - a busy reader
+# can hold the snapshot for that long without the WAL being a problem.
+_WAL_CHECKPOINT_INTERVAL_SEC = 600
+
+
+def _make_log_handlers(log_path: Path) -> list[logging.Handler]:
+    """Rotate the daemon log so a long-running install doesn't accumulate
+    hundreds of MB of indexing chatter. 10MB x 3 backups = ~30MB ceiling.
+    """
+    rotating = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    return [rotating]
 
 
 def _setup_state(cfg: Config):
@@ -122,10 +139,7 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=[*_make_log_handlers(log_path), logging.StreamHandler()],
     )
 
     folders = _resolve_folders(cfg)
@@ -156,13 +170,24 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
     )
     watcher.start(folders)
     log.info("watcher running. Ctrl-C to stop.")
+    last_checkpoint = time.time()
     try:
         while True:
             time.sleep(1)
+            # Periodically truncate the WAL so a long-running daemon with an
+            # active reader (the dashboard) doesn't let it grow unbounded.
+            if time.time() - last_checkpoint >= _WAL_CHECKPOINT_INTERVAL_SEC:
+                checkpoint_wal(conn)
+                last_checkpoint = time.time()
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:
         watcher.stop()
+        # One final checkpoint on shutdown so the next start finds a clean WAL.
+        try:
+            checkpoint_wal(conn)
+        except Exception:  # noqa: BLE001
+            pass
         conn.close()
 
 
@@ -205,7 +230,7 @@ def run_tray(cfg: Config) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        handlers=_make_log_handlers(log_path),
     )
     log.info("starting tray, watching: %s", [str(f) for f in folders])
 
@@ -279,5 +304,9 @@ def run_tray(cfg: Config) -> None:
     finally:
         log.info("stopping watcher...")
         watcher.stop()
+        try:
+            checkpoint_wal(conn)
+        except Exception:  # noqa: BLE001
+            pass
         conn.close()
         log.info("stopped")

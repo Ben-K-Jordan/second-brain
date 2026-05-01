@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "second-brain context bridge",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "Inject context from your local second-brain into ChatGPT, Gemini, Perplexity, Grok, and DeepSeek prompts.",
     "permissions": ["storage"],
     "host_permissions": [

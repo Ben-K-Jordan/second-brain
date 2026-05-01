@@ -17,6 +17,7 @@ Pages:
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 import urllib.parse
@@ -26,15 +27,44 @@ from pathlib import Path
 
 from .briefing import generate_briefing
 from .budget import spend_summary
-from .config import load_config
+from .config import Config, load_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .indexer import index_url
+from .mcp_server import _log_query
 from .reranker import make_reranker
 from .search import hybrid_search
 
 log = logging.getLogger(__name__)
+
+
+def _extension_token_path(cfg: Config) -> Path:
+    return cfg.data_dir / "extension_token.txt"
+
+
+def get_or_create_extension_token(cfg: Config) -> str:
+    """Per-install random secret the browser extension must present as
+    ``Authorization: Bearer ...`` on /api/extension/* calls.
+
+    Stored at ``<data_dir>/extension_token.txt`` with mode 0600 where the
+    OS supports it. Without this, the dashboard's CORS allow-list lets any
+    JavaScript on chatgpt.com / x.com / etc. exfiltrate the entire index.
+    """
+    path = _extension_token_path(cfg)
+    if path.exists():
+        token = path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    path.write_text(token, encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Windows ignores the bits anyway; fine.
+        pass
+    return token
 
 
 # --- HTML rendering helpers (no Jinja dep — embedded templates as f-strings) ---
@@ -878,6 +908,13 @@ def create_app():
                 path_prefix=folder or None,
                 kind=kind or None,
                 since_days=since_days,
+                use_hyde=cfg.hyde_enabled,
+                hyde_model=cfg.hyde_model,
+                personal_prefixes=cfg.personal_path_prefixes,
+                personal_boost=cfg.personal_path_boost,
+                download_prefixes=cfg.download_path_prefixes,
+                download_demote=cfg.download_path_demote,
+                cfg=cfg,
             )
             if results:
                 results_html = "".join(_result_block(r) for r in results)
@@ -1421,8 +1458,23 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Ingest", body, "ingest"))
 
     @app.post("/ingest", response_class=HTMLResponse)
-    def ingest_action(url: str = Form(...)):
+    def ingest_action(request: Request, url: str = Form(...)):
         cfg, conn, embedder, _ = get_state()
+        # CSRF guard: form-POSTs aren't gated by CORS, so any page the user
+        # visits could otherwise force-ingest an arbitrary URL by submitting
+        # a hidden form to http://127.0.0.1:8765/ingest. Require the Origin
+        # (or Referer, when Origin isn't sent) to be the dashboard itself.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        same_origin = any(origin.startswith(p) for p in same_origin_prefixes) or any(
+            referer.startswith(p) for p in same_origin_prefixes
+        )
+        if not same_origin:
+            return HTMLResponse(
+                "<h1>Forbidden</h1><p>Cross-origin POSTs to /ingest are blocked.</p>",
+                status_code=403,
+            )
         url = url.strip()
         if not url:
             return RedirectResponse(url="/ingest", status_code=303)
@@ -1480,10 +1532,33 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return {
                 "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
+                # Authorization must be in the allowlist or the browser strips
+                # it from cross-origin preflight-required requests.
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
                 "Vary": "Origin",
             }
         return {}
+
+    def _extension_authorized(request: Request) -> bool:
+        """Bearer-token + 127.0.0.1-only check.
+
+        The CORS allow-list is *not* authentication - any JS running on one
+        of those origins (a content script in another extension, an XSS) can
+        otherwise read the entire index. Extension surfaces the per-install
+        token from ``secondbrain auth extension`` and presents it here.
+        """
+        # We only ever bind to 127.0.0.1, but defense-in-depth: reject if
+        # the request didn't come from loopback.
+        client_host = (request.client.host if request.client else "") or ""
+        if client_host not in {"127.0.0.1", "::1", "localhost"}:
+            return False
+        cfg, _, _, _ = get_state()
+        expected = get_or_create_extension_token(cfg)
+        header = request.headers.get("authorization", "")
+        if not header.lower().startswith("bearer "):
+            return False
+        presented = header.split(" ", 1)[1].strip()
+        return secrets.compare_digest(presented, expected)
 
     @app.options("/api/extension/{path:path}")
     def extension_preflight(request: Request, path: str):  # noqa: ARG001
@@ -1495,10 +1570,10 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     def extension_health(request: Request):
         from fastapi.responses import JSONResponse as _JSON
 
-        return _JSON(
-            {"ok": True, "name": "second-brain"},
-            headers=_extension_cors(request.headers.get("origin")),
-        )
+        cors = _extension_cors(request.headers.get("origin"))
+        if not _extension_authorized(request):
+            return _JSON({"ok": False, "error": "unauthorized"}, status_code=401, headers=cors)
+        return _JSON({"ok": True, "name": "second-brain"}, headers=cors)
 
     @app.get("/api/extension/search")
     def extension_search(request: Request, q: str = "", k: int = 5):
@@ -1507,6 +1582,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from fastapi.responses import JSONResponse as _JSON
 
         cors = _extension_cors(request.headers.get("origin"))
+        if not _extension_authorized(request):
+            return _JSON({"error": "unauthorized"}, status_code=401, headers=cors)
         if not q.strip():
             return _JSON({"results": []}, headers=cors)
         cfg, conn, embedder, reranker = get_state()
@@ -1517,10 +1594,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             use_adaptive_alpha=cfg.adaptive_alpha,
             time_decay_weight=cfg.time_decay_weight if cfg.time_decay_enabled else 0.0,
             time_decay_half_life_days=cfg.time_decay_half_life_days,
+            use_hyde=cfg.hyde_enabled,
+            hyde_model=cfg.hyde_model,
+            personal_prefixes=cfg.personal_path_prefixes,
+            personal_boost=cfg.personal_path_boost,
+            download_prefixes=cfg.download_path_prefixes,
+            download_demote=cfg.download_path_demote,
+            cfg=cfg,
         )
         # Log this query in the same audit trail as MCP-driven queries.
         try:
-            from .mcp_server import _log_query
             _log_query(cfg, q, "extension", results)
         except Exception:
             pass

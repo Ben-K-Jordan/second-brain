@@ -276,6 +276,7 @@ def search(
         personal_boost=cfg.personal_path_boost,
         download_prefixes=cfg.download_path_prefixes,
         download_demote=cfg.download_path_demote,
+        cfg=cfg,
     )
     if not results:
         console.print("[yellow]No matches.[/]")
@@ -370,19 +371,44 @@ def watch(
 def auth(
     provider: str = typer.Argument(
         "google",
-        help="Auth provider to set up (currently: 'google').",
+        help="Auth provider to set up: 'google' (Gmail / Calendar / Drive) "
+             "or 'extension' (browser-extension bearer token).",
     ),
 ) -> None:
-    """One-time OAuth flow for a cloud provider.
+    """One-time OAuth flow for a cloud provider, or print the extension token.
 
     For 'google': make sure you've created an OAuth Desktop client in
     https://console.cloud.google.com and saved the JSON as
     ~/.secondbrain/google_client_secret.json. Then this command opens a
     browser, captures the redirect, and stores credentials. Subsequent
     Gmail / Google Calendar syncs auto-refresh.
+
+    For 'extension': prints (and creates if missing) the per-install bearer
+    token for the browser extension. Paste it into the extension popup; the
+    token is required for /api/extension/* calls.
     """
+    cfg = load_config()
+
+    if provider == "extension":
+        from .dashboard import get_or_create_extension_token
+
+        token = get_or_create_extension_token(cfg)
+        console.print(
+            "[green]Browser-extension token[/] "
+            "(paste this into the extension popup):"
+        )
+        console.print(f"  [cyan]{token}[/]")
+        console.print()
+        console.print(
+            "Anyone with this token + access to 127.0.0.1:8765 can read your "
+            "index. Don't share it; rotate by deleting "
+            f"{cfg.data_dir / 'extension_token.txt'}."
+        )
+        return
+
     if provider != "google":
         console.print(f"[red]Unknown auth provider:[/] {provider}")
+        console.print("Try: 'google' or 'extension'.")
         raise typer.Exit(code=1)
 
     from .connectors._google_oauth import GoogleAuthError, run_oauth_flow
@@ -390,7 +416,6 @@ def auth(
     from .connectors.google_calendar import GOOGLE_CALENDAR_SCOPES
     from .connectors.google_drive import GOOGLE_DRIVE_SCOPES
 
-    cfg = load_config()
     scopes = list({*GMAIL_SCOPES, *GOOGLE_CALENDAR_SCOPES, *GOOGLE_DRIVE_SCOPES})
     try:
         creds = run_oauth_flow(cfg, scopes, open_browser=True)

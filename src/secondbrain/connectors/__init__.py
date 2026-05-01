@@ -14,11 +14,46 @@ the OAuth flow.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from .. import __version__ as _SECONDBRAIN_VERSION
 from ..config import Config
+
+# Shared HTTP defaults so every connector is consistent. Override per-call
+# only when there's a clear reason (large file downloads, GraphQL endpoints
+# that aggregate a lot of data, etc).
+DEFAULT_TIMEOUT = 30
+USER_AGENT = f"second-brain/{_SECONDBRAIN_VERSION}"
+
+_log = logging.getLogger(__name__)
+
+
+def respect_retry_after(response, max_wait: float = 60.0) -> bool:
+    """If ``response`` is a 429, sleep up to ``max_wait`` seconds and return True.
+
+    Caller should re-issue the same request after we return True. Honors the
+    ``Retry-After`` header when present (Google, GitHub, Pocket, Reddit all
+    set it). Without this, every connector treats a 429 identically to a 5xx
+    and silently truncates the sync.
+    """
+    try:
+        if response.status_code != 429:
+            return False
+    except AttributeError:
+        return False
+    raw = response.headers.get("Retry-After", "5") if hasattr(response, "headers") else "5"
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        wait = 5.0
+    wait = max(0.5, min(max_wait, wait))
+    _log.info("rate limited (429); sleeping %.1fs before retry", wait)
+    time.sleep(wait)
+    return True
 
 
 @dataclass

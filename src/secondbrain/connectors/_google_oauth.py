@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.server
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -40,6 +41,19 @@ log = logging.getLogger(__name__)
 _AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _REDIRECT_HOST = "127.0.0.1"
+
+
+# Strip token-shaped fields from any response body before it ends up in a
+# log line or exception message. Google's token endpoint returns access_token
+# / refresh_token / id_token as JSON, and on some error paths echoes them
+# back. Truncate to 500 chars regardless.
+_TOKEN_FIELD_RE = re.compile(
+    r'("(?:access_token|refresh_token|id_token)"\s*:\s*")[^"]+"', re.IGNORECASE
+)
+
+
+def _scrub(body: str) -> str:
+    return _TOKEN_FIELD_RE.sub(r'\1<redacted>"', body or "")[:500]
 
 
 @dataclass
@@ -61,6 +75,19 @@ class GoogleCredentials:
 
 class GoogleAuthError(RuntimeError):
     pass
+
+
+class ScopeMissing(GoogleAuthError):
+    """Raised by ``get_credentials`` when stored creds don't cover required scopes.
+
+    Distinguished from ``GoogleAuthError`` so callers can show a useful message
+    ("you authorized for X but this connector needs Y") instead of a generic
+    "no Google credentials" prompt.
+    """
+
+    def __init__(self, missing: set[str]) -> None:
+        self.missing = missing
+        super().__init__(f"Missing Google scopes: {sorted(missing)}")
 
 
 def _client_secret_path(cfg: Config) -> Path:
@@ -189,8 +216,8 @@ def run_oauth_flow(cfg: Config, scopes: list[str], open_browser: bool = True) ->
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
 
-    print(f"\nOpening browser for Google authorization...")
-    print(f"If it doesn't open, visit:\n  {auth_url}\n")
+    log.info("Opening browser for Google authorization...")
+    log.info("If it doesn't open, visit: %s", auth_url)
     if open_browser:
         try:
             webbrowser.open(auth_url)
@@ -215,7 +242,9 @@ def run_oauth_flow(cfg: Config, scopes: list[str], open_browser: bool = True) ->
         "grant_type": "authorization_code",
     }, timeout=30)
     if resp.status_code != 200:
-        raise GoogleAuthError(f"Token exchange failed: {resp.status_code} {resp.text}")
+        raise GoogleAuthError(
+            f"Token exchange failed: {resp.status_code} {_scrub(resp.text)}"
+        )
     body = resp.json()
     if "refresh_token" not in body:
         raise GoogleAuthError(
@@ -244,7 +273,7 @@ def _refresh(cfg: Config, creds: GoogleCredentials) -> GoogleCredentials:
     }, timeout=30)
     if resp.status_code != 200:
         raise GoogleAuthError(
-            f"Token refresh failed: {resp.status_code} {resp.text}. "
+            f"Token refresh failed: {resp.status_code} {_scrub(resp.text)}. "
             "Re-run `secondbrain auth google` to re-authorize."
         )
     body = resp.json()
@@ -260,29 +289,77 @@ def _refresh(cfg: Config, creds: GoogleCredentials) -> GoogleCredentials:
 def get_credentials(cfg: Config, required_scopes: list[str]) -> GoogleCredentials | None:
     """Return valid credentials covering ``required_scopes``, refreshing if
     expired. Returns None if no credentials are stored yet — caller should
-    prompt the user to run ``secondbrain auth google``."""
+    prompt the user to run ``secondbrain auth google``.
+
+    Raises ``ScopeMissing`` (a ``GoogleAuthError``) if creds exist but lack
+    one or more required scopes — distinct from "not authed at all" so the
+    UX can tell the user *which* scope is missing instead of asking them to
+    re-auth blind.
+    """
     creds = _load_credentials(cfg)
     if creds is None:
         return None
-    if any(s not in creds.scopes for s in required_scopes):
-        return None  # caller must re-auth with broader scopes
+    missing = {s for s in required_scopes if s not in creds.scopes}
+    if missing:
+        raise ScopeMissing(missing)
     if creds.expired:
         creds = _refresh(cfg, creds)
     return creds
 
 
+class _AutoRefreshSession(requests.Session):
+    """A requests.Session that re-checks token expiry before every request.
+
+    The previous ``authorized_session`` snapshotted the access token into a
+    static header at session-creation time. Google access tokens expire after
+    1h, so a long Drive or Gmail first-sync would 401 partway through and
+    silently truncate. This subclass calls ``get_credentials`` (which refreshes
+    on expiry) before each request, and on a 401 forces one refresh + retry.
+    """
+
+    def __init__(self, cfg: Config, scopes: list[str]) -> None:
+        super().__init__()
+        self._cfg = cfg
+        self._scopes = list(scopes)
+        self.headers.update({"User-Agent": "second-brain/0.0.1"})
+
+    def _apply_token(self) -> None:
+        creds = get_credentials(self._cfg, self._scopes)
+        if creds is None:
+            raise GoogleAuthError(
+                "No Google credentials. Run `secondbrain auth google` first."
+            )
+        self.headers["Authorization"] = f"{creds.token_type} {creds.access_token}"
+
+    def request(self, method, url, **kwargs):  # type: ignore[override]
+        self._apply_token()
+        resp = super().request(method, url, **kwargs)
+        # On 401, force one refresh + retry. Covers the case where the token
+        # was valid at request-prep time but Google rejected it (clock skew,
+        # rotation, etc.).
+        if resp.status_code == 401:
+            creds = _load_credentials(self._cfg)
+            if creds is not None:
+                try:
+                    _refresh(self._cfg, creds)
+                except GoogleAuthError as e:
+                    log.warning("token refresh after 401 failed: %s", e)
+                    return resp
+                self._apply_token()
+                resp = super().request(method, url, **kwargs)
+        return resp
+
+
 def authorized_session(cfg: Config, scopes: list[str]) -> requests.Session | None:
-    """Convenience: return a requests.Session that auto-injects the bearer
-    token. None if no creds stored."""
+    """Return a requests.Session with auto-token-refresh on every request.
+
+    Returns None if no creds stored. Raises ``ScopeMissing`` if creds exist
+    but don't cover ``scopes``.
+    """
     creds = get_credentials(cfg, scopes)
     if creds is None:
         return None
-    s = requests.Session()
-    s.headers.update({
-        "Authorization": f"{creds.token_type} {creds.access_token}",
-        "User-Agent": "second-brain/0.0.1",
-    })
-    return s
+    return _AutoRefreshSession(cfg, scopes)
 
 
 def is_authorized(cfg: Config, scopes: list[str]) -> bool:

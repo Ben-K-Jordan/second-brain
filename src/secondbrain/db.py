@@ -18,9 +18,15 @@ def serialize_f32(vec: Iterable[float]) -> bytes:
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open a read/write connection with sqlite-vec loaded and sensible pragmas."""
+    """Open a read/write connection with sqlite-vec loaded and sensible pragmas.
+
+    ``check_same_thread=False`` is required because the daemon hands one
+    connection to a watchdog worker thread, which then calls into the indexer
+    on file events. Caller is responsible for not running concurrent writers
+    *within* a process; busy_timeout already serializes across processes.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
@@ -32,7 +38,26 @@ def connect(db_path: Path) -> sqlite3.Connection:
     # transactions on big spreadsheets (1500+ chunks + entities + vectors)
     # can run for several seconds end-to-end; 5s left status queries failing.
     conn.execute("PRAGMA busy_timeout = 30000")
+    # Auto-checkpoint after every ~1000 pages of WAL (4MB at default page size).
+    # Without this, a long-running daemon with an active reader connection can
+    # let the WAL grow unbounded - we previously hit a 893MB -wal file. This
+    # is a passive checkpoint; it doesn't block writers.
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
     return conn
+
+
+def checkpoint_wal(conn: sqlite3.Connection) -> None:
+    """Force a TRUNCATE checkpoint, shrinking the -wal file to zero.
+
+    Called periodically by the daemon and on clean shutdown. Safe to call from
+    any thread that holds the connection. If a reader holds an old snapshot,
+    the checkpoint may only partially complete - that's fine, it'll catch up.
+    """
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        # Another writer holds the lock; we'll get the next opportunity.
+        pass
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -244,12 +269,10 @@ def find_file_by_hash(conn: sqlite3.Connection, content_hash: str) -> sqlite3.Ro
 
 def add_alias(conn: sqlite3.Connection, file_id: int, path: str) -> None:
     """Record an alternate path for a file. No-op if the alias already exists."""
-    import time as _time
-
     conn.execute(
         "INSERT OR IGNORE INTO file_aliases(file_id, path, discovered_at) "
         "VALUES (?, ?, ?)",
-        (file_id, path, _time.time()),
+        (file_id, path, time.time()),
     )
 
 
@@ -301,34 +324,47 @@ def replace_chunks(
     Accepts ``(text, embedding)`` or ``(text, embedding, start_offset)`` tuples
     — the latter is used by callers that track byte offsets back into the
     original file (citation provenance). Returns the new chunk IDs in order.
-    """
-    old_ids = [
-        r["id"] for r in conn.execute("SELECT id FROM chunks WHERE file_id = ?", (file_id,))
-    ]
-    for cid in old_ids:
-        conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
-        conn.execute("DELETE FROM entities WHERE chunk_id = ?", (cid,))
-    conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
 
-    new_ids: list[int] = []
-    for idx, item in enumerate(chunks):
-        if len(item) == 3:
-            text, embedding, start_offset = item
-        else:
-            text, embedding = item
-            start_offset = None
-        cur = conn.execute(
-            "INSERT INTO chunks(file_id, chunk_index, text, start_offset) "
-            "VALUES (?, ?, ?, ?) RETURNING id",
-            (file_id, idx, text, start_offset),
-        )
-        chunk_id = cur.fetchone()["id"]
-        new_ids.append(chunk_id)
-        conn.execute(
-            "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)",
-            (chunk_id, serialize_f32(embedding)),
-        )
-    return new_ids
+    Wrapped in a SAVEPOINT so a crash mid-replace doesn't leave the file row
+    with content_hash set but no chunks. The caller still has to commit the
+    outer transaction, but a thrown exception here unwinds atomically.
+    """
+    conn.execute("SAVEPOINT replace_chunks")
+    try:
+        old_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM chunks WHERE file_id = ?", (file_id,)
+            )
+        ]
+        for cid in old_ids:
+            conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+            conn.execute("DELETE FROM entities WHERE chunk_id = ?", (cid,))
+        conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+
+        new_ids: list[int] = []
+        for idx, item in enumerate(chunks):
+            if len(item) == 3:
+                text, embedding, start_offset = item
+            else:
+                text, embedding = item
+                start_offset = None
+            cur = conn.execute(
+                "INSERT INTO chunks(file_id, chunk_index, text, start_offset) "
+                "VALUES (?, ?, ?, ?) RETURNING id",
+                (file_id, idx, text, start_offset),
+            )
+            chunk_id = cur.fetchone()["id"]
+            new_ids.append(chunk_id)
+            conn.execute(
+                "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, serialize_f32(embedding)),
+            )
+        conn.execute("RELEASE SAVEPOINT replace_chunks")
+        return new_ids
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT replace_chunks")
+        conn.execute("RELEASE SAVEPOINT replace_chunks")
+        raise
 
 
 def upsert_image_embedding(
@@ -339,8 +375,6 @@ def upsert_image_embedding(
     embedding: list[float],
 ) -> int:
     """Replace any existing image embedding for this file+embedder, return image_id."""
-    import time as _time
-
     old = conn.execute(
         "SELECT id FROM images WHERE file_id = ? AND embedder = ?",
         (file_id, embedder_name),
@@ -351,7 +385,7 @@ def upsert_image_embedding(
     cur = conn.execute(
         "INSERT INTO images(file_id, embedder, embedding_dim, indexed_at) "
         "VALUES (?, ?, ?, ?) RETURNING id",
-        (file_id, embedder_name, embedding_dim, _time.time()),
+        (file_id, embedder_name, embedding_dim, time.time()),
     )
     image_id = cur.fetchone()["id"]
     conn.execute(

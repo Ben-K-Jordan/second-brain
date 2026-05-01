@@ -93,9 +93,6 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset({
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".heic",
 })
 
-# Backwards-compatibility alias; remove after one release if nothing depends on it.
-MEDIA_EXTENSIONS: frozenset[str] = AUDIO_VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
-
 
 def app_data_dir() -> Path:
     """Return the cross-platform app data directory."""
@@ -389,7 +386,34 @@ def load_config(path: Path | None = None) -> Config:
             cfg.daily_budget_cents_anthropic = int(data["daily_budget_cents_anthropic"])
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
+    _validate_config(cfg)
     return cfg
+
+
+def _validate_config(cfg: Config) -> None:
+    """Sanity-check loaded values. Raise on combinations that would silently
+    misbehave - e.g. chunk_overlap >= chunk_size produces a sliding window
+    of step=1 and embeds tens of thousands of near-duplicate chunks.
+    """
+    if cfg.chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0 (got {cfg.chunk_size})")
+    if cfg.chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap must be >= 0 (got {cfg.chunk_overlap})")
+    if cfg.chunk_overlap >= cfg.chunk_size:
+        raise ValueError(
+            f"chunk_overlap ({cfg.chunk_overlap}) must be < chunk_size "
+            f"({cfg.chunk_size}); otherwise we produce a step-1 sliding window."
+        )
+    # Personal-path prefixes that are too short match every path; warn loudly
+    # rather than silently boost everything.
+    if cfg.personal_path_prefixes:
+        for p in cfg.personal_path_prefixes:
+            if p and len(p.strip("/")) <= 1:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "personal_path_prefixes contains a very short prefix %r; "
+                    "this will boost almost everything", p,
+                )
 
 
 def write_default_config(cfg: Config) -> None:

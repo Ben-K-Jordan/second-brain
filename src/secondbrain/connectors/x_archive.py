@@ -39,8 +39,12 @@ from . import ConnectorDocument
 
 log = logging.getLogger(__name__)
 
-# The wrapper looks like: `window.YTD.<name>.part<N> = `
-_PREFIX_RE = re.compile(r"^\s*window\.YTD\.[A-Za-z0-9_]+\.part\d+\s*=\s*", re.DOTALL)
+# The wrapper looks like: `window.YTD.<name>.part<N> = `, sometimes with a
+# leading semicolon (older archive format) or trailing whitespace. Be lenient
+# so a small format change doesn't silently break parsing.
+_PREFIX_RE = re.compile(
+    r"^\s*;?\s*window\.YTD\.[A-Za-z0-9_]+\.part\d+\s*=\s*", re.DOTALL
+)
 
 
 def _twitter_ts_to_epoch(s: str | None) -> float:
@@ -109,13 +113,27 @@ class XArchiveConnector:
         if likes_path:
             yield from self._iter_likes(likes_path)
 
-        # DMs (opt-in)
+        # DMs (opt-in). Also log the opt-in once so the user has a paper
+        # trail in the daemon log when DMs start showing up in search.
+        dm_path = None
         if os.environ.get("SB_X_INCLUDE_DMS") == "1":
+            log.info("X archive: SB_X_INCLUDE_DMS=1 - including direct messages")
             dm_path = _first_existing(
                 base, ("direct-messages.js", "direct_messages.js")
             )
             if dm_path:
                 yield from self._iter_dms(dm_path)
+
+        # If the directory had nothing recognisable, surface that loudly.
+        # is_enabled returns True for any directory; without this, a wrong
+        # X_ARCHIVE_PATH silently looks like a successful sync.
+        if not (tweets_path or bookmarks_path or likes_path or dm_path):
+            log.warning(
+                "X archive at %s has no tweets.js / bookmark.js / like.js - "
+                "wrong directory? Expected the unzipped archive root or its "
+                "data/ subfolder.",
+                root,
+            )
 
     # --- iterators --------------------------------------------------------
 

@@ -22,7 +22,12 @@ import requests
 
 from ..config import Config
 from . import ConnectorDocument
-from ._google_oauth import authorized_session, is_authorized
+from ._google_oauth import (
+    GoogleAuthError,
+    ScopeMissing,
+    authorized_session,
+    is_authorized,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +64,17 @@ class GoogleCalendarConnector:
         return is_authorized(cfg, GOOGLE_CALENDAR_SCOPES)
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
-        s = authorized_session(cfg, GOOGLE_CALENDAR_SCOPES)
+        try:
+            s = authorized_session(cfg, GOOGLE_CALENDAR_SCOPES)
+        except ScopeMissing as e:
+            log.warning(
+                "Google Calendar: %s. Re-run `secondbrain auth google` to grant the missing scope.",
+                e,
+            )
+            return
+        except GoogleAuthError as e:
+            log.warning("Google Calendar: auth error: %s", e)
+            return
         if s is None:
             log.warning("Google Calendar: no credentials. Run `secondbrain auth google`.")
             return
@@ -113,21 +128,23 @@ class GoogleCalendarConnector:
                 params=params, timeout=30,
             )
             if r.status_code != 200:
+                # Don't log r.text - error responses can include the calendar
+                # ID in the URL (which may be a sensitive shared-cal address).
                 log.warning(
-                    "Calendar events fetch failed for %s: %s %s",
-                    cal_id, r.status_code, r.text[:200],
+                    "Calendar events fetch failed for %s: HTTP %s",
+                    cal_summary, r.status_code,
                 )
                 return
             data = r.json()
             for ev in data.get("items") or []:
-                doc = self._render_event(cal_summary, ev)
+                doc = self._render_event(cal_id, cal_summary, ev)
                 if doc is not None:
                     yield doc
             page_token = data.get("nextPageToken")
             if not page_token:
                 return
 
-    def _render_event(self, cal_name: str, ev: dict) -> ConnectorDocument | None:
+    def _render_event(self, cal_id: str, cal_name: str, ev: dict) -> ConnectorDocument | None:
         ev_id = ev.get("id")
         if not ev_id or ev.get("status") == "cancelled":
             return None
@@ -139,8 +156,12 @@ class GoogleCalendarConnector:
         organizer = (ev.get("organizer") or {}).get("email") or ""
         creator = (ev.get("creator") or {}).get("email") or ""
         attendees_list = ev.get("attendees") or []
+        # Filter empties so we don't render "alice@x.com, , bob@y.com".
         attendees = ", ".join(
-            (a.get("email") or a.get("displayName") or "") for a in attendees_list
+            filter(
+                None,
+                (a.get("email") or a.get("displayName") for a in attendees_list),
+            )
         )
         description = ev.get("description") or ""
         meet_link = (ev.get("hangoutLink") or "").strip()
@@ -167,7 +188,11 @@ class GoogleCalendarConnector:
 
         return ConnectorDocument(
             source="google_calendar",
-            virtual_path=f"google_calendar://{ev_id}",
+            # Event IDs are unique within a calendar but not across calendars
+            # (forwarded invites land in both your personal cal and the shared
+            # team cal with the same id). Include the calendar id to keep
+            # virtual paths globally unique.
+            virtual_path=f"google_calendar://{cal_id}/{ev_id}",
             title=summary,
             content="\n".join(lines),
             mtime=start_ts,

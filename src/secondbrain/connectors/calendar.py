@@ -104,17 +104,27 @@ class CalendarConnector:
             )
             r.raise_for_status()
         except requests.RequestException as e:
-            log.warning("calendar fetch failed: %s", e)
+            # Don't log `e` directly - the request URL contains the secret
+            # iCal feed token and `RequestException.__str__` may include it
+            # on DNS/timeout failures.
+            log.warning("calendar fetch failed: %s", type(e).__name__)
             return
 
         text = r.text
-        seen_uids: set[str] = set()
+        seen_keys: set[tuple[str, str]] = set()
         for ev in _parse_events(text):
             uid = ev.get("uid", "")
-            if not uid or uid in seen_uids:
-                # ICS feeds with recurring events repeat UIDs; skip duplicates.
+            if not uid:
                 continue
-            seen_uids.add(uid)
+            # ICS uses (UID, RECURRENCE-ID) for occurrence overrides; deduping
+            # on UID alone drops legitimate recurrence exceptions ("the team
+            # meeting on the 5th was rescheduled to 4pm").
+            # The ICS field name is RECURRENCE-ID; our generic parser
+            # lowercases the key as-is, so it lands as "recurrence-id".
+            key = (uid, ev.get("recurrence-id", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
 
             summary = ev.get("summary", "(no title)")
             mtime = ev.get("dtstart_ts", time.time())

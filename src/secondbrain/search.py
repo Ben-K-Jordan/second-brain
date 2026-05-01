@@ -24,6 +24,8 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from .budget import BudgetExceededError, check_budget, record_usage
+from .config import Config
 from .db import serialize_f32
 from .embedder import Embedder
 from .reranker import Reranker
@@ -41,19 +43,34 @@ to use. Do not preface ("Here's a hypothetical answer"). Do not hedge \
 a real source. Keep it grounded and specific even though it's hypothetical."""
 
 
-def hyde_rewrite(query: str, model: str = "claude-haiku-4-5", max_tokens: int = 256) -> str:
+def hyde_rewrite(
+    cfg: Config,
+    query: str,
+    model: str = "claude-haiku-4-5",
+    max_tokens: int = 256,
+) -> str:
     """Generate a hypothetical answer for the query, suitable for embedding.
 
-    Returns the original query unchanged if the Anthropic SDK isn't installed
-    or ANTHROPIC_API_KEY isn't set — HyDE is a quality-bump, never a hard
-    dependency. Errors are logged but never raised; a vague hypothetical
-    is better than a search failure.
+    Returns the original query unchanged if the Anthropic SDK isn't installed,
+    ANTHROPIC_API_KEY isn't set, or the daily Anthropic cap is hit — HyDE is
+    a quality-bump, never a hard dependency. Errors are logged but never
+    raised; a vague hypothetical is better than a search failure.
+
+    Every call goes through ``check_budget`` and ``record_usage`` so the
+    spend ledger reflects HyDE traffic. Without this, a search loop with
+    HyDE enabled was silently uncapped and unaccounted-for.
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return query
     try:
         import anthropic
     except ImportError:
+        return query
+
+    try:
+        check_budget(cfg, "anthropic")
+    except BudgetExceededError as e:
+        log.warning("HyDE skipped: %s", e)
         return query
 
     try:
@@ -65,6 +82,15 @@ def hyde_rewrite(query: str, model: str = "claude-haiku-4-5", max_tokens: int = 
             messages=[{"role": "user", "content": query}],
         )
         text = "\n".join(b.text for b in response.content if b.type == "text").strip()
+        try:
+            record_usage(
+                cfg, "anthropic", model,
+                input_tokens=getattr(response.usage, "input_tokens", 0),
+                output_tokens=getattr(response.usage, "output_tokens", 0),
+                note="hyde",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("HyDE usage recording failed: %s", e)
         return text or query
     except Exception as e:
         log.warning("HyDE rewrite failed, falling back to raw query: %s", e)
@@ -290,6 +316,7 @@ def hybrid_search(
     personal_boost: float = 1.0,
     download_prefixes: tuple[str, ...] = (),
     download_demote: float = 1.0,
+    cfg: Config | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search and return up to k merged results.
 
@@ -322,8 +349,11 @@ def hybrid_search(
 
     # HyDE: embed a hypothetical answer instead of the raw query when the
     # query is conceptual enough to benefit. BM25 always uses raw query.
-    if use_hyde and should_use_hyde(query):
-        hypothetical = hyde_rewrite(query, model=hyde_model)
+    # Requires ``cfg`` so the call goes through the budget cap; if cfg is
+    # missing (legacy callers), we silently skip HyDE rather than risk an
+    # uncapped Anthropic call.
+    if use_hyde and cfg is not None and should_use_hyde(query):
+        hypothetical = hyde_rewrite(cfg, query, model=hyde_model)
         q_emb = embedder.embed_query(hypothetical)
     else:
         q_emb = embedder.embed_query(query)
@@ -393,7 +423,14 @@ def hybrid_search(
         rerank_pairs = reranker.rerank(query, docs, top_k=k)
         results: list[SearchResult] = []
         for orig_idx, score in rerank_pairs:
+            # Defend against an out-of-range index from the reranker (a
+            # truncated `documents` list, an SDK bug, or a stale cached
+            # response): silently skip rather than crash the search.
+            if orig_idx < 0 or orig_idx >= len(cids):
+                continue
             cid = cids[orig_idx]
+            if cid not in hydrated:
+                continue
             path, idx, text, mtime, start_offset = hydrated[cid]
             _, sources = fused[cid]
             results.append(

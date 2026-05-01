@@ -143,6 +143,7 @@ def search_brain(
         personal_boost=cfg.personal_path_boost,
         download_prefixes=cfg.download_path_prefixes,
         download_demote=cfg.download_path_demote,
+        cfg=cfg,
     )
     _log_query(cfg, query, "search_brain", results)
     header = f"# Hybrid search: {query!r}"

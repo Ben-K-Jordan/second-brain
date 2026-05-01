@@ -19,9 +19,7 @@
     if (window.__SecondBrainAttached) return;
     window.__SecondBrainAttached = true;
 
-    const API = "http://127.0.0.1:8765";
     const POLL_MS = 1500;
-    const STORAGE_K_AUTOATTACH = "sb_autoattach";
 
     const SecondBrain = {};
 
@@ -29,24 +27,34 @@
         try { console.debug("[second-brain]", ...args); } catch (_) {}
     }
 
+    // All HTTP traffic to the local dashboard goes through the background
+    // service worker so the bearer token is never visible to page scripts.
+    function sendBg(msg) {
+        return new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage(msg, (resp) => {
+                    if (chrome.runtime.lastError) {
+                        resolve({ error: "sw_unreachable", detail: chrome.runtime.lastError.message });
+                        return;
+                    }
+                    resolve(resp || { error: "no_response" });
+                });
+            } catch (e) {
+                resolve({ error: "sw_throw", detail: String(e) });
+            }
+        });
+    }
+
     async function fetchHealth() {
-        try {
-            const r = await fetch(`${API}/api/extension/health`, { method: "GET" });
-            if (!r.ok) return false;
-            const j = await r.json();
-            return !!j.ok;
-        } catch (e) { return false; }
+        const r = await sendBg({ type: "health" });
+        if (r && r.ok && r.body && r.body.ok) return true;
+        return false;
     }
 
     async function fetchContext(query, k = 5) {
-        try {
-            const url = `${API}/api/extension/search?q=${encodeURIComponent(query)}&k=${k}`;
-            const r = await fetch(url, { method: "GET" });
-            if (!r.ok) return { error: `${r.status} ${r.statusText}` };
-            return await r.json();
-        } catch (e) {
-            return { error: String(e) };
-        }
+        const r = await sendBg({ type: "search", q: query, k });
+        if (r && r.ok && r.body) return r.body;
+        return { error: (r && r.error) || "unknown" };
     }
 
     function makePill(label) {
@@ -162,12 +170,21 @@
             // Health check — gives a useful error instead of silent failure.
             const ok = await fetchHealth();
             if (!ok) {
-                alert("[second-brain] Couldn't reach http://127.0.0.1:8765. Is `secondbrain dashboard` running?");
+                alert(
+                    "[second-brain] Couldn't reach the local dashboard.\n\n" +
+                    "Is `secondbrain dashboard` running, and have you set the " +
+                    "extension token (open the extension popup and paste the " +
+                    "value from `secondbrain auth extension`)?"
+                );
                 return;
             }
             const data = await fetchContext(trimmed, 5);
             if (data.error) {
-                alert(`[second-brain] Search failed: ${data.error}`);
+                if (data.error === "unauthorized" || data.error === "no_token") {
+                    alert("[second-brain] Extension is not authorized. Open the popup and paste the token from `secondbrain auth extension`.");
+                } else {
+                    alert(`[second-brain] Search failed: ${data.error}`);
+                }
                 return;
             }
             const results = data.results || [];

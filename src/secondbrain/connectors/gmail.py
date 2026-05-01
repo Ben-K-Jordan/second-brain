@@ -28,7 +28,12 @@ import requests
 
 from ..config import Config
 from . import ConnectorDocument
-from ._google_oauth import authorized_session, is_authorized
+from ._google_oauth import (
+    GoogleAuthError,
+    ScopeMissing,
+    authorized_session,
+    is_authorized,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +50,11 @@ def _strip_html(html: str) -> str:
     enough for retrieval — Gmail viewers do something similar by default."""
     text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Preserve preformatted code blocks - the catch-all <[^>]+> below would
+    # otherwise join code lines with no whitespace, killing recall on
+    # code-in-email (alerts from CI, code review notifications, etc).
+    text = re.sub(r"<pre[^>]*>", "\n```\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</pre>", "\n```\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -125,7 +135,17 @@ class GmailConnector:
         return is_authorized(cfg, GMAIL_SCOPES)
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
-        s = authorized_session(cfg, GMAIL_SCOPES)
+        try:
+            s = authorized_session(cfg, GMAIL_SCOPES)
+        except ScopeMissing as e:
+            log.warning(
+                "Gmail: %s. Re-run `secondbrain auth google` to grant the missing scope.",
+                e,
+            )
+            return
+        except GoogleAuthError as e:
+            log.warning("Gmail: auth error: %s", e)
+            return
         if s is None:
             log.warning("Gmail: no Google credentials. Run `secondbrain auth google`.")
             return

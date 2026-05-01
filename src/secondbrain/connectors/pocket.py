@@ -74,11 +74,26 @@ class PocketConnector:
                     log.warning("Pocket request failed: %s", e)
                     return
                 if r.status_code != 200:
-                    log.warning("Pocket /v3/get failed: %s %s", r.status_code, r.text[:200])
+                    # Never log r.text - Pocket echoes the request payload
+                    # (consumer_key + access_token) in some error responses.
+                    log.warning(
+                        "Pocket /v3/get failed: HTTP %s "
+                        "(check POCKET_CONSUMER_KEY / POCKET_ACCESS_TOKEN)",
+                        r.status_code,
+                    )
                     return
                 data = r.json() or {}
                 # /v3/get returns {"list": {"<item_id>": {...}}}; an empty
                 # response can be `[]` instead of `{}`, so be defensive.
+                # Distinguish "missing list" (probably auth or backend
+                # issue) from "empty list" (you have no items) so the user
+                # gets a log line instead of silent zero-results.
+                if "list" not in data:
+                    log.warning(
+                        "Pocket: unexpected payload shape (keys=%s); auth or backend issue?",
+                        list(data)[:5],
+                    )
+                    return
                 items_obj = data.get("list")
                 if isinstance(items_obj, dict):
                     items = list(items_obj.values())

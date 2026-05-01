@@ -57,28 +57,28 @@ class HackerNewsConnector:
         return bool(os.environ.get("HN_USERNAME"))
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
+        from . import USER_AGENT
+
         user = os.environ["HN_USERNAME"]
         cap = int(os.environ.get("SB_HN_MAX", _DEFAULT_MAX))
         s = requests.Session()
-        s.headers.update({"User-Agent": "second-brain/0.0.1"})
+        s.headers.update({"User-Agent": USER_AGENT})
 
         try:
-            seen: set[int] = set()
-            # Favorites first — these are usually the most valuable signal.
+            # Build the union of label sets per item id first, so a single
+            # item that's both a favorite AND own submission gets `["favorite",
+            # "own"]` instead of nondeterministically flipping between the
+            # two on re-runs (and overwriting via upsert).
+            labels: dict[int, list[str]] = {}
             for item_id in self._iter_favorites(s, user, cap):
-                if item_id in seen:
-                    continue
-                seen.add(item_id)
-                doc = self._fetch_item(s, item_id, source_label="favorite")
-                if doc is not None:
-                    yield doc
-
-            # Then own submissions / comments.
+                labels.setdefault(item_id, []).append("favorite")
             for item_id in self._iter_user_submissions(s, user, cap):
-                if item_id in seen:
-                    continue
-                seen.add(item_id)
-                doc = self._fetch_item(s, item_id, source_label="own")
+                lst = labels.setdefault(item_id, [])
+                if "own" not in lst:
+                    lst.append("own")
+
+            for item_id, label_list in labels.items():
+                doc = self._fetch_item(s, item_id, labels=label_list)
                 if doc is not None:
                     yield doc
         finally:
@@ -140,12 +140,12 @@ class HackerNewsConnector:
             yield iid
 
     def _fetch_item(
-        self, s: requests.Session, item_id: int, source_label: str
+        self, s: requests.Session, item_id: int, labels: list[str]
     ) -> ConnectorDocument | None:
         try:
             r = s.get(f"{_API}/item/{item_id}.json", timeout=30)
         except requests.RequestException as e:
-            log.warning("HN item %s fetch failed: %s", item_id, e)
+            log.warning("HN item %s fetch failed: %s", item_id, type(e).__name__)
             return None
         if r.status_code != 200:
             return None
@@ -193,7 +193,9 @@ class HackerNewsConnector:
             mtime=ts or time.time(),
             metadata={
                 "kind": kind,
-                "label": source_label,
+                # `labels` is the union of relationships - "favorite" and/or
+                # "own" - so re-runs don't flip a single value back and forth.
+                "labels": list(labels),
                 "author": author,
                 "score": score,
                 "url": url,

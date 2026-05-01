@@ -357,21 +357,7 @@ def index_file(
             # Don't fail the whole file - OCR (if any) is already stored.
             log.warning("image embedding failed for %s: %s", path, e)
 
-    if entity_extractor is not None and chunk_ids:
-        try:
-            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
-                # Strip markdown links/images so URLs don't bleed into entities.
-                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
-                if ents:
-                    insert_entities(
-                        conn,
-                        chunk_id,
-                        [(e.text, e.label) for e in ents],
-                    )
-        except Exception as e:
-            # Entity failures are non-fatal: the chunk + embedding are already stored,
-            # so the file is still searchable - we just won't have NER on it.
-            log.warning("entity extraction failed for %s: %s", path, e)
+    _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=str(path))
 
     conn.commit()
     return IndexResult(path, "indexed", chunks=len(chunk_texts))
@@ -395,8 +381,12 @@ def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
     Idempotent. Safe to run on a populated index even after the indexer-side
     dedup is in place - it cleans up duplicates added before that fix shipped.
     """
+    # We need (id, indexed_at) per group to pick the *oldest indexed* row as
+    # canonical. Earlier this used MIN(id) as a proxy, but ids only correlate
+    # with insertion order, not indexed_at - after a reset / re-embed the
+    # truly oldest ingest can have a higher id.
     rows = conn.execute(
-        "SELECT content_hash, GROUP_CONCAT(id) AS ids, COUNT(*) AS n "
+        "SELECT content_hash, COUNT(*) AS n "
         "FROM files WHERE content_hash IS NOT NULL "
         "GROUP BY content_hash HAVING n > 1"
     ).fetchall()
@@ -404,15 +394,18 @@ def dedupe_existing(conn: sqlite3.Connection) -> dict[str, int]:
     converted = 0
     chunks_freed = 0
     for r in rows:
-        ids = [int(x) for x in r["ids"].split(",")]
-        # Pick the oldest indexed_at as the canonical primary - lowest id is a
-        # good proxy since our schema uses AUTOINCREMENT and inserts grow.
-        canonical_id = min(ids)
-        duplicate_ids = [i for i in ids if i != canonical_id]
-        for dup_id in duplicate_ids:
-            dup = conn.execute("SELECT path FROM files WHERE id = ?", (dup_id,)).fetchone()
-            if dup is None:
-                continue
+        chash = r["content_hash"]
+        members = conn.execute(
+            "SELECT id, path, indexed_at FROM files WHERE content_hash = ? "
+            "ORDER BY indexed_at ASC, id ASC",
+            (chash,),
+        ).fetchall()
+        if len(members) < 2:
+            continue
+        canonical = members[0]
+        canonical_id = canonical["id"]
+        for dup in members[1:]:
+            dup_id = dup["id"]
             chunk_count = conn.execute(
                 "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ?", (dup_id,)
             ).fetchone()["c"]
@@ -436,10 +429,18 @@ _USER_AGENT = (
 )
 
 
+# Hard ceiling on how much of a URL response we'll buffer to disk. Without
+# this, a hostile or misconfigured server serving Content-Length: 100 GB
+# blows out the disk. 200 MB is comfortably above any document we'd want
+# in a personal knowledge base.
+_URL_FETCH_MAX_BYTES = 200 * 1024 * 1024
+
+
 def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
     """Download a URL with a real user-agent so sites like Wikipedia don't 403 us.
 
-    Returns (local_path, content_type). Caller must clean up the temp file.
+    Streams the response with a hard size cap. Returns (local_path,
+    content_type). Caller must clean up the temp file.
     """
     import os
     import tempfile
@@ -452,8 +453,21 @@ def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
         headers={"User-Agent": _USER_AGENT, "Accept": "*/*"},
         timeout=60,
         allow_redirects=True,
+        stream=True,
     )
     resp.raise_for_status()
+    # Honor Content-Length up front - cheaper than streaming and bailing.
+    declared = resp.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > _URL_FETCH_MAX_BYTES:
+                resp.close()
+                raise RuntimeError(
+                    f"refusing to download {declared} bytes from {url} "
+                    f"(cap {_URL_FETCH_MAX_BYTES})"
+                )
+        except ValueError:
+            pass
     ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
     ext_map = {
         "text/html": ".html",
@@ -471,10 +485,29 @@ def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
         _, suffix = os.path.splitext(path)
         ext = suffix or ".html"
     fd, tmp = tempfile.mkstemp(suffix=ext, prefix="sb-url-")
+    written = 0
     try:
-        os.write(fd, resp.content)
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            written += len(chunk)
+            if written > _URL_FETCH_MAX_BYTES:
+                os.close(fd)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                resp.close()
+                raise RuntimeError(
+                    f"response from {url} exceeded {_URL_FETCH_MAX_BYTES} bytes; aborted"
+                )
+            os.write(fd, chunk)
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        resp.close()
     return tmp, ctype
 
 
@@ -544,16 +577,9 @@ def index_text(
         list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
     )
 
-    if entity_extractor is not None:
-        try:
-            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
-                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
-                if ents:
-                    insert_entities(
-                        conn, chunk_id, [(e.text, e.label) for e in ents]
-                    )
-        except Exception as e:
-            log.warning("entity extraction failed for %s: %s", virtual_path, e)
+    _run_entity_extraction(
+        conn, chunk_ids, chunk_texts, entity_extractor, label=virtual_path
+    )
 
     conn.commit()
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
@@ -606,6 +632,18 @@ def index_url(
     if existing and existing["content_hash"] == chash:
         return IndexResult(label_path, "unchanged")
 
+    # Hash-dedup against existing primaries. The same article fetched via
+    # mobile vs. desktop URL, or with vs. without ?utm_*, otherwise produces
+    # two embedded copies. Match -> alias the new URL onto the existing row.
+    if existing is None:
+        twin = find_file_by_hash(conn, chash)
+        if twin is not None:
+            add_alias(conn, twin["id"], url)
+            conn.commit()
+            return IndexResult(
+                label_path, "alias", reason=f"duplicate of {twin['path']}"
+            )
+
     chunked = chunk_text(text, target_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
     if not chunked:
         return IndexResult(label_path, "skipped", reason="no chunks produced")
@@ -635,19 +673,38 @@ def index_url(
         list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
     )
 
-    if entity_extractor is not None:
-        try:
-            for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
-                ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
-                if ents:
-                    insert_entities(
-                        conn, chunk_id, [(e.text, e.label) for e in ents]
-                    )
-        except Exception as e:
-            log.warning("entity extraction failed for url %s: %s", url, e)
+    _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=url)
 
     conn.commit()
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
+
+
+def _run_entity_extraction(
+    conn: sqlite3.Connection,
+    chunk_ids: list[int],
+    chunk_texts: list[str],
+    entity_extractor: EntityExtractor | None,
+    label: str,
+) -> None:
+    """Run NER over each chunk and insert results. Best-effort; failure logs
+    but never aborts indexing - having chunks without entities is fine, but
+    losing the chunk because NER threw is a much worse outcome.
+
+    Extracted to a helper to dry up the three near-identical try/except
+    blocks across index_text / index_url / index_file. Drift between those
+    copies was a real risk.
+    """
+    if entity_extractor is None:
+        return
+    try:
+        for chunk_id, chunk_text_val in zip(chunk_ids, chunk_texts, strict=True):
+            ents = entity_extractor.extract(strip_markdown_decorations(chunk_text_val))
+            if ents:
+                insert_entities(
+                    conn, chunk_id, [(e.text, e.label) for e in ents]
+                )
+    except Exception as e:
+        log.warning("entity extraction failed for %s: %s", label, e)
 
 
 def walk_folder(folder: Path, cfg: Config) -> Iterator[Path]:

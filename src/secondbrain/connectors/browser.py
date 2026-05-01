@@ -19,6 +19,7 @@ import sqlite3
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from ..config import Config
 from . import ConnectorDocument
@@ -97,19 +98,28 @@ class BrowserHistoryConnector:
                     continue
                 visits = int(r["visit_count"] or 0)
                 mtime = _webkit_to_unix(int(r["last_visit_time"] or 0))
+                # Strip query strings + fragments from the indexed path.
+                # Otherwise reset-password URLs ("?token=...") and other
+                # query-string secrets land verbatim in `files.path`,
+                # the search palette, MCP responses, and the dashboard.
+                try:
+                    parts = urlsplit(url)
+                    safe_url = urlunsplit(parts._replace(query="", fragment=""))
+                except ValueError:
+                    safe_url = url
                 content = (
                     f"# {title}\n\n"
-                    f"URL: {url}\n"
+                    f"URL: {safe_url}\n"
                     f"Browser: {label}\n"
                     f"Visit count: {visits}\n"
                 )
                 yield ConnectorDocument(
                     source="browser",
-                    virtual_path=f"browser://{label}/{url}",
+                    virtual_path=f"browser://{label}/{safe_url}",
                     title=title,
                     content=content,
                     mtime=mtime,
-                    metadata={"url": url, "visits": visits, "browser": label},
+                    metadata={"url": safe_url, "visits": visits, "browser": label},
                 )
         finally:
             try:

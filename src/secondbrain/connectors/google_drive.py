@@ -29,7 +29,12 @@ import requests
 
 from ..config import Config
 from . import ConnectorDocument
-from ._google_oauth import authorized_session, is_authorized
+from ._google_oauth import (
+    GoogleAuthError,
+    ScopeMissing,
+    authorized_session,
+    is_authorized,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +71,17 @@ class GoogleDriveConnector:
         return is_authorized(cfg, GOOGLE_DRIVE_SCOPES)
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
-        s = authorized_session(cfg, GOOGLE_DRIVE_SCOPES)
+        try:
+            s = authorized_session(cfg, GOOGLE_DRIVE_SCOPES)
+        except ScopeMissing as e:
+            log.warning(
+                "Drive: %s. Re-run `secondbrain auth google` to grant the missing scope.",
+                e,
+            )
+            return
+        except GoogleAuthError as e:
+            log.warning("Drive: auth error: %s", e)
+            return
         if s is None:
             log.warning("Drive: no credentials. Run `secondbrain auth google`.")
             return

@@ -72,23 +72,37 @@ class SlackConnector:
 
     def _slack_get(self, s: requests.Session, method: str, params: dict) -> dict:
         """Call a Slack Web API method, return the parsed body. Logs and
-        returns {} on error so the iteration continues."""
-        try:
-            r = s.get(f"{_API}/{method}", params=params, timeout=30)
-            data = r.json()
+        returns {} on error so the iteration continues. Honors Retry-After
+        on 429 (Slack's tier-3 rate limits trigger easily on first sync)."""
+        from . import respect_retry_after
+
+        for _ in range(3):  # one initial + up to two 429-retries
+            try:
+                r = s.get(f"{_API}/{method}", params=params, timeout=30)
+            except requests.RequestException as e:
+                log.warning("Slack %s exception: %s", method, type(e).__name__)
+                return {}
+            if respect_retry_after(r):
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                log.warning("Slack %s: non-JSON response (HTTP %s)", method, r.status_code)
+                return {}
             if not data.get("ok"):
                 log.warning("Slack %s failed: %s", method, data.get("error"))
                 return {}
             return data
-        except (requests.RequestException, ValueError) as e:
-            log.warning("Slack %s exception: %s", method, e)
-            return {}
+        log.warning("Slack %s: gave up after repeated 429s", method)
+        return {}
 
     def _fetch_user_directory(self, s: requests.Session) -> dict[str, str]:
         """Map user_id -> display name. Cached for the duration of a sync."""
         out: dict[str, str] = {}
         cursor: str | None = None
-        while True:
+        # Bound at 50 pages * 200 = 10k users. Without this bound, a Slack
+        # bug that returns the same next_cursor twice would loop forever.
+        for _ in range(50):
             params: dict[str, str | int] = {"limit": 200}
             if cursor:
                 params["cursor"] = cursor
@@ -107,9 +121,12 @@ class SlackConnector:
                     or uid
                 )
                 out[uid] = name
-            cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
-            if not cursor:
+            new_cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+            if not new_cursor or new_cursor == cursor:
                 return out
+            cursor = new_cursor
+        log.warning("Slack users.list: hit 50-page cap; truncating user directory")
+        return out
 
     def _iter_conversations(self, s: requests.Session) -> Iterator[dict]:
         """Yield each conversation the user is a member of."""

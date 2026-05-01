@@ -124,7 +124,18 @@ class NotionConnector:
             if cursor:
                 params["start_cursor"] = cursor
             r = s.get(f"{_API}/blocks/{block_id}/children", params=params, timeout=30)
+            if r.status_code == 429:
+                # Honor Notion's Retry-After (they enforce 3 RPS / user) and
+                # re-issue the same request.
+                from . import respect_retry_after
+                if respect_retry_after(r):
+                    continue
             if r.status_code != 200:
+                # Log so half-fetched pages don't look like a successful sync.
+                log.warning(
+                    "Notion blocks fetch %s failed: HTTP %s (returning partial)",
+                    block_id, r.status_code,
+                )
                 break
             data = r.json()
             out.extend(data.get("results", []))
