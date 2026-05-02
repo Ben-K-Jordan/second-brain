@@ -879,6 +879,91 @@ def capture(
     conn.close()
 
 
+@app.command("transcripts")
+def transcripts_list(
+    course: str | None = typer.Option(
+        None, "--course", "-c",
+        help="Filter to a specific Canvas course code (e.g. 'BME 410').",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """List ingested lecture / meeting transcripts.
+
+    Plaud, Otter, and generic transcript-shaped emails ingested via the
+    IMAP connector show up here with their inferred course code and
+    recording timestamp.
+    """
+    from .db import connect_readonly
+
+    cfg = load_config()
+    try:
+        conn = connect_readonly(cfg.db_path)
+    except FileNotFoundError as e:
+        console.print(f"[yellow]{e}[/]")
+        raise typer.Exit(code=1) from None
+    rows = conn.execute(
+        "SELECT path, mtime, indexed_at FROM files "
+        "WHERE path LIKE 'transcript://%' "
+        "ORDER BY mtime DESC LIMIT ?",
+        (limit * 3,),
+    ).fetchall()
+    if not rows:
+        console.print(
+            "[yellow]No transcripts ingested yet.[/]\n"
+            "  - Set up Plaud's auto-export to email\n"
+            "  - Configure a Gmail filter that labels them (e.g. 'Plaud')\n"
+            "  - Add that label to imap_folders in config.toml\n"
+            "  - Run [cyan]secondbrain sync imap[/]"
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Transcripts")
+    table.add_column("when", style="dim", width=18)
+    table.add_column("course", style="cyan", width=10)
+    table.add_column("provider", style="dim", width=10)
+    table.add_column("title")
+    matched = 0
+    for r in rows:
+        path = r["path"]
+        # Path shape: transcript://<provider>/<...>
+        try:
+            provider = path.split("//", 1)[1].split("/", 1)[0]
+        except IndexError:
+            provider = "?"
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"]))
+        # Pull title + course out of the rendered first chunk.
+        chunk = conn.execute(
+            "SELECT text FROM chunks WHERE file_id = ("
+            "  SELECT id FROM files WHERE path = ?"
+            ") ORDER BY chunk_index LIMIT 1",
+            (path,),
+        ).fetchone()
+        title = "(unknown)"
+        course_code = ""
+        if chunk:
+            head = (chunk["text"].split("\n", 1)[0] or "").lstrip("# ").strip()
+            if head.startswith("["):
+                end = head.find("]")
+                if end > 0:
+                    course_code = head[1:end]
+                    title = head[end + 1:].strip()
+                else:
+                    title = head
+            else:
+                title = head
+        if course and course_code != course:
+            continue
+        matched += 1
+        if matched > limit:
+            break
+        table.add_row(when, course_code, provider, title[:60])
+    if matched == 0:
+        console.print("[yellow]No transcripts match that filter.[/]")
+    else:
+        console.print(table)
+    conn.close()
+
+
 read_app = typer.Typer(
     no_args_is_help=True,
     help="Reading queue. Watchlist runs auto-enqueue high-fit jobs and "

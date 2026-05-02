@@ -236,6 +236,18 @@ class ImapEmailConnector:
         if len(body) > 60_000:
             body = body[:60_000] + "\n[...truncated]"
 
+        # Transcript detection: if this email looks like a Plaud / Otter /
+        # generic-format lecture transcript, build a richer document so it
+        # indexes as the lecture it is, not as a generic email. Failure
+        # falls through to the regular email shape below.
+        transcript_doc = self._maybe_build_transcript_doc(
+            from_=from_, subject=subject, body=body,
+            date_hdr=date_hdr, mtime=mtime,
+            folder=folder, msg_id=msg_id, uid=uid,
+        )
+        if transcript_doc is not None:
+            return transcript_doc
+
         lines = [f"# {subject}", ""]
         if from_:    lines.append(f"From: {from_}")
         if to_:      lines.append(f"To: {to_}")
@@ -263,6 +275,84 @@ class ImapEmailConnector:
                 "folder": folder,
                 "message_id": msg_id,
                 "date": date_hdr,
+            },
+        )
+
+    def _maybe_build_transcript_doc(
+        self, *, from_: str, subject: str, body: str,
+        date_hdr: str, mtime: float, folder: str,
+        msg_id: str, uid: bytes,
+    ) -> ConnectorDocument | None:
+        """When the email looks like a transcript, return a structured
+        ConnectorDocument with ``source="transcript:<provider>"``. None
+        otherwise (caller falls back to the generic email rendering)."""
+        try:
+            from ..transcripts import detect_transcript, match_canvas_course
+        except ImportError:
+            return None
+        t = detect_transcript(from_, subject, body)
+        if t is None:
+            return None
+        # Try to tag with a Canvas course code. We don't fetch live
+        # course list here (that requires network); we rely on the
+        # subject/title regex which works for "BME 410 lecture ...".
+        course = match_canvas_course(t)
+        if course:
+            t.course_code = course
+        # mtime: prefer the recording timestamp when known, fall back
+        # to the email date so time-decay surfaces recent lectures.
+        eff_mtime = t.recorded_at or mtime
+        # virtual_path: use the message-id when present so the same
+        # transcript doesn't double-ingest if it lands twice.
+        if msg_id:
+            vp = f"transcript://{t.provider}/{msg_id}"
+        else:
+            uid_s = uid.decode("ascii", errors="replace")
+            vp = f"transcript://{t.provider}/{folder}/{uid_s}"
+        title = (
+            f"[{course}] {t.title}" if course else t.title
+        )
+        # Build a readable rendering: header with metadata + summary +
+        # transcript body. Searchable as one document; chunking happens
+        # downstream in index_text.
+        lines: list[str] = [f"# {title}", ""]
+        if course:
+            lines.append(f"Course: {course}")
+        if t.recorded_at:
+            from datetime import datetime
+            lines.append(
+                "Recorded: "
+                + datetime.fromtimestamp(t.recorded_at, tz=UTC)
+                .strftime("%Y-%m-%d %H:%M UTC"),
+            )
+        if t.duration_seconds:
+            lines.append(f"Duration: {t.duration_seconds // 60} min")
+        if t.speakers:
+            lines.append(f"Speakers: {', '.join(t.speakers[:8])}")
+        lines.append(f"Provider: {t.provider}")
+        lines.append("")
+        if t.summary:
+            lines.append("## Summary")
+            lines.append(t.summary)
+            lines.append("")
+        lines.append("## Transcript")
+        lines.append(t.body)
+        return ConnectorDocument(
+            source=f"transcript:{t.provider}",
+            virtual_path=vp,
+            title=title,
+            content="\n".join(lines),
+            mtime=eff_mtime,
+            metadata={
+                "provider": t.provider,
+                "course_code": course,
+                "recorded_at": t.recorded_at,
+                "duration_seconds": t.duration_seconds,
+                "speakers": t.speakers,
+                "summary": t.summary,
+                "from": from_,
+                "folder": folder,
+                "message_id": msg_id,
             },
         )
 
