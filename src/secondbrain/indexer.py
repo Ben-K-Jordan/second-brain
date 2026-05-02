@@ -36,6 +36,22 @@ from .transcriber import Transcriber
 
 log = logging.getLogger(__name__)
 
+
+def _link_after_index(conn, file_id: int) -> None:
+    """Phase 52: compute backlinks for the freshly-indexed file.
+
+    Best-effort — a backlinks failure must never take down an ingest.
+    Logged at WARNING so transient sqlite-vec hiccups are visible
+    without blowing up the indexer pipeline.
+    """
+    try:
+        from .backlinks import link_doc
+        link_doc(conn, file_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("backlinks: link_doc failed for file_id=%s: %s",
+                    file_id, e)
+
+
 # Markitdown is the workhorse for documents; it handles PDF/DOCX/PPTX/HTML/etc.
 # We lazy-import it to keep startup fast for commands that don't index.
 _markitdown_instance = None
@@ -370,6 +386,9 @@ def index_file(
 
     _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=str(path))
 
+    if chunk_ids:
+        _link_after_index(conn, file_id)
+
     conn.commit()
     return IndexResult(path, "indexed", chunks=len(chunk_texts))
 
@@ -636,6 +655,9 @@ def index_text(
         conn, chunk_ids, chunk_texts, entity_extractor, label=virtual_path
     )
 
+    if chunk_ids:
+        _link_after_index(conn, file_id)
+
     conn.commit()
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
 
@@ -729,6 +751,9 @@ def index_url(
     )
 
     _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=url)
+
+    if chunk_ids:
+        _link_after_index(conn, file_id)
 
     conn.commit()
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))

@@ -369,6 +369,28 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_click_path_ts ON click_log(path, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_click_ts ON click_log(ts DESC);
 
+        -- Backlinks (Phase 52): pairs of files that are semantically
+        -- similar enough to surface as "see also" context. Computed on
+        -- ingest by averaging the new doc's chunk embeddings, querying
+        -- vec_chunks for nearest neighbours, and aggregating to file
+        -- granularity.
+        --
+        -- Storage policy: bidirectional pairs (one row per direction).
+        -- Means double the rows but trivial query (WHERE src = ?). Bounded
+        -- by O(K × num_files) — at K=5 and 10k files that's 50k rows, fine.
+        -- ``score`` is sqlite-vec's distance (LOWER is more similar) so we
+        -- can ORDER BY score ASC without conversion.
+        CREATE TABLE IF NOT EXISTS backlinks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            dst_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            score REAL NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(src_file_id, dst_file_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_backlinks_src
+            ON backlinks(src_file_id, score ASC);
+
         -- Tasks (Phase 47): first-class action items. Materialised lazily
         -- from transcript-shaped docs (Granola action items, generic
         -- meeting `- [ ]` checkboxes) and from manual `tasks add` calls.

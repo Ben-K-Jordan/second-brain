@@ -1320,6 +1320,101 @@ def brief_today(
     conn.close()
 
 
+links_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 52 auto-backlinks. After a doc lands in the index, "
+         "we compute its top-K most-similar siblings and store the "
+         "pairs both ways. Use these subcommands to inspect or "
+         "rebuild the graph.",
+)
+app.add_typer(links_app, name="links")
+
+
+@links_app.command("show")
+def links_show(
+    path: str = typer.Argument(
+        ...,
+        help="Doc path (or substring) — supports virtual paths like "
+             "'transcript://granola/abc' or filesystem paths.",
+    ),
+    limit: int = typer.Option(10, "--limit", "-n"),
+) -> None:
+    """Show the top related docs for a path. Lower distance = more similar."""
+    from .backlinks import get_backlinks_for_path
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = get_backlinks_for_path(conn, path, limit=limit)
+    if not rows:
+        # Try a substring match before giving up — paths are long.
+        candidate = conn.execute(
+            "SELECT path FROM files WHERE path LIKE ? "
+            "ORDER BY indexed_at DESC LIMIT 1",
+            (f"%{path}%",),
+        ).fetchone()
+        if candidate is None:
+            console.print(f"[yellow]No doc matches[/] {path!r}")
+            conn.close()
+            return
+        rows = get_backlinks_for_path(conn, candidate["path"], limit=limit)
+        console.print(f"[dim]Matched:[/] {candidate['path']}")
+    if not rows:
+        console.print("[yellow]No backlinks recorded for this doc.[/] "
+                      "Run `secondbrain links rebuild` to compute them.")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Related docs")
+    table.add_column("score", style="dim", width=6)
+    table.add_column("title")
+    table.add_column("path", style="dim")
+    for r in rows:
+        table.add_row(
+            f"{r.percent}%",
+            r.title[:60],
+            r.path[-50:] if len(r.path) > 50 else r.path,
+        )
+    console.print(table)
+    conn.close()
+
+
+@links_app.command("rebuild")
+def links_rebuild(
+    k: int = typer.Option(5, "--k", "-k", help="Neighbours per file."),
+    max_distance: float = typer.Option(
+        1.0, "--max-distance",
+        help="Distance threshold; pairs above this aren't recorded.",
+    ),
+) -> None:
+    """Drop the existing graph and recompute from scratch. Useful
+    after switching embedders or for a one-time backfill."""
+    from .backlinks import rebuild_all
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    n_files = conn.execute(
+        "SELECT COUNT(*) AS n FROM files",
+    ).fetchone()["n"]
+    if n_files == 0:
+        console.print("[yellow]Index is empty.[/]")
+        conn.close()
+        return
+    console.print(f"[cyan]Rebuilding backlinks across {n_files} files...[/]")
+
+    last_pct = -1
+    def on_progress(done: int, total: int) -> None:
+        nonlocal last_pct
+        pct = (done * 100) // max(1, total)
+        if pct != last_pct and pct % 5 == 0:
+            console.print(f"[dim]  {done}/{total} ({pct}%)[/]")
+            last_pct = pct
+
+    written = rebuild_all(
+        conn, k=k, max_distance=max_distance, on_progress=on_progress,
+    )
+    console.print(f"[green]✓[/] Recorded {written} pair-rows.")
+    conn.close()
+
+
 tasks_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 47 tasks. First-class action items extracted from "
