@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import requests
 
@@ -42,11 +42,11 @@ def _parse_ics_dt(value: str) -> float:
         if "T" in value:
             if value.endswith("Z"):
                 dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
-                return dt.replace(tzinfo=timezone.utc).timestamp()
+                return dt.replace(tzinfo=UTC).timestamp()
             dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
-            return dt.replace(tzinfo=timezone.utc).timestamp()
+            return dt.replace(tzinfo=UTC).timestamp()
         dt = datetime.strptime(value, "%Y%m%d")
-        return dt.replace(tzinfo=timezone.utc).timestamp()
+        return dt.replace(tzinfo=UTC).timestamp()
     except ValueError:
         return time.time()
 

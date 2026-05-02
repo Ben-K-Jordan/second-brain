@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import requests
 
@@ -142,8 +142,7 @@ class SlackConnector:
             data = self._slack_get(s, "users.conversations", params)
             if not data:
                 return
-            for ch in data.get("channels") or []:
-                yield ch
+            yield from data.get("channels") or []
             cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
             if not cursor:
                 return
@@ -184,7 +183,7 @@ class SlackConnector:
             # Replace user mentions <@U123> with names where we can
             for m_uid, m_name in users.items():
                 text = text.replace(f"<@{m_uid}>", f"@{m_name}")
-            when = datetime.fromtimestamp(ts_num, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts_num else ""
+            when = datetime.fromtimestamp(ts_num, tz=UTC).strftime("%Y-%m-%d %H:%M") if ts_num else ""
             lines.append(f"**{user}** — {when}")
             lines.append(text)
             lines.append("")

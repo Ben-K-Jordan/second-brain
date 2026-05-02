@@ -59,4 +59,27 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501"]
+ignore = [
+    "E501",  # line too long: we wrap by hand where it matters
+    "E701",  # multiple statements on one line: "if x: continue" is more readable here
+    "SIM105", # try/except/pass is fine for cleanup paths; contextlib import noise isn't worth it
+    "SIM108", # ternary-vs-if-else is a stylistic preference, not a bug
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer requires `typer.Argument(...)` / `typer.Option(...)` as default values.
+"src/secondbrain/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: tests that touch the network or the real index (deselect with '-m \"not slow\"')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:google.*",
+]

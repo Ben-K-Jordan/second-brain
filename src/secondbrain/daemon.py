@@ -254,7 +254,7 @@ def run_tray(cfg: Config) -> None:
     threading.Thread(target=bootstrap_async, name="sb-bootstrap", daemon=True).start()
     watcher.start(folders)
 
-    icon: "pystray.Icon"
+    icon: pystray.Icon
 
     def show_status(_):
         s = stats.snapshot()

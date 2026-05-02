@@ -13,8 +13,8 @@ from pathlib import Path
 
 from .config import (
     CODE_EXTENSIONS,
-    Config,
     DOCUMENT_EXTENSIONS,
+    Config,
     classify_file,
     is_ignored,
 )

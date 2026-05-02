@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import requests
 
@@ -57,7 +57,7 @@ def _ts(value: float | int | None) -> float:
 def _format_when(epoch: float) -> str:
     if not epoch:
         return ""
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 class RedditConnector:

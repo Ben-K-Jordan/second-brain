@@ -146,18 +146,16 @@ def record_usage(
     # (daemon + dashboard + MCP can all write concurrently). fsync ensures
     # the row survives a crash - otherwise the cap under-reports, the next
     # call passes, and the loop blows the budget for real.
-    with _LEDGER_LOCK:
-        with open(path, "a", encoding="utf-8") as f:
-            with _flock(f):
-                f.write(payload)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    # Some filesystems / WSL on certain mounts can refuse
-                    # fsync on append-only writes. The flush already made it
-                    # to OS buffers; that's the best we can do.
-                    pass
+    with _LEDGER_LOCK, open(path, "a", encoding="utf-8") as f, _flock(f):
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Some filesystems / WSL on certain mounts can refuse
+            # fsync on append-only writes. The flush already made it
+            # to OS buffers; that's the best we can do.
+            pass
     return estimate
 
 

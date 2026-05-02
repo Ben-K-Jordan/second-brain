@@ -87,9 +87,7 @@ def _matching_entity_keys(conn, query: str, fuzzy: bool) -> list[str]:
         t = r["text_lower"]
         if t == q_lower:
             continue
-        if pattern.search(t):
-            matches.add(t)
-        elif re.search(r"\b" + re.escape(t) + r"\b", q_lower):
+        if pattern.search(t) or re.search(r"\b" + re.escape(t) + r"\b", q_lower):
             matches.add(t)
     return list(matches)
 

@@ -98,7 +98,7 @@ def status() -> None:
         conn = connect_readonly(cfg.db_path)
     except FileNotFoundError as e:
         console.print(f"[yellow]{e}[/]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     s = stats(conn)
     table = Table(show_header=False, box=None)
     table.add_row("Files", str(s["files"]))

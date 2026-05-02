@@ -1889,8 +1889,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from fastapi.responses import StreamingResponse
 
         from .db import (
-            chat_append_message, chat_create_conversation, chat_get_conversation,
-            chat_rename_conversation,
+            chat_append_message,
+            chat_create_conversation,
         )
 
         cfg, conn, embedder, reranker = get_state()

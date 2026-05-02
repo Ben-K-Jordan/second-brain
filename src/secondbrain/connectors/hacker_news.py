@@ -136,8 +136,7 @@ class HackerNewsConnector:
             return
         data = r.json() or {}
         submitted = data.get("submitted") or []
-        for iid in submitted[:cap]:
-            yield iid
+        yield from submitted[:cap]
 
     def _fetch_item(
         self, s: requests.Session, item_id: int, labels: list[str]

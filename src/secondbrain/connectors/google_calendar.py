@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import requests
 
@@ -50,7 +50,7 @@ def _parse_event_time(value: dict | None) -> tuple[float, str]:
             return time.time(), value["dateTime"]
     if "date" in value:
         try:
-            dt = datetime.fromisoformat(value["date"]).replace(tzinfo=timezone.utc)
+            dt = datetime.fromisoformat(value["date"]).replace(tzinfo=UTC)
             return dt.timestamp(), value["date"] + " (all day)"
         except ValueError:
             return time.time(), value["date"]
@@ -80,7 +80,7 @@ class GoogleCalendarConnector:
             return
 
         days = int(os.environ.get("SB_CALENDAR_RANGE_DAYS", _DEFAULT_RANGE_DAYS))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         time_min = (now - timedelta(days=days)).isoformat()
         time_max = (now + timedelta(days=days)).isoformat()
 

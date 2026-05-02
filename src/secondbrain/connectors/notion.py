@@ -85,8 +85,7 @@ class NotionConnector:
                 log.warning("Notion /search failed: %s %s", r.status_code, r.text[:200])
                 return
             data = r.json()
-            for page in data.get("results", []):
-                yield page
+            yield from data.get("results", [])
             if not data.get("has_more"):
                 return
             cursor = data.get("next_cursor")
@@ -172,9 +171,7 @@ class NotionConnector:
             elif t == "to_do":
                 box = "x" if data.get("checked") else " "
                 lines.append(f"- [{box}] {text}")
-            elif t == "quote":
-                lines.append(f"> {text}")
-            elif t == "callout":
+            elif t == "quote" or t == "callout":
                 lines.append(f"> {text}")
             elif t == "code":
                 lang = data.get("language", "")
