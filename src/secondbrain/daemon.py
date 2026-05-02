@@ -321,6 +321,17 @@ def _build_daemon_scheduler(
         ),
     ))
 
+    # Study card materialiser (Phase 67) — generates flashcards for
+    # `[course]` docs that don't have any yet. Slow cadence (30 min)
+    # + per-tick cap so we trickle through the backlog instead of
+    # spending the budget all at once.
+    from .study import materialize_due_cards
+    sched.register(Job(
+        name="study_card_materialiser",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda cfg, conn: materialize_due_cards(conn, cfg),
+    ))
+
     return sched
 
 

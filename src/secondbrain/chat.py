@@ -561,11 +561,29 @@ def ask_brain(
 
     if error:
         return ChatResponse(text=f"[error] {error}", citations=[], iterations=iterations)
-    return ChatResponse(
+    response = ChatResponse(
         text="".join(text_parts).strip(),
         citations=citations,
         iterations=iterations,
     )
+    # Phase 68: knowledge-gap detection. When retrieval came back weak
+    # (low top score / few hits / no brain citations at all), log the
+    # question so the weekly review can surface it as a study target.
+    # Scoped to brain citations — we don't fault retrieval just because
+    # the user's question routed entirely through web_search.
+    try:
+        from .study import log_gap
+        brain_cites = [c for c in citations if c.kind == "brain"]
+        top_score = (
+            min(c.score for c in brain_cites) if brain_cites else None
+        )
+        log_gap(
+            conn, question,
+            n_results=len(brain_cites), top_score=top_score,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("study: gap-log failed: %s", e)
+    return response
 
 
 # `json` is referenced indirectly through the JSONResponse path; ensure it's

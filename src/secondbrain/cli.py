@@ -1849,6 +1849,205 @@ def health_summary(
     conn.close()
 
 
+study_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 67 study mode. Flashcards generated from class "
+         "transcripts (`[course]` titled docs). SM-2 spaced repetition "
+         "tracks per-card ease + interval; weak concepts surface in "
+         "the morning brief.",
+)
+app.add_typer(study_app, name="study")
+
+
+@study_app.command("quiz")
+def study_quiz(
+    course: str = typer.Argument(
+        None,
+        help="Course code, e.g. BME410. Omit for any course's due cards.",
+    ),
+    limit: int = typer.Option(10, "--limit", "-n"),
+) -> None:
+    """Run an interactive quiz session over due cards. Grade 0-5
+    after each card; the schedule updates per SM-2."""
+    from . import study as study_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    course_code = course.upper().replace(" ", "").replace("-", "") if course else None
+    cards = study_mod.due_cards(conn, course_code=course_code, limit=limit)
+    if not cards:
+        msg = (
+            "[green]No due cards[/]"
+            + (f" for {course_code}" if course_code else "")
+            + ". You're caught up. ✨"
+        )
+        console.print(msg)
+        conn.close()
+        return
+    console.print(
+        f"[cyan]Quiz: {len(cards)} card(s)"
+        + (f" in {course_code}" if course_code else "")
+        + "[/]\n",
+    )
+    n_correct = 0
+    for i, card in enumerate(cards, 1):
+        console.print(
+            f"[bold]Q{i}/{len(cards)}[/] [dim]({card.concept})[/]",
+        )
+        console.print(card.question)
+        console.input("[dim]Press Enter to reveal...[/]")
+        console.print(f"[bold]Answer:[/] {card.answer}\n")
+        grade_str = console.input(
+            "[cyan]Grade 0-5 (0=blank, 5=perfect, q=quit): [/]",
+        ).strip().lower()
+        if grade_str in ("q", "quit"):
+            console.print("[yellow]Quitting.[/]")
+            break
+        try:
+            grade = int(grade_str)
+        except ValueError:
+            console.print(f"[red]Bad grade {grade_str!r}, skipping[/]")
+            continue
+        updated = study_mod.grade_card(conn, card.id, grade)
+        if updated and grade >= 3:
+            n_correct += 1
+        if updated:
+            next_when = (
+                f"{updated.interval_days:.1f}d" if updated.interval_days >= 1
+                else f"{int(updated.interval_days * 24)}h"
+            )
+            console.print(
+                f"[dim]ease {updated.ease:.2f} · next in {next_when}[/]\n",
+            )
+    console.print(
+        f"\n[bold]Done.[/] {n_correct}/{len(cards)} correct ≥3.",
+    )
+    conn.close()
+
+
+@study_app.command("status")
+def study_status(
+    course: str = typer.Argument(None, help="Course code (optional)."),
+) -> None:
+    """Show study progress: card count, due now, weak concepts."""
+    from . import study as study_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    course_code = course.upper().replace(" ", "").replace("-", "") if course else None
+    if course_code:
+        cards = study_mod.cards_for_course(conn, course_code)
+    else:
+        cards = conn.execute(
+            "SELECT * FROM study_cards",
+        ).fetchall()
+        cards = [study_mod._row_to_card(r) for r in cards]
+    n_total = len(cards)
+    if n_total == 0:
+        console.print(
+            "[yellow]No cards yet.[/]  Run "
+            "[cyan]secondbrain study generate[/] (or wait for the daemon).",
+        )
+        conn.close()
+        return
+    n_due = len(study_mod.due_cards(conn, course_code=course_code, limit=1000))
+    n_reviewed = sum(1 for c in cards if c.review_count > 0)
+    avg_acc = (
+        sum(c.accuracy for c in cards if c.review_count > 0) / max(1, n_reviewed)
+        if n_reviewed else 0.0
+    )
+    console.print(
+        f"[bold]Cards:[/] {n_total} total, {n_due} due, "
+        f"{n_reviewed} reviewed, avg accuracy {avg_acc:.0%}",
+    )
+    weak = study_mod.weak_concepts(conn, course_code=course_code, limit=5)
+    if weak:
+        console.print("\n[bold]Weak concepts:[/]")
+        for concept, acc, n in weak:
+            console.print(f"  {acc:.0%}  {concept}  [dim]({n} reviews)[/]")
+    conn.close()
+
+
+@study_app.command("generate")
+def study_generate(
+    docs: int = typer.Option(
+        3, "--docs", "-d",
+        help="How many course docs to materialise this run.",
+    ),
+) -> None:
+    """Force-materialise cards for course docs that don't have any yet."""
+    from . import study as study_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    n = study_mod.materialize_due_cards(conn, cfg, docs_per_tick=docs)
+    if n == 0:
+        console.print("[dim]No new cards generated.[/]")
+    else:
+        console.print(f"[green]✓[/] Generated {n} new card(s).")
+    conn.close()
+
+
+gaps_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 68 knowledge gaps. Questions ask_brain couldn't "
+         "answer well — weekly review surfaces these as study targets.",
+)
+app.add_typer(gaps_app, name="gaps")
+
+
+@gaps_app.command("list")
+def gaps_list(
+    show_resolved: bool = typer.Option(False, "--resolved/--no-resolved"),
+    limit: int = typer.Option(20, "--limit", "-n"),
+) -> None:
+    """List unanswered questions."""
+    from . import study as study_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = study_mod.list_gaps(
+        conn, include_resolved=show_resolved, limit=limit,
+    )
+    if not rows:
+        console.print("[green]No knowledge gaps logged.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Knowledge gaps")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("question")
+    table.add_column("hits", justify="right", style="dim")
+    table.add_column("score", justify="right", style="dim")
+    table.add_column("when", style="dim")
+    for g in rows:
+        when = time.strftime("%Y-%m-%d", time.localtime(g.asked_at))
+        score = f"{g.top_score:.2f}" if g.top_score is not None else "—"
+        marker = "✓ " if g.resolved_at else ""
+        table.add_row(
+            str(g.id), f"{marker}{g.question[:80]}",
+            str(g.n_results), score, when,
+        )
+    console.print(table)
+    conn.close()
+
+
+@gaps_app.command("resolve")
+def gaps_resolve(
+    gap_id: int = typer.Argument(..., help="Gap id."),
+    note: str = typer.Option(None, "--note", "-n"),
+) -> None:
+    """Mark a gap resolved (you found the answer / don't care anymore)."""
+    from . import study as study_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if study_mod.resolve_gap(conn, gap_id, note=note):
+        console.print(f"[green]✓[/] Resolved #{gap_id}")
+    else:
+        console.print(f"[yellow]Gap #{gap_id} not found or already resolved.[/]")
+    conn.close()
+
+
 people_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 65 people module. De-duped, profile-shaped view of "

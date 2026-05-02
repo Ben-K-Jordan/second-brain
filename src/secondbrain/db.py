@@ -426,6 +426,55 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_person_mentions_file
             ON person_mentions(file_id);
 
+        -- Study cards (Phase 67): flashcards generated from class
+        -- transcripts. One row per (course_doc, question). Cards are
+        -- materialised lazily by the LLM at first study or by the
+        -- daemon's background generator.
+        --
+        -- Tracks SM-2-style spaced repetition state: ease, interval,
+        -- next_due. The CLI quiz updates this in-place. Cards from a
+        -- doc that no longer exists CASCADE on file delete.
+        CREATE TABLE IF NOT EXISTS study_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            course_code TEXT NOT NULL,                 -- 'BME410' / '' for non-class
+            concept TEXT NOT NULL,                     -- short topic tag
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+            -- SM-2 state.
+            ease REAL NOT NULL DEFAULT 2.5,
+            interval_days REAL NOT NULL DEFAULT 0,
+            next_due_at REAL NOT NULL,                 -- when to surface next
+            last_reviewed_at REAL,
+            review_count INTEGER NOT NULL DEFAULT 0,
+            correct_count INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            UNIQUE(file_id, question)
+        );
+        CREATE INDEX IF NOT EXISTS idx_study_due
+            ON study_cards(course_code, next_due_at);
+        CREATE INDEX IF NOT EXISTS idx_study_file
+            ON study_cards(file_id);
+        CREATE INDEX IF NOT EXISTS idx_study_concept
+            ON study_cards(course_code, concept);
+
+        -- Knowledge-gap log (Phase 68): when ask_brain returns weak
+        -- results (low retrieval score / 'I don't know enough'), log
+        -- the question. Weekly review surfaces top-N gaps as study
+        -- targets.
+        CREATE TABLE IF NOT EXISTS knowledge_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            asked_at REAL NOT NULL,
+            top_score REAL,                            -- best retrieval score
+            n_results INTEGER NOT NULL DEFAULT 0,
+            resolved_at REAL,                          -- user marked it done
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gaps_unresolved
+            ON knowledge_gaps(resolved_at, asked_at DESC);
+
         -- Health metrics (Phase 56): structured numeric values from
         -- the Oura connector (and future Apple Health / Garmin etc).
         -- Stored separately from doc bodies so trend / correlation
