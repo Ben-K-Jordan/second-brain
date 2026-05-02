@@ -11,7 +11,13 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config, load_config
-from .db import connect, init_schema, search_images, stats
+from .db import (
+    connect,
+    connect_readonly,
+    init_schema,
+    search_images,
+    stats,
+)
 from .embedder import make_embedder
 from .image_embedder import make_image_embedder
 from .reranker import make_reranker
@@ -23,12 +29,19 @@ mcp = FastMCP("second-brain")
 
 # Module-level singletons; lazily initialised so importing this file is cheap.
 _cfg: Config | None = None
-_conn = None
+_conn = None         # writer — used by tools that mutate (add_task,
+                      # complete_task, sync_source, ingest_url).
+_read_conn = None    # read-only — used by every query / search /
+                      # listing tool. Won't contend with the daemon's
+                      # writer transactions; physically prevented from
+                      # writing as a defense-in-depth measure.
 _embedder = None
 _reranker = None
 
 
 def _get_state():
+    """Return (cfg, writer_conn, embedder, reranker). Used by tools
+    that need to write (add a task, complete a task, run sync, etc.)."""
     global _cfg, _conn, _embedder, _reranker
     if _conn is None:
         _cfg = load_config()
@@ -37,6 +50,25 @@ def _get_state():
         _conn = connect(_cfg.db_path)
         init_schema(_conn, _embedder.dim, _embedder.name)
     return _cfg, _conn, _embedder, _reranker
+
+
+def _get_read_state():
+    """Return (cfg, read_conn, embedder, reranker). Read-only path —
+    used by every search / listing tool so they don't contend with
+    the daemon's write lock or accidentally mutate state.
+
+    The read_conn is opened lazily and cached for the process lifetime;
+    sqlite-vec needs ``load_extension`` per connection, so creating
+    fresh per-call would be wasteful for a long-running stdio server.
+    """
+    global _cfg, _read_conn, _embedder, _reranker
+    if _read_conn is None:
+        # Make sure the writer has been opened first — it runs schema
+        # migrations and verifies embedder compatibility. The read-only
+        # conn just attaches to the existing DB file.
+        _get_state()
+        _read_conn = connect_readonly(_cfg.db_path)
+    return _cfg, _read_conn, _embedder, _reranker
 
 
 def _query_log_path(cfg) -> Path:
@@ -125,7 +157,8 @@ def search_brain(
       - ``kind``: 'document' / 'code' / 'audio_video' / 'image' / 'url'.
       - ``since_days``: only files modified within the last N days.
     """
-    cfg, conn, embedder, reranker = _get_state()
+    # Read-only conn — won't contend with the daemon's writer.
+    cfg, conn, embedder, reranker = _get_read_state()
     results = hybrid_search(
         conn, embedder, query, k=k, alpha=cfg.hybrid_alpha,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
@@ -184,7 +217,7 @@ def ask_brain(question: str) -> str:
 @mcp.tool()
 def vector_search(query: str, k: int = 10) -> str:
     """Pure semantic (vector) search. Best for conceptual questions where exact wording differs."""
-    cfg, conn, embedder, reranker = _get_state()
+    cfg, conn, embedder, reranker = _get_read_state()
     results = vector_only(
         conn, embedder, query, k=k,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
@@ -195,7 +228,7 @@ def vector_search(query: str, k: int = 10) -> str:
 @mcp.tool()
 def keyword_search(query: str, k: int = 10) -> str:
     """Pure BM25 keyword search. Best for proper nouns, IDs, exact strings."""
-    cfg, conn, embedder, reranker = _get_state()
+    cfg, conn, embedder, reranker = _get_read_state()
     results = keyword_only(
         conn, embedder, query, k=k,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,

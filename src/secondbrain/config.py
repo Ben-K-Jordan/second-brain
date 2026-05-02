@@ -303,6 +303,16 @@ class Config:
     daily_budget_cents_voyage: int = 500
     daily_budget_cents_anthropic: int = 500
 
+    # Per-feature daily caps (Phase 63). When present, prevents one
+    # feature from exhausting the global provider cap and starving
+    # the others. Optional — features without an entry use only the
+    # global cap. Map values are cents/day.
+    #
+    # Example: {"watchlist": 200, "chat": 200, "briefing": 100} —
+    # caps watchlists at $2/day, chat at $2/day, briefings at $1/day,
+    # leaving the rest of the provider budget for ad-hoc use.
+    feature_budget_cents: dict[str, int] = field(default_factory=dict)
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "index.db"
@@ -618,6 +628,13 @@ def load_config(path: Path | None = None) -> Config:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:
             cfg.daily_budget_cents_anthropic = int(data["daily_budget_cents_anthropic"])
+        # Per-feature caps (Phase 63). Accepts either a top-level dict
+        # or a nested [feature_budget_cents] table.
+        fb = data.get("feature_budget_cents")
+        if isinstance(fb, dict):
+            cfg.feature_budget_cents = {
+                str(k): int(v) for k, v in fb.items()
+            }
 
     cfg.voyage_api_key = os.environ.get("VOYAGE_API_KEY")
     _validate_config(cfg)

@@ -29,6 +29,14 @@ from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder
 from .reading_queue import run_summariser_if_due
 from .reranker import make_reranker
+from .scheduler import (
+    CooldownSchedule,
+    DailyAtSchedule,
+    IntervalSchedule,
+    Job,
+    Scheduler,
+    trim_old_runs,
+)
 from .transcriber import make_transcriber
 from .watcher import Watcher
 from .watchlist import run_due_watchlists
@@ -188,74 +196,17 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("reranker init failed; watchlists will run without rerank: %s", e)
         reranker = None
+
+    sched = _build_daemon_scheduler(cfg, conn, embedder, reranker)
     log.info("watcher running. Ctrl-C to stop.")
-    last_checkpoint = time.time()
-    last_watchlist_poll = 0.0  # poll immediately on first iteration
+    log.info("scheduler: %d jobs registered: %s",
+             len(sched.names()), ", ".join(sched.names()))
     try:
         while True:
             time.sleep(1)
-            now = time.time()
-            # Periodically truncate the WAL so a long-running daemon with an
-            # active reader (the dashboard) doesn't let it grow unbounded.
-            if now - last_checkpoint >= _WAL_CHECKPOINT_INTERVAL_SEC:
-                checkpoint_wal(conn)
-                last_checkpoint = now
-            # Watchlist scheduler. Runs in the daemon thread; each due
-            # watchlist may take several seconds (Claude + tool use), so
-            # we serialise rather than spinning a worker pool. Acceptable
-            # for a single-user tool with O(10) watchlists.
-            if now - last_watchlist_poll >= _WATCHLIST_POLL_INTERVAL_SEC:
-                last_watchlist_poll = now
-                try:
-                    n = run_due_watchlists(cfg, conn, embedder, reranker)
-                    if n:
-                        log.info("watchlist scheduler: ran %d due watchlist(s)", n)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("watchlist scheduler crashed: %s", e)
-                # Daily digest check piggybacks on the same cadence; it's a
-                # cheap clock comparison + at-most-once-per-day SMTP call.
-                try:
-                    run_digest_if_due(cfg, conn)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("digest scheduler crashed: %s", e)
-                # Daily brief (Phase 44) — same cadence, separate
-                # send time + cooldown so the morning brief and the
-                # daily digest can fire at different hours.
-                try:
-                    if run_brief_if_due(cfg, conn):
-                        log.info("daily brief: auto-fired")
-                except Exception as e:  # noqa: BLE001
-                    log.warning("daily brief scheduler crashed: %s", e)
-                # Oura ring auto-sync (Phase 56) — once per ~12h to
-                # land overnight data without burning the API quota.
-                try:
-                    if run_oura_sync_if_due(cfg, conn, embedder):
-                        log.info("oura: daemon sync ran")
-                except Exception as e:  # noqa: BLE001
-                    log.warning("oura scheduler crashed: %s", e)
-                # Pre-event briefings — checks calendars for events
-                # starting soon and generates briefings on demand.
-                try:
-                    n_brief = run_briefings_if_due(cfg, conn, embedder, reranker)
-                    if n_brief:
-                        log.info(
-                            "event briefing scheduler: generated %d briefing(s)",
-                            n_brief,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("event briefing scheduler crashed: %s", e)
-                # Reading-queue summariser — picks off items that watchlist
-                # runs enqueued and writes 60-second precis. Cheap relative
-                # to watchlist runs themselves.
-                try:
-                    n_sum = run_summariser_if_due(cfg, conn, embedder, reranker)
-                    if n_sum:
-                        log.info(
-                            "read-queue summariser: generated %d summar(ies)",
-                            n_sum,
-                        )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("read-queue summariser crashed: %s", e)
+            sched.tick(
+                cfg=cfg, conn=conn, embedder=embedder, reranker=reranker,
+            )
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:
@@ -266,6 +217,111 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
         except Exception:  # noqa: BLE001
             pass
         conn.close()
+
+
+def _build_daemon_scheduler(
+    cfg: Config, conn, embedder, reranker,
+) -> Scheduler:
+    """Wire every periodic job into one scheduler. Each job's name is
+    visible in `secondbrain status`; its schedule encapsulates the
+    'is it due?' decision; its callable does the actual work and
+    returns ``int`` (count) / ``bool`` (did-something) / ``None`` for
+    silent success.
+
+    Schedules:
+
+      - ``IntervalSchedule`` for poll-cadence jobs (watchlists, event
+        briefings, queue summariser) that decide internally what's due.
+      - ``DailyAtSchedule`` for "send at 8am" jobs (digest, daily brief)
+        that fire at most once per cooldown window.
+      - ``CooldownSchedule`` for "roughly every N hours" jobs (Oura
+        sync, WAL checkpoint, runs trim).
+    """
+    sched = Scheduler(conn)
+
+    # WAL checkpoint — keeps the WAL bounded so a long-running daemon
+    # with an active reader (the dashboard) doesn't let it grow.
+    sched.register(Job(
+        name="wal_checkpoint",
+        schedule=IntervalSchedule(seconds=_WAL_CHECKPOINT_INTERVAL_SEC),
+        fn=lambda conn: checkpoint_wal(conn),
+    ))
+
+    # Runs-table garbage collection — keep 14 days of history.
+    sched.register(Job(
+        name="trim_scheduler_runs",
+        schedule=CooldownSchedule(
+            seconds=3600, cooldown_hours=24,
+        ),
+        fn=lambda conn: trim_old_runs(conn, keep_days=14),
+    ))
+
+    # Watchlists — each due watchlist may take several seconds
+    # (Claude + tool use). Serial within the scheduler tick.
+    sched.register(Job(
+        name="watchlists",
+        schedule=IntervalSchedule(
+            seconds=_WATCHLIST_POLL_INTERVAL_SEC,
+        ),
+        fn=lambda cfg, conn, embedder, reranker: run_due_watchlists(
+            cfg, conn, embedder, reranker,
+        ),
+    ))
+
+    # Pre-event briefings — checks calendars for soon-starting events.
+    sched.register(Job(
+        name="event_briefings",
+        schedule=IntervalSchedule(
+            seconds=_WATCHLIST_POLL_INTERVAL_SEC,
+        ),
+        fn=lambda cfg, conn, embedder, reranker: run_briefings_if_due(
+            cfg, conn, embedder, reranker,
+        ),
+    ))
+
+    # Reading-queue summariser — cheap relative to watchlist runs.
+    sched.register(Job(
+        name="read_queue_summariser",
+        schedule=IntervalSchedule(
+            seconds=_WATCHLIST_POLL_INTERVAL_SEC,
+        ),
+        fn=lambda cfg, conn, embedder, reranker: run_summariser_if_due(
+            cfg, conn, embedder, reranker,
+        ),
+    ))
+
+    # Daily digest — once per local-time day after digest_send_time.
+    sched.register(Job(
+        name="daily_digest",
+        schedule=DailyAtSchedule(
+            local_time=cfg.digest_send_time, cooldown_hours=12,
+        ),
+        fn=lambda cfg, conn: run_digest_if_due(cfg, conn),
+    ))
+
+    # Daily brief — once per local-time day after daily_brief_send_time.
+    # Same shape as digest but separate cadence config.
+    sched.register(Job(
+        name="daily_brief",
+        schedule=DailyAtSchedule(
+            local_time=getattr(cfg, "daily_brief_send_time", "07:00"),
+            cooldown_hours=12,
+        ),
+        fn=lambda cfg, conn: run_brief_if_due(cfg, conn),
+    ))
+
+    # Oura sync — roughly daily; cooldown gates re-sync within window.
+    sched.register(Job(
+        name="oura_sync",
+        schedule=CooldownSchedule(
+            seconds=_WATCHLIST_POLL_INTERVAL_SEC, cooldown_hours=12,
+        ),
+        fn=lambda cfg, conn, embedder: run_oura_sync_if_due(
+            cfg, conn, embedder,
+        ),
+    ))
+
+    return sched
 
 
 def _make_tray_image():

@@ -24,6 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import Config
 
@@ -131,9 +132,19 @@ def record_usage(
     input_tokens: int,
     output_tokens: int = 0,
     note: str = "",
+    feature: str | None = None,
 ) -> CostEstimate:
-    """Append a row to the spend ledger. Returns the cost estimate."""
+    """Append a row to the spend ledger. Returns the cost estimate.
+
+    ``feature`` (Phase 63): one of 'chat', 'watchlist', 'briefing',
+    'event_briefing', 'summary', 'daily_brief', 'tag', 'hyde', 'voice',
+    'embed', or 'other'. Used by the per-feature budget caps + the
+    dashboard's spend breakdown. When None, we infer it from the
+    ``note`` prefix to keep older callers working — see _infer_feature.
+    """
     estimate = estimate_cost(model, input_tokens, output_tokens)
+    if feature is None:
+        feature = _infer_feature(note, provider)
     row = {
         "ts": time.time(),
         "provider": provider,
@@ -142,6 +153,7 @@ def record_usage(
         "output_tokens": output_tokens,
         "cents": round(estimate.cents, 6),
         "note": note,
+        "feature": feature,
     }
     path = _ledger_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,11 +175,18 @@ def record_usage(
     return estimate
 
 
-def daily_spend_cents(cfg: Config, provider: str | None = None, hours: float = 24.0) -> float:
+def daily_spend_cents(
+    cfg: Config,
+    provider: str | None = None,
+    hours: float = 24.0,
+    feature: str | None = None,
+) -> float:
     """Sum spend in the last ``hours`` from the ledger.
 
-    If ``provider`` is None, sums across all providers; otherwise filters.
-    Missing or unreadable ledger files return 0 (no spend recorded yet).
+    Filters: ``provider`` (e.g. 'anthropic') and ``feature`` (e.g.
+    'watchlist'). Either or both can be None for no filtering on that
+    field. Missing or unreadable ledger files return 0 (no spend
+    recorded yet).
     """
     path = _ledger_path(cfg)
     if not path.exists():
@@ -188,6 +207,8 @@ def daily_spend_cents(cfg: Config, provider: str | None = None, hours: float = 2
                     continue
                 if provider and row.get("provider") != provider:
                     continue
+                if feature and row.get("feature") != feature:
+                    continue
                 total += float(row.get("cents", 0))
     except OSError as e:
         log.warning("could not read spend ledger %s: %s", path, e)
@@ -195,17 +216,27 @@ def daily_spend_cents(cfg: Config, provider: str | None = None, hours: float = 2
     return total
 
 
-def check_budget(cfg: Config, provider: str) -> None:
+def check_budget(
+    cfg: Config, provider: str, feature: str | None = None,
+) -> None:
     """Refuse the call if the provider's 24h spend has hit its cap.
 
-    Caps live in config: ``daily_budget_cents_voyage`` and
-    ``daily_budget_cents_anthropic`` (cents because integer cents avoid float
-    parsing surprises in TOML). Set to 0 to **explicitly disable** the cap.
+    Two-level enforcement:
 
-    Fails closed: if the config field is missing or None, we refuse the call
-    rather than silently allowing unlimited spend. The user previously hit a
-    case where None bypassed the cap and a runaway loop spent $6.47 against
-    a $5 cap. Better to halt and ask "why is the cap None?" than to leak.
+    1. **Provider cap**: ``daily_budget_cents_voyage`` /
+       ``daily_budget_cents_anthropic`` — the global daily ceiling
+       per provider (existing Phase 14 behaviour).
+
+    2. **Feature cap** (Phase 63): ``cfg.feature_budget_cents`` is a
+       dict like ``{"watchlist": 200, "chat": 200}``. When ``feature``
+       is supplied AND has an entry, this acts as a *per-feature*
+       cap: a runaway watchlist loop can't deny chat its budget.
+       Optional — features without an entry only see the global cap.
+
+    Fails closed: if the provider field is missing or None, refuse
+    the call rather than silently allow unlimited spend. The user
+    previously hit a case where None bypassed the cap and a runaway
+    loop spent $6.47 against a $5 cap.
     """
     cap = (
         cfg.daily_budget_cents_voyage if provider == "voyage"
@@ -213,18 +244,38 @@ def check_budget(cfg: Config, provider: str) -> None:
     )
     if cap is None:
         raise BudgetExceededError(provider, 0.0, 0.0)
-    if cap <= 0:
-        return  # explicit "disabled" sentinel
-    spent = daily_spend_cents(cfg, provider=provider)
-    if spent >= cap:
-        raise BudgetExceededError(provider, spent, cap)
+    if cap > 0:
+        spent = daily_spend_cents(cfg, provider=provider)
+        if spent >= cap:
+            raise BudgetExceededError(provider, spent, cap)
+    # cap <= 0 means provider-level cap is explicitly disabled — but
+    # the per-feature check still runs.
+    if feature:
+        feature_caps = getattr(cfg, "feature_budget_cents", {}) or {}
+        f_cap = feature_caps.get(feature)
+        if f_cap is None or f_cap <= 0:
+            return  # no per-feature cap configured
+        f_spent = daily_spend_cents(
+            cfg, provider=provider, feature=feature,
+        )
+        if f_spent >= f_cap:
+            raise BudgetExceededError(
+                f"{provider}/{feature}", f_spent, f_cap,
+            )
 
 
 def spend_summary(cfg: Config) -> dict:
-    """Snapshot for dashboards - totals + counts per provider for the last 24h."""
-    out: dict[str, dict[str, float]] = {
-        "voyage":    {"cents": 0.0, "calls": 0, "tokens": 0},
-        "anthropic": {"cents": 0.0, "calls": 0, "tokens": 0},
+    """Snapshot for dashboards - totals + counts per provider for the last 24h.
+
+    Each provider bucket also carries a ``by_feature`` sub-breakdown
+    (Phase 63) so the dashboard can show "$0.42 chat / $0.18 watchlist
+    / $0.09 briefing" instead of one opaque "$0.69 anthropic" total.
+    """
+    out: dict[str, dict[str, Any]] = {
+        "voyage":    {"cents": 0.0, "calls": 0, "tokens": 0,
+                      "by_feature": {}},
+        "anthropic": {"cents": 0.0, "calls": 0, "tokens": 0,
+                      "by_feature": {}},
     }
     path = _ledger_path(cfg)
     if not path.exists():
@@ -243,10 +294,55 @@ def spend_summary(cfg: Config) -> dict:
                 if row.get("ts", 0) < cutoff:
                     continue
                 provider = row.get("provider", "unknown")
-                bucket = out.setdefault(provider, {"cents": 0.0, "calls": 0, "tokens": 0})
+                bucket = out.setdefault(
+                    provider,
+                    {"cents": 0.0, "calls": 0, "tokens": 0,
+                     "by_feature": {}},
+                )
                 bucket["cents"] += float(row.get("cents", 0))
                 bucket["calls"] += 1
                 bucket["tokens"] += int(row.get("input_tokens", 0)) + int(row.get("output_tokens", 0))
+                feature = row.get("feature") or "other"
+                fbucket = bucket["by_feature"].setdefault(
+                    feature, {"cents": 0.0, "calls": 0},
+                )
+                fbucket["cents"] += float(row.get("cents", 0))
+                fbucket["calls"] += 1
     except OSError:
         pass
     return out
+
+
+# ---- Feature inference (back-compat) ---------------------------------
+
+# Map note prefixes (used by older record_usage callers) to feature
+# names. When a caller passes ``note="watchlist/N items"`` but doesn't
+# pass an explicit ``feature=``, we recover the feature here.
+_NOTE_FEATURE_PREFIXES: dict[str, str] = {
+    "watchlist": "watchlist",
+    "briefing": "briefing",
+    "event_briefing": "event_briefing",
+    "summary": "summary",
+    "daily_brief": "daily_brief",
+    "tag": "tag",
+    "hyde": "hyde",
+    "voice": "voice",
+    "chat": "chat",
+    "embed": "embed",
+}
+
+
+def _infer_feature(note: str, provider: str) -> str:
+    """Best-effort feature attribution when caller didn't specify.
+
+    Inspects the note prefix; falls back to provider-based heuristic
+    (voyage = embeddings unless rerank, anthropic = chat).
+    """
+    if not note:
+        # Heuristic: provider tells us most of the story.
+        return "embed" if provider == "voyage" else "other"
+    note_l = note.lower().strip()
+    for prefix, feature in _NOTE_FEATURE_PREFIXES.items():
+        if note_l.startswith(prefix):
+            return feature
+    return "other"

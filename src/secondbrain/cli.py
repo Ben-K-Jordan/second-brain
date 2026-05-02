@@ -90,9 +90,27 @@ def init() -> None:
 
 
 @app.command()
-def status() -> None:
-    """Show what's currently in the index. Read-only — safe to run while the
-    daemon is bulk-indexing."""
+def status(
+    jobs: bool = typer.Option(
+        False, "--jobs/--no-jobs",
+        help="Show daemon scheduler jobs + their last/next run times.",
+    ),
+    spend: bool = typer.Option(
+        False, "--spend/--no-spend",
+        help="Show today's API spend by provider + feature.",
+    ),
+) -> None:
+    """Show what's currently in the index. Read-only — safe to run
+    while the daemon is bulk-indexing.
+
+    Three sections, each opt-in:
+
+      - **Index** (always): file / chunk / entity counts.
+      - ``--jobs``: scheduler runs from the last 24h with status,
+        next-due ETA, and last error message.
+      - ``--spend``: per-provider 24h spend with the per-feature
+        breakdown. Useful for spotting which feature blew the budget.
+    """
     cfg = load_config()
     try:
         conn = connect_readonly(cfg.db_path)
@@ -100,16 +118,132 @@ def status() -> None:
         console.print(f"[yellow]{e}[/]")
         raise typer.Exit(code=1) from None
     s = stats(conn)
-    table = Table(show_header=False, box=None)
+    table = Table(show_header=False, box=None, title="Index")
     table.add_row("Files", str(s["files"]))
     table.add_row("Aliases", f"{s.get('aliases', 0)} (duplicate paths)")
     table.add_row("Chunks", str(s["chunks"]))
     table.add_row("Entities", str(s.get("entities", 0)))
     table.add_row("Embedder", f"{s['embedder']} (dim {s['embedding_dim']})")
     table.add_row("DB path", str(cfg.db_path))
-    table.add_row("Watched folders", ", ".join(str(p) for p in cfg.watched_folders) or "(none)")
+    table.add_row(
+        "Watched folders",
+        ", ".join(str(p) for p in cfg.watched_folders) or "(none)",
+    )
     console.print(table)
+
+    if jobs:
+        _render_jobs_status(conn)
+
+    if spend:
+        _render_spend_status(cfg)
+
     conn.close()
+
+
+def _render_jobs_status(conn) -> None:
+    """Status of every daemon scheduler job: last run + next due + error."""
+    from .scheduler import runs_in_last
+
+    rows = runs_in_last(conn, hours=24, limit=500)
+    if not rows:
+        console.print("\n[dim](no scheduler runs in the last 24h)[/]")
+        return
+    # Aggregate per-job: last run, last success, last error, count.
+    by_job: dict[str, dict] = {}
+    for r in rows:
+        name = r["job_name"]
+        b = by_job.setdefault(name, {
+            "last_started": 0.0, "last_success": 0.0,
+            "last_error": None, "runs": 0, "errors": 0,
+        })
+        b["runs"] += 1
+        if r["started_at"] > b["last_started"]:
+            b["last_started"] = r["started_at"]
+        if r["success"]:
+            if r["started_at"] > b["last_success"]:
+                b["last_success"] = r["started_at"]
+        else:
+            b["errors"] += 1
+            if r["error"]:
+                b["last_error"] = r["error"]
+
+    table = Table(
+        show_header=True, box=None,
+        title="\nScheduled jobs (last 24h)",
+    )
+    table.add_column("job")
+    table.add_column("last run", style="dim")
+    table.add_column("runs", justify="right")
+    table.add_column("errors", justify="right")
+    table.add_column("status")
+    now = time.time()
+    for name in sorted(by_job):
+        b = by_job[name]
+        ago = (now - b["last_started"]) / 60.0
+        ago_label = f"{ago:.0f}m ago" if ago < 60 else f"{ago / 60:.1f}h ago"
+        status_label = (
+            "[green]ok[/]" if b["errors"] == 0
+            else f"[red]{b['errors']} err[/]"
+        )
+        table.add_row(
+            name, ago_label, str(b["runs"]),
+            str(b["errors"]), status_label,
+        )
+        if b["last_error"]:
+            table.add_row(
+                "", f"[dim red]→ {b['last_error'][:80]}[/]",
+                "", "", "",
+            )
+    console.print(table)
+
+
+def _render_spend_status(cfg) -> None:
+    """Per-provider 24h spend with per-feature breakdown."""
+    from .budget import spend_summary
+
+    summary = spend_summary(cfg)
+    table = Table(
+        show_header=True, box=None,
+        title="\nToday's spend (last 24h)",
+    )
+    table.add_column("provider")
+    table.add_column("feature")
+    table.add_column("spend", justify="right")
+    table.add_column("calls", justify="right", style="dim")
+    for provider, bucket in sorted(summary.items()):
+        if bucket["calls"] == 0:
+            continue
+        cap_cents = (
+            cfg.daily_budget_cents_voyage if provider == "voyage"
+            else cfg.daily_budget_cents_anthropic
+        )
+        cap_str = (
+            f"${cap_cents / 100:.2f}" if cap_cents and cap_cents > 0
+            else "(no cap)"
+        )
+        # Provider total row.
+        table.add_row(
+            f"[bold]{provider}[/]",
+            f"[dim]/ {cap_str}[/]",
+            f"${bucket['cents'] / 100:.4f}",
+            str(bucket["calls"]),
+        )
+        # Per-feature breakdown indented.
+        for feat, fb in sorted(bucket.get("by_feature", {}).items()):
+            f_cap = (cfg.feature_budget_cents or {}).get(feat)
+            cap_label = (
+                f" / ${f_cap / 100:.2f}" if f_cap and f_cap > 0 else ""
+            )
+            table.add_row(
+                "",
+                f"  {feat}{cap_label}",
+                f"${fb['cents'] / 100:.4f}",
+                str(fb["calls"]),
+            )
+    if not any(b["calls"] > 0 for b in summary.values()):
+        console.print("\n[dim](no spend recorded today)[/]")
+        return
+    console.print(table)
 
 
 @app.command()
@@ -624,6 +758,7 @@ def sync(
     """
     _setup_logging(verbose)
     from .connectors import all_connectors, get_connector
+    from .sync import parallel_sync
 
     cfg = load_config()
     conn, embedder = _open_state(cfg)
@@ -643,68 +778,77 @@ def sync(
             raise typer.Exit(code=1)
         connector_classes = [cls]
 
-    grand_totals: dict[str, int] = {}
+    # Filter out unconfigured connectors before submitting to the pool.
+    connectors = []
     for cls in connector_classes:
         c = cls()
         if not c.is_enabled(cfg):
             console.print(f"[dim]skip[/]  {c.name:10s}  (not configured — see `secondbrain --help`)")
             continue
-        console.print(f"[cyan]sync[/]  {c.name:10s}  fetching...")
-        counts = {"indexed": 0, "skipped": 0, "unchanged": 0, "alias": 0, "error": 0}
-        try:
-            for doc in c.fetch(cfg):
-                result = index_text(
-                    conn, embedder, cfg,
-                    virtual_path=doc.virtual_path,
-                    title=doc.title,
-                    content=doc.content,
-                    mtime=doc.mtime,
-                    kind=doc.kind,
-                    source=doc.source,
-                    entity_extractor=entity_extractor,
-                )
-                counts[result.status] = counts.get(result.status, 0) + 1
-                total = sum(counts.values())
-                if verbose or total % 25 == 0:
-                    console.print(
-                        f"  [{c.name}] {total:4d}: "
-                        f"indexed={counts.get('indexed',0)} "
-                        f"unchanged={counts.get('unchanged',0)} "
-                        f"alias={counts.get('alias',0)} "
-                        f"err={counts.get('error',0)}"
-                    )
-        except Exception as e:
-            console.print(f"[red]error in {c.name}:[/] {e}")
-        for k, v in counts.items():
-            grand_totals[k] = grand_totals.get(k, 0) + v
+        connectors.append(c)
+
+    if not connectors:
+        console.print("[yellow]No connectors configured — nothing to sync.[/]")
+        conn.close()
+        return
+
+    console.print(
+        f"[cyan]sync[/]  fetching from "
+        f"{len(connectors)} connector(s) in parallel...",
+    )
+
+    def _index(doc, source_name):
+        """Closure passed to parallel_sync. Each call serialises into
+        the writer (single-thread consumer side of the queue)."""
+        result = index_text(
+            conn, embedder, cfg,
+            virtual_path=doc.virtual_path,
+            title=doc.title,
+            content=doc.content,
+            mtime=doc.mtime,
+            kind=doc.kind,
+            source=doc.source,
+            entity_extractor=entity_extractor,
+        )
+        return result.status
+
+    def _on_progress(c):
+        """Called once per connector when its fetch leg completes —
+        renders the same per-connector status line the old loop did."""
+        if c.error_msg:
+            console.print(f"[red]error[/] {c.name:10s}  {c.error_msg}")
         console.print(
             f"[green]done[/]  {c.name:10s}  "
-            f"indexed={counts.get('indexed',0)} "
-            f"unchanged={counts.get('unchanged',0)} "
-            f"alias={counts.get('alias',0)} "
-            f"errors={counts.get('error',0)}"
+            f"indexed={c.indexed} unchanged={c.unchanged} "
+            f"alias={c.alias} errors={c.error}",
         )
-        # Phase 56: after the Oura connector runs, also write structured
-        # numeric values to health_metrics so trend/correlation queries
-        # don't need to re-parse doc Markdown. Best-effort — failure
-        # logs but doesn't block the rest of the sync.
-        if c.name == "oura":
-            try:
-                from .connectors.oura import fetch_summaries
-                from .health import ingest_summaries
 
-                summaries = fetch_summaries(cfg)
-                n = ingest_summaries(conn, summaries)
-                console.print(f"[dim]  health_metrics: {n} value(s) updated[/]")
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[yellow]  health_metrics ingest failed:[/] {e}")
+    report = parallel_sync(
+        connectors, cfg,
+        index_doc=_index, on_progress=_on_progress,
+    )
 
+    # Phase 56: after the Oura connector runs, also write structured
+    # numeric values to health_metrics. Same hook as before, just
+    # checked once at the end rather than per-connector.
+    if any(c.name == "oura" for c in connectors):
+        try:
+            from .connectors.oura import fetch_summaries
+            from .health import ingest_summaries
+
+            summaries = fetch_summaries(cfg)
+            n = ingest_summaries(conn, summaries)
+            console.print(f"[dim]  health_metrics: {n} value(s) updated[/]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]  health_metrics ingest failed:[/] {e}")
+
+    total = report.grand_total()
     console.print()
     console.print(
-        f"[bold]Total:[/] indexed={grand_totals.get('indexed', 0)} "
-        f"unchanged={grand_totals.get('unchanged', 0)} "
-        f"alias={grand_totals.get('alias', 0)} "
-        f"errors={grand_totals.get('error', 0)}"
+        f"[bold]Total:[/] indexed={total.indexed} "
+        f"unchanged={total.unchanged} alias={total.alias} "
+        f"errors={total.error}  "
+        f"[dim]({report.duration_seconds:.1f}s, {len(connectors)} parallel)[/]",
     )
     conn.close()
 

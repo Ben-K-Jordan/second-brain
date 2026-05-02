@@ -1195,9 +1195,17 @@ def create_app():
 
     app = FastAPI(title="second-brain", docs_url=None, redoc_url=None)
 
-    state = {"cfg": None, "conn": None, "embedder": None, "reranker": None}
+    state = {
+        "cfg": None,
+        "conn": None,           # writer — chat history, ingest, click log
+        "read_conn": None,      # read-only — search, file view, listings
+        "embedder": None,
+        "reranker": None,
+    }
 
     def get_state():
+        """Return the writer connection. Used by routes that mutate
+        (chat send, ingest, click feedback, task add/done, settings)."""
         if state["conn"] is None:
             cfg = load_config()
             embedder = make_embedder(cfg)
@@ -1208,6 +1216,25 @@ def create_app():
             state["conn"] = conn
             state["reranker"] = make_reranker(cfg)
         return state["cfg"], state["conn"], state["embedder"], state["reranker"]
+
+    def get_read_state():
+        """Return a read-only connection. Used by query / listing /
+        search routes — won't contend with the daemon's writer
+        transactions, and physically prevents accidental writes (an
+        UPDATE/INSERT through this conn raises).
+
+        Lazily opens the read-only conn on first use; caches it for
+        the process lifetime since sqlite-vec needs ``load_extension``
+        per connection."""
+        if state["read_conn"] is None:
+            from .db import connect_readonly
+            # Make sure the writer / schema migrations have run first.
+            get_state()
+            state["read_conn"] = connect_readonly(state["cfg"].db_path)
+        return (
+            state["cfg"], state["read_conn"],
+            state["embedder"], state["reranker"],
+        )
 
     # --- Routes ---
 
@@ -1307,7 +1334,10 @@ def create_app():
         since_days: int | None = None,
         k: int = 10,
     ):
-        cfg, conn, embedder, reranker = get_state()
+        # Read-only conn — search is the heaviest read path and runs
+        # on every keystroke through the palette; using a read-only
+        # snapshot lets it coexist with the daemon's write lock.
+        cfg, conn, embedder, reranker = get_read_state()
         kinds = [r["kind"] for r in conn.execute(
             "SELECT DISTINCT kind FROM files ORDER BY kind"
         ).fetchall()]
@@ -1739,7 +1769,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/file", response_class=HTMLResponse)
     def file_view(path: str):
-        cfg, conn, embedder, reranker = get_state()
+        # Read-only — pure rendering, no mutations.
+        cfg, conn, embedder, reranker = get_read_state()
         row = conn.execute(
             "SELECT path, kind, mtime, size FROM files WHERE path = ?", (path,)
         ).fetchone()
@@ -3720,8 +3751,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/api/palette")
     def api_palette(q: str = ""):
-        """Mixed search for the command palette: entities + files matching q."""
-        cfg, conn, _, _ = get_state()
+        """Mixed search for the command palette: entities + files matching q.
+        High-traffic (fires on every keystroke) → read-only conn."""
+        cfg, conn, _, _ = get_read_state()
         q = q.strip()
         if len(q) < 2:
             return {"entities": [], "files": []}
