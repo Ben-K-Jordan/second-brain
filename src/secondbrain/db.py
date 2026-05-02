@@ -211,6 +211,15 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
     if wl_cols and "allowed_domains_json" not in wl_cols:
         conn.execute("ALTER TABLE watchlists ADD COLUMN allowed_domains_json TEXT")
 
+    # Migration: watchlist_runs.new_paths_json + new_count added in Phase 30.
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watchlist_runs)")}
+    if run_cols and "new_paths_json" not in run_cols:
+        conn.execute("ALTER TABLE watchlist_runs ADD COLUMN new_paths_json TEXT")
+    if run_cols and "new_count" not in run_cols:
+        conn.execute(
+            "ALTER TABLE watchlist_runs ADD COLUMN new_count INTEGER NOT NULL DEFAULT 0"
+        )
+
     # Chat conversations: each conversation has many turns, each turn has a
     # role (user / assistant) and a content blob. Citations are stored per
     # assistant turn so we can re-render past chats with their sources.
@@ -269,7 +278,13 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             answer TEXT,           -- synthesized text from ask_brain
             citations_json TEXT,   -- JSON list of citation dicts
             error TEXT,            -- non-null when the run failed
-            cents_spent REAL       -- estimated cost of this run
+            cents_spent REAL,      -- estimated cost of this run
+            -- Diff bookkeeping (Phase 30): URLs/paths in this run that
+            -- weren't in the previous run, and the count of same. Used by
+            -- the dashboard's "what's new" highlight + tray notifications +
+            -- email digests.
+            new_paths_json TEXT,
+            new_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_wlruns_wl_started
             ON watchlist_runs(watchlist_id, started_at DESC);
@@ -758,12 +773,19 @@ def watchlist_run_record_finish(
     citations_json: str | None = None,
     error: str | None = None,
     cents_spent: float | None = None,
+    new_paths_json: str | None = None,
+    new_count: int = 0,
 ) -> None:
     """Mark a watchlist run finished and persist the synthesized answer."""
     conn.execute(
         "UPDATE watchlist_runs SET finished_at = ?, answer = ?, "
-        "citations_json = ?, error = ?, cents_spent = ? WHERE id = ?",
-        (time.time(), answer, citations_json, error, cents_spent, run_id),
+        "citations_json = ?, error = ?, cents_spent = ?, "
+        "new_paths_json = ?, new_count = ? "
+        "WHERE id = ?",
+        (
+            time.time(), answer, citations_json, error, cents_spent,
+            new_paths_json, int(new_count), run_id,
+        ),
     )
     # Also bump last_run_at on the parent so watchlist_due moves on.
     conn.execute(
@@ -777,12 +799,31 @@ def watchlist_run_record_finish(
     conn.commit()
 
 
+def watchlist_previous_run(
+    conn: sqlite3.Connection, watchlist_id: int, before_run_id: int,
+) -> sqlite3.Row | None:
+    """Find the most recent successful run before ``before_run_id``.
+
+    "Successful" = finished_at IS NOT NULL AND error IS NULL. Used by
+    run_watchlist to compute the diff against the last good run.
+    """
+    return conn.execute(
+        "SELECT * FROM watchlist_runs WHERE watchlist_id = ? "
+        "AND id < ? AND finished_at IS NOT NULL AND error IS NULL "
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
+        (watchlist_id, before_run_id),
+    ).fetchone()
+
+
 def watchlist_runs(
     conn: sqlite3.Connection, watchlist_id: int, limit: int = 50,
 ) -> list[sqlite3.Row]:
+    # Tiebreak by id DESC because time.time() on Windows has ~16ms
+    # resolution; without it, two runs in quick succession can sort
+    # non-deterministically.
     return conn.execute(
         "SELECT * FROM watchlist_runs WHERE watchlist_id = ? "
-        "ORDER BY started_at DESC LIMIT ?",
+        "ORDER BY started_at DESC, id DESC LIMIT ?",
         (watchlist_id, limit),
     ).fetchall()
 
@@ -792,7 +833,7 @@ def watchlist_latest_run(
 ) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM watchlist_runs WHERE watchlist_id = ? "
-        "ORDER BY started_at DESC LIMIT 1",
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
         (watchlist_id,),
     ).fetchone()
 

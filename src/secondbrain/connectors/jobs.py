@@ -288,18 +288,182 @@ def _render_ashby_job(org: str, j: dict) -> ConnectorDocument | None:
     )
 
 
+# ----------------------------- SmartRecruiters ------------------------
+
+def _fetch_smartrecruiters(s: requests.Session, org: str) -> Iterator[ConnectorDocument]:
+    """SmartRecruiters' public postings API:
+    api.smartrecruiters.com/v1/companies/<company>/postings.
+
+    Listings come back in a paginated envelope; ``offset`` + ``limit``
+    walk pages. Each posting needs a second fetch for the description.
+    """
+    base = f"https://api.smartrecruiters.com/v1/companies/{org}/postings"
+    offset = 0
+    page_size = 100
+    while True:
+        data = _get(s, f"{base}?limit={page_size}&offset={offset}")
+        if not isinstance(data, dict):
+            return
+        items = data.get("content") or []
+        if not items:
+            return
+        for j in items:
+            try:
+                doc = _render_smartrecruiters_summary(org, j)
+                if doc is not None:
+                    yield doc
+            except Exception as e:  # noqa: BLE001
+                log.warning("smartrecruiters render failed for %s: %s", org, e)
+        if len(items) < page_size:
+            return
+        offset += page_size
+
+
+def _render_smartrecruiters_summary(org: str, j: dict) -> ConnectorDocument | None:
+    """Render the summary endpoint's payload. The summary already includes
+    title/location/department/jobAd which is enough for retrieval; we don't
+    do the extra per-posting GET unless someone really wants the full
+    description."""
+    jid = j.get("id")
+    if not jid:
+        return None
+    title = j.get("name") or "(untitled)"
+    location = j.get("location") or {}
+    loc_str = ", ".join(filter(None, [
+        location.get("city"), location.get("region"), location.get("country"),
+    ]))
+    department = ((j.get("department") or {}).get("label")) or ""
+    employment_type = ((j.get("typeOfEmployment") or {}).get("label")) or ""
+    industry = ((j.get("industry") or {}).get("label")) or ""
+    company = ((j.get("company") or {}).get("name")) or org
+    apply_url = ((j.get("applyUrl")) or "")
+    posting_url = ((j.get("ref")) or "")
+    if not apply_url:
+        # Fallback: SmartRecruiters' canonical job page.
+        apply_url = f"https://jobs.smartrecruiters.com/{org}/{jid}"
+    job_ad = j.get("jobAd") or {}
+    sections = (job_ad.get("sections") or {})
+    parts: list[str] = []
+    for key in ("companyDescription", "jobDescription", "qualifications", "additionalInformation"):
+        sec = sections.get(key) or {}
+        text = _strip_html(sec.get("text") or "")
+        if text:
+            parts.append(f"## {sec.get('title', key)}\n{text}")
+    desc = "\n\n".join(parts)
+    updated = _iso_to_ts(j.get("releasedDate") or j.get("createdOn"))
+
+    lines = [f"# {title}", "", f"Company: {company} (SmartRecruiters)"]
+    if loc_str:        lines.append(f"Location: {loc_str}")
+    if department:     lines.append(f"Department: {department}")
+    if employment_type:lines.append(f"Type: {employment_type}")
+    if industry:       lines.append(f"Industry: {industry}")
+    if apply_url:      lines.append(f"Apply: {apply_url}")
+    if desc:
+        lines.append("")
+        lines.append(desc)
+    return ConnectorDocument(
+        source="jobs",
+        virtual_path=f"jobs://smartrecruiters/{org}/{jid}",
+        title=f"[{company}] {title}",
+        content="\n".join(lines),
+        mtime=updated,
+        metadata={
+            "provider": "smartrecruiters",
+            "company": company,
+            "title": title,
+            "location": loc_str,
+            "department": department,
+            "employment_type": employment_type,
+            "url": apply_url,
+            "ref_url": posting_url,
+            "id": jid,
+        },
+    )
+
+
+# ------------------------------- Recruitee ----------------------------
+
+def _fetch_recruitee(s: requests.Session, slug: str) -> Iterator[ConnectorDocument]:
+    """Recruitee's careers API: <slug>.recruitee.com/api/offers/."""
+    url = f"https://{slug}.recruitee.com/api/offers/"
+    data = _get(s, url)
+    if not isinstance(data, dict):
+        return
+    for j in data.get("offers") or []:
+        try:
+            doc = _render_recruitee_offer(slug, j)
+            if doc is not None:
+                yield doc
+        except Exception as e:  # noqa: BLE001
+            log.warning("recruitee render failed for %s: %s", slug, e)
+
+
+def _render_recruitee_offer(slug: str, j: dict) -> ConnectorDocument | None:
+    jid = j.get("id")
+    if not jid:
+        return None
+    title = j.get("title") or "(untitled)"
+    location = j.get("location") or ""
+    department = j.get("department") or ""
+    employment_type = j.get("employment_type_code") or j.get("employment_type") or ""
+    description = _strip_html(j.get("description") or "") or (j.get("description_plain") or "")
+    requirements = _strip_html(j.get("requirements") or "") or (j.get("requirements_plain") or "")
+    apply_url = j.get("careers_url") or j.get("careers_apply_url") or ""
+    updated = _iso_to_ts(j.get("created_at") or j.get("updated_at"))
+
+    lines = [f"# {title}", "", f"Company: {slug} (Recruitee)"]
+    if location:        lines.append(f"Location: {location}")
+    if department:      lines.append(f"Department: {department}")
+    if employment_type: lines.append(f"Type: {employment_type}")
+    if apply_url:       lines.append(f"Apply: {apply_url}")
+    if description:
+        lines.append("")
+        lines.append(description)
+    if requirements:
+        lines.append("")
+        lines.append("## Requirements")
+        lines.append(requirements)
+    return ConnectorDocument(
+        source="jobs",
+        virtual_path=f"jobs://recruitee/{slug}/{jid}",
+        title=f"[{slug}] {title}",
+        content="\n".join(lines),
+        mtime=updated,
+        metadata={
+            "provider": "recruitee",
+            "company": slug,
+            "title": title,
+            "location": location,
+            "department": department,
+            "employment_type": employment_type,
+            "url": apply_url,
+            "id": jid,
+        },
+    )
+
+
 # ---------------------------- Connector class --------------------------
 
 class JobsConnector:
-    """Pulls open postings from Greenhouse / Lever / Ashby boards.
+    """Pulls open postings from Greenhouse / Lever / Ashby /
+    SmartRecruiters / Recruitee boards.
 
     Configure the company lists in ``~/.secondbrain/config.toml``::
 
-        jobs_greenhouse = ["anthropic", "openai", "stripe"]
-        jobs_lever      = ["mistral"]
-        jobs_ashby      = ["modal"]
+        jobs_greenhouse      = ["anthropic", "openai", "stripe"]
+        jobs_lever           = ["mistral"]
+        jobs_ashby           = ["modal"]
+        jobs_smartrecruiters = ["bosch", "publicis-groupe"]
+        jobs_recruitee       = ["someco"]
 
     The connector is enabled when at least one of those lists is non-empty.
+
+    Workday is intentionally not included: every Workday tenant lives at
+    a per-company subdomain (e.g. microsoft.wd5.myworkdayjobs.com) and
+    requires CSRF tokens for the search endpoint, which would mean a
+    headless-browser dependency. For Workday-hosted companies, prefer
+    ``--preset jobs`` web search, or scrape via the Indeed/LinkedIn
+    aggregators that re-list those postings.
     """
 
     name = "jobs"
@@ -309,6 +473,8 @@ class JobsConnector:
             _config_companies(cfg, "greenhouse")
             or _config_companies(cfg, "lever")
             or _config_companies(cfg, "ashby")
+            or _config_companies(cfg, "smartrecruiters")
+            or _config_companies(cfg, "recruitee")
         )
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
@@ -324,5 +490,9 @@ class JobsConnector:
                 yield from _fetch_lever(s, company)
             for org in _config_companies(cfg, "ashby"):
                 yield from _fetch_ashby(s, org)
+            for org in _config_companies(cfg, "smartrecruiters"):
+                yield from _fetch_smartrecruiters(s, org)
+            for slug in _config_companies(cfg, "recruitee"):
+                yield from _fetch_recruitee(s, slug)
         finally:
             s.close()

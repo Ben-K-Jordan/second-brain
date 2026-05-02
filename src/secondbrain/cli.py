@@ -702,6 +702,94 @@ def serve() -> None:
     run()
 
 
+digest_app = typer.Typer(
+    no_args_is_help=True,
+    help="Send / inspect the daily watchlist email digest. Configure SMTP "
+         "in config.toml (digest_*) and put your password in the "
+         "SECONDBRAIN_SMTP_PASSWORD env var.",
+)
+app.add_typer(digest_app, name="digest")
+
+
+@digest_app.command("send")
+def digest_send_cmd(
+    force: bool = typer.Option(
+        False, "--force",
+        help="Send even if digest_enabled=false in config.",
+    ),
+) -> None:
+    """Send the email digest now (regardless of the daily schedule)."""
+    from .digest import send_digest
+
+    cfg = load_config()
+    if force:
+        cfg.digest_enabled = True
+    conn, _ = _open_state(cfg)
+    ok, msg = send_digest(cfg, conn)
+    if ok:
+        console.print(f"[green]✓[/] {msg}")
+    else:
+        console.print(f"[red]digest failed:[/] {msg}")
+        conn.close()
+        raise typer.Exit(code=1)
+    conn.close()
+
+
+@digest_app.command("preview")
+def digest_preview_cmd() -> None:
+    """Render the digest body to stdout without sending. Useful to verify
+    config + see what tonight's email will look like."""
+    from .digest import _gather, _render_text, last_digest_sent_at
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    since = last_digest_sent_at(conn)
+    rows = _gather(conn, since)
+    console.print(_render_text(rows, since))
+    conn.close()
+
+
+@digest_app.command("history")
+def digest_history_cmd(
+    limit: int = typer.Option(20, "--limit", "-n"),
+) -> None:
+    """Show recent digest send attempts."""
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    # ensure table exists for fresh installs
+    import time as _time
+
+    from .digest import _ensure_digest_runs_table
+
+    _ensure_digest_runs_table(conn)
+    rows = conn.execute(
+        "SELECT * FROM digest_runs ORDER BY sent_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    if not rows:
+        console.print("[dim]No digest sends yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Digest history")
+    table.add_column("when")
+    table.add_column("ok?", justify="center", width=4)
+    table.add_column("watchlists", justify="right")
+    table.add_column("new", justify="right")
+    table.add_column("recipients/error", overflow="fold")
+    for r in rows:
+        when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(r["sent_at"]))
+        ok = "[green]✓[/]" if r["success"] else "[red]✗[/]"
+        info = r["recipients"] if r["success"] else (r["error"] or "?")
+        table.add_row(
+            when, ok,
+            str(r["watchlists_summarized"]),
+            str(r["new_items_total"]),
+            info[:80],
+        )
+    console.print(table)
+    conn.close()
+
+
 @app.command()
 def chat(
     question: str = typer.Argument(

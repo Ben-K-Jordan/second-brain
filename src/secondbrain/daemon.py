@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import Config
 from .db import checkpoint_wal, connect, init_schema
+from .digest import run_digest_if_due
 from .embedder import make_embedder
 from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
@@ -207,6 +208,12 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
                         log.info("watchlist scheduler: ran %d due watchlist(s)", n)
                 except Exception as e:  # noqa: BLE001
                     log.warning("watchlist scheduler crashed: %s", e)
+                # Daily digest check piggybacks on the same cadence; it's a
+                # cheap clock comparison + at-most-once-per-day SMTP call.
+                try:
+                    run_digest_if_due(cfg, conn)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("digest scheduler crashed: %s", e)
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:

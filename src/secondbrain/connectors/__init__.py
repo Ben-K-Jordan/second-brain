@@ -108,6 +108,7 @@ def all_connectors() -> list[type[Connector]]:
     from .google_calendar import GoogleCalendarConnector
     from .google_drive import GoogleDriveConnector
     from .hacker_news import HackerNewsConnector
+    from .imap_email import ImapEmailConnector
     from .jobs import JobsConnector
     from .linear import LinearConnector
     from .mastodon import MastodonConnector
@@ -116,6 +117,7 @@ def all_connectors() -> list[type[Connector]]:
     from .obsidian import ObsidianConnector
     from .pocket import PocketConnector
     from .reddit import RedditConnector
+    from .rss import RSSConnector
     from .slack import SlackConnector
     from .substack import SubstackConnector
     from .x_archive import XArchiveConnector
@@ -129,6 +131,7 @@ def all_connectors() -> list[type[Connector]]:
         # Network-bound APIs (small/cheap first)
         JobsConnector,            # public ATS APIs - quick
         NewsConnector,            # NewsAPI.org - quick
+        RSSConnector,             # generic feeds - usually quick
         GitHubConnector,
         LinearConnector,
         NotionConnector,
@@ -141,6 +144,8 @@ def all_connectors() -> list[type[Connector]]:
         MastodonConnector,
         CalendarConnector,
         GoogleCalendarConnector,
+        # IMAP scans your mailbox; can be slow on big folders.
+        ImapEmailConnector,
         # Slowest first-sync last
         GmailConnector,
         GoogleDriveConnector,

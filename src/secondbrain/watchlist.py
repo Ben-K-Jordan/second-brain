@@ -35,10 +35,12 @@ from .db import (
     watchlist_due,
     watchlist_get_domains,
     watchlist_latest_run,
+    watchlist_previous_run,
     watchlist_run_record_finish,
     watchlist_run_record_start,
 )
 from .embedder import make_embedder
+from .notify import notify
 from .reranker import make_reranker
 
 log = logging.getLogger(__name__)
@@ -112,19 +114,83 @@ def run_watchlist(
         }
         for c in response.citations
     ]
+
+    # Diff against the previous successful run: which citation paths
+    # weren't in the prior run? Used by the dashboard's "what's new"
+    # callout, tray notifications, and email digest.
+    new_paths, new_count = _compute_new_paths(conn, watchlist_id, run_id, cites_payload)
+
     watchlist_run_record_finish(
         conn, run_id,
         answer=response.text,
         citations_json=json.dumps(cites_payload),
         cents_spent=cents_spent,
+        new_paths_json=json.dumps(new_paths) if new_paths else None,
+        new_count=new_count,
     )
     log.info(
-        "watchlist %s ran in %.2f cents; %d citations",
+        "watchlist %s ran in %.2f cents; %d citations; %d new since last run",
         watchlist_id,
         cents_spent or 0.0,
         len(response.citations),
+        new_count,
     )
+
+    # Tray / desktop notification when there's something genuinely new.
+    # The first run has no prior to compare against; we treat it as
+    # "everything new" by setting new_count to len(citations), but skip
+    # the notification because the user just created the watchlist and
+    # is presumably looking at the dashboard already.
+    if new_count > 0 and _has_prior_run(conn, watchlist_id, run_id):
+        try:
+            wl_name = _name(conn, watchlist_id) or f"watchlist {watchlist_id}"
+            notify(
+                f"second-brain: {new_count} new on '{wl_name}'",
+                response.text[:240] if response.text else
+                "Open the dashboard to see what's new.",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("notify after watchlist run failed: %s", e)
+
     return response
+
+
+def _name(conn, watchlist_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT name FROM watchlists WHERE id = ?", (watchlist_id,),
+    ).fetchone()
+    return row["name"] if row else None
+
+
+def _has_prior_run(conn, watchlist_id: int, before_run_id: int) -> bool:
+    return watchlist_previous_run(conn, watchlist_id, before_run_id) is not None
+
+
+def _compute_new_paths(
+    conn, watchlist_id: int, this_run_id: int,
+    cites_payload: list[dict],
+) -> tuple[list[str], int]:
+    """Return (new_paths, new_count): paths in this run not in the previous.
+
+    Identity = file_path (which is the URL for web citations and the
+    virtual_path for brain citations). On first run with no prior, we
+    treat every citation as new since there's nothing to diff against -
+    the caller decides whether to notify.
+    """
+    this_paths = [c.get("file_path") for c in cites_payload if c.get("file_path")]
+    if not this_paths:
+        return [], 0
+    prev = watchlist_previous_run(conn, watchlist_id, this_run_id)
+    if prev is None or not prev["citations_json"]:
+        # Nothing to diff against - everything is "new".
+        return list(this_paths), len(this_paths)
+    try:
+        prev_cites = json.loads(prev["citations_json"]) or []
+    except json.JSONDecodeError:
+        prev_cites = []
+    prev_paths = {c.get("file_path") for c in prev_cites if c.get("file_path")}
+    new_paths = [p for p in this_paths if p not in prev_paths]
+    return new_paths, len(new_paths)
 
 
 def run_due_watchlists(cfg: Config, conn=None, embedder=None, reranker=None) -> int:
@@ -163,7 +229,7 @@ def run_due_watchlists(cfg: Config, conn=None, embedder=None, reranker=None) -> 
 
 def latest_summary(conn, watchlist_id: int) -> dict | None:
     """Return the most recent finished run for the dashboard's "what's
-    new" panel: text + parsed citations + finished_at + error."""
+    new" panel: text + parsed citations + finished_at + error + diff."""
     row = watchlist_latest_run(conn, watchlist_id)
     if row is None:
         return None
@@ -173,6 +239,21 @@ def latest_summary(conn, watchlist_id: int) -> dict | None:
             cites = json.loads(row["citations_json"])
         except json.JSONDecodeError:
             cites = []
+    new_paths: list = []
+    # Older rows (pre-Phase 30) don't have the new_paths_json column.
+    try:
+        npj = row["new_paths_json"]
+    except (IndexError, KeyError):
+        npj = None
+    if npj:
+        try:
+            new_paths = json.loads(npj)
+        except json.JSONDecodeError:
+            new_paths = []
+    try:
+        new_count = int(row["new_count"] or 0)
+    except (IndexError, KeyError, TypeError, ValueError):
+        new_count = 0
     return {
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
@@ -180,6 +261,8 @@ def latest_summary(conn, watchlist_id: int) -> dict | None:
         "citations": cites,
         "error": row["error"],
         "cents_spent": row["cents_spent"],
+        "new_paths": new_paths,
+        "new_count": new_count,
     }
 
 

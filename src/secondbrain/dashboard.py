@@ -2093,6 +2093,19 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             s = latest_summary(conn, r["id"])
             answer_html = ""
             cite_html = ""
+            new_html = ""
+            if s and s.get("new_count"):
+                # "what's new since last run" badge - the headline thing
+                # the user wants to see at a glance.
+                count = s["new_count"]
+                np = s.get("new_paths") or []
+                tip = "\n".join(np[:25])
+                if len(np) > 25:
+                    tip += f"\n... and {len(np) - 25} more"
+                new_html = (
+                    f'<div class="watch-new-badge" title="{escape(tip)}">'
+                    f'⚡ {count} new since last run</div>'
+                )
             if s and s.get("answer"):
                 answer_html = (
                     '<div class="watch-answer">'
@@ -2100,23 +2113,31 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                     '</div>'
                 )
                 cites = s.get("citations") or []
+                # Mark which citations are new in this run so they get a
+                # visual highlight in the list.
+                new_set = set(s.get("new_paths") or []) if s else set()
                 if cites:
                     cite_pieces: list[str] = []
                     for c in cites:
                         kind = c.get("kind", "brain")
+                        is_new = c.get("file_path") in new_set
+                        new_chip = (
+                            ' <span class="watch-cite-new">NEW</span>'
+                            if is_new else ""
+                        )
                         if kind == "web":
                             url = c.get("url") or c.get("file_path", "")
                             label = c.get("page_title") or url
                             cite_pieces.append(
                                 f'<a href="{escape(url)}" target="_blank" '
                                 f'rel="noopener noreferrer" class="watch-cite watch-cite-web">'
-                                f'↗ {escape(label)}</a>'
+                                f'↗ {escape(label)}{new_chip}</a>'
                             )
                         else:
                             fp = c.get("file_path", "")
                             cite_pieces.append(
                                 f'<a href="/file?path={urllib.parse.quote_plus(fp)}" '
-                                f'class="watch-cite">{escape(fp)}</a>'
+                                f'class="watch-cite">{escape(fp)}{new_chip}</a>'
                             )
                     cite_html = (
                         '<div class="watch-cites">' + "".join(cite_pieces) + "</div>"
@@ -2139,6 +2160,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         <span class="watch-sched">every {every} · last: {last}</span>
     </header>
     <div class="watch-q">"{escape(r['query'])}"</div>
+    {new_html}
     {answer_html}
     {cite_html}
     <form method="post" action="/watch/{r['id']}/action" class="watch-actions">
@@ -2223,6 +2245,26 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 }}
 .watch-cite-web {{ color: #5af0ff; }}
 .watch-cite:hover {{ text-decoration: underline; }}
+.watch-new-badge {{
+    display: inline-block; margin: 6px 0;
+    padding: 4px 10px;
+    background: #1c2814; color: #b8ffb8;
+    border: 1px solid #4abe4a;
+    border-radius: 2px;
+    font-size: 12px; font-family: var(--mono);
+    letter-spacing: 0.04em;
+    box-shadow: 0 0 12px rgba(127,255,127,0.2);
+    cursor: help;
+}}
+.watch-cite-new {{
+    display: inline-block; margin-left: 6px;
+    padding: 0 4px;
+    background: #1c2814; color: #b8ffb8;
+    border: 1px solid #4abe4a;
+    font-size: 9.5px; letter-spacing: 0.08em;
+    border-radius: 2px;
+    vertical-align: middle;
+}}
 .watch-actions {{
     display: flex; gap: 10px; margin-top: 10px;
 }}

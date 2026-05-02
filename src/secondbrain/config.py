@@ -195,6 +195,8 @@ class Config:
     jobs_greenhouse: tuple[str, ...] = ()
     jobs_lever: tuple[str, ...] = ()
     jobs_ashby: tuple[str, ...] = ()
+    jobs_smartrecruiters: tuple[str, ...] = ()
+    jobs_recruitee: tuple[str, ...] = ()
 
     # News connector (NewsAPI.org). Free tier = 100 req/day. Set
     # NEWSAPI_KEY env var, then pick topics + (optionally) sources to
@@ -202,6 +204,21 @@ class Config:
     news_topics: tuple[str, ...] = ()
     news_sources: tuple[str, ...] = ()  # NewsAPI source ids, e.g. "techcrunch"
     news_window_days: int = 1
+
+    # Generic RSS / Atom feeds. Use for Indeed RSS (where exposed),
+    # Google Alerts (every alert exposes RSS), LinkedIn job-alert RSS,
+    # blogs, anything with a feed.
+    rss_feeds: tuple[str, ...] = ()
+
+    # IMAP connector — universal "email-to-brain" pipe. Point at a Gmail
+    # label or any IMAP folder; every message in the window becomes a
+    # searchable doc. Password lives in SECONDBRAIN_IMAP_PASSWORD env.
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_folders: tuple[str, ...] = ()
+    imap_window_days: int = 14
+    imap_max_per_folder: int = 1000
 
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
@@ -221,6 +238,20 @@ class Config:
     # Useful for recruiting boards (linkedin.com, lever.co, ...) or news
     # (nytimes.com, ...). Leave empty for unrestricted.
     web_search_allowed_domains: tuple[str, ...] = ()
+
+    # Email digest: optional daily summary of every watchlist's run since
+    # the last digest. SMTP config is the user's choice; for Gmail use an
+    # app password (https://myaccount.google.com/apppasswords). The send
+    # time is local-timezone HH:MM; the daemon checks once a minute.
+    digest_enabled: bool = False
+    digest_to: str = ""  # comma-separated recipients
+    digest_send_time: str = "08:00"  # local HH:MM, 24-hour
+    digest_smtp_host: str = "smtp.gmail.com"
+    digest_smtp_port: int = 587
+    digest_smtp_user: str = ""
+    digest_smtp_from: str = ""  # falls back to digest_smtp_user when empty
+    # Password lives in the SECONDBRAIN_SMTP_PASSWORD env var, NOT config,
+    # so the user doesn't accidentally check it in.
 
     # Daily spend caps in cents (so $5 = 500). Refuses paid calls once today's
     # cumulative spend hits the cap. Set to 0 to disable. Defense in depth -
@@ -448,6 +479,20 @@ def load_config(path: Path | None = None) -> Config:
             cfg.web_search_max_uses_per_turn = int(data["web_search_max_uses_per_turn"])
         if "web_search_allowed_domains" in data:
             cfg.web_search_allowed_domains = tuple(data["web_search_allowed_domains"])
+        if "digest_enabled" in data:
+            cfg.digest_enabled = bool(data["digest_enabled"])
+        if "digest_to" in data:
+            cfg.digest_to = str(data["digest_to"])
+        if "digest_send_time" in data:
+            cfg.digest_send_time = str(data["digest_send_time"])
+        if "digest_smtp_host" in data:
+            cfg.digest_smtp_host = str(data["digest_smtp_host"])
+        if "digest_smtp_port" in data:
+            cfg.digest_smtp_port = int(data["digest_smtp_port"])
+        if "digest_smtp_user" in data:
+            cfg.digest_smtp_user = str(data["digest_smtp_user"])
+        if "digest_smtp_from" in data:
+            cfg.digest_smtp_from = str(data["digest_smtp_from"])
         if "substack_feeds" in data:
             cfg.substack_feeds = tuple(data["substack_feeds"])
         if "obsidian_vaults" in data:
@@ -458,12 +503,39 @@ def load_config(path: Path | None = None) -> Config:
             cfg.jobs_lever = tuple(data["jobs_lever"])
         if "jobs_ashby" in data:
             cfg.jobs_ashby = tuple(data["jobs_ashby"])
+        if "jobs_smartrecruiters" in data:
+            cfg.jobs_smartrecruiters = tuple(data["jobs_smartrecruiters"])
+        if "jobs_recruitee" in data:
+            cfg.jobs_recruitee = tuple(data["jobs_recruitee"])
         if "news_topics" in data:
             cfg.news_topics = tuple(data["news_topics"])
         if "news_sources" in data:
             cfg.news_sources = tuple(data["news_sources"])
         if "news_window_days" in data:
             cfg.news_window_days = int(data["news_window_days"])
+        if "rss_feeds" in data:
+            cfg.rss_feeds = tuple(data["rss_feeds"])
+        # IMAP block: accept either flat `imap_*` keys at the top level or
+        # a nested ``[imap]`` table for cleaner config.toml.
+        imap_block = data.get("imap") if isinstance(data.get("imap"), dict) else None
+        if imap_block:
+            if "host" in imap_block:        cfg.imap_host = str(imap_block["host"])
+            if "port" in imap_block:        cfg.imap_port = int(imap_block["port"])
+            if "username" in imap_block:    cfg.imap_username = str(imap_block["username"])
+            if "folders" in imap_block:     cfg.imap_folders = tuple(imap_block["folders"])
+            if "window_days" in imap_block: cfg.imap_window_days = int(imap_block["window_days"])
+            if "max_per_folder" in imap_block:
+                cfg.imap_max_per_folder = int(imap_block["max_per_folder"])
+        for k in ("imap_host", "imap_port", "imap_username", "imap_folders",
+                  "imap_window_days", "imap_max_per_folder"):
+            if k in data:
+                v = data[k]
+                if k == "imap_folders":
+                    setattr(cfg, k, tuple(v))
+                elif k in ("imap_port", "imap_window_days", "imap_max_per_folder"):
+                    setattr(cfg, k, int(v))
+                else:
+                    setattr(cfg, k, str(v))
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:
