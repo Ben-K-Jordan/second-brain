@@ -212,7 +212,11 @@ def test_build_prompt_truncates_very_long_descriptions():
 
 
 def test_human_when_includes_relative_phrase():
-    out = _human_when(time.time() + 600, 1800)
+    """``_human_when`` floors the minute count via ``int(// 60)``, so
+    we add a 30-second pad to the offset — without it, the few ms
+    between this ``time.time()`` and the one inside ``_human_when``
+    can drop the result from 10 to 9 minutes flakily on slow CI."""
+    out = _human_when(time.time() + 630, 1800)
     assert "in 10 minutes" in out
     assert "30 min" in out  # duration
 

@@ -55,15 +55,24 @@ def test_chat_seq_isolated_per_conversation(fresh_db):
 
 
 def test_click_log_aggregates_by_path(fresh_db):
-    log_click(fresh_db, "/notes/a.md", "search", chunk_id=1)
-    time.sleep(0.01)
-    log_click(fresh_db, "/notes/a.md", "search", chunk_id=2)
+    """recent_clicks_by_path returns the most-recent timestamp per
+    path. We log b.md FIRST, then a.md (twice) — so a.md should be
+    the more recent of the two paths.
+
+    Sleeps are 25ms each: Windows time.time() has ~16ms resolution, so
+    the previous 10ms gaps could collapse and make the comparison
+    non-deterministic.
+    """
     log_click(fresh_db, "/notes/b.md", "chat")
+    time.sleep(0.025)
+    log_click(fresh_db, "/notes/a.md", "search", chunk_id=1)
+    time.sleep(0.025)
+    log_click(fresh_db, "/notes/a.md", "search", chunk_id=2)
 
     by_path = recent_clicks_by_path(fresh_db)
     assert set(by_path) == {"/notes/a.md", "/notes/b.md"}
-    # Most-recent click for /notes/a.md is the second one (chunk_id=2).
-    assert by_path["/notes/a.md"] >= by_path["/notes/b.md"]
+    # a.md's second click is the most recent of all three → a.md > b.md.
+    assert by_path["/notes/a.md"] > by_path["/notes/b.md"]
 
 
 def test_click_log_window_filter(fresh_db):
