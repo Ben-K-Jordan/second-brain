@@ -244,6 +244,13 @@ class Config:
     read_queue_summarise_per_run: int = 5  # per-tick cap
     read_queue_notify_threshold: int = 5   # tray ping when unread >= this
 
+    # Voice capture (`secondbrain capture`). Auto-VAD stop after the
+    # configured silence duration. Save the .wav for keepsake too.
+    voice_sample_rate: int = 16000
+    voice_silence_rms: float = 0.012        # tune up if your mic is loud
+    voice_silence_seconds: float = 1.5
+    voice_save_audio: bool = True
+
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
     # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
@@ -580,6 +587,14 @@ def load_config(path: Path | None = None) -> Config:
             cfg.read_queue_summarise_per_run = int(data["read_queue_summarise_per_run"])
         if "read_queue_notify_threshold" in data:
             cfg.read_queue_notify_threshold = int(data["read_queue_notify_threshold"])
+        if "voice_sample_rate" in data:
+            cfg.voice_sample_rate = int(data["voice_sample_rate"])
+        if "voice_silence_rms" in data:
+            cfg.voice_silence_rms = float(data["voice_silence_rms"])
+        if "voice_silence_seconds" in data:
+            cfg.voice_silence_seconds = float(data["voice_silence_seconds"])
+        if "voice_save_audio" in data:
+            cfg.voice_save_audio = bool(data["voice_save_audio"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

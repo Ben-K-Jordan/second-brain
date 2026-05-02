@@ -793,6 +793,92 @@ def serve() -> None:
     run()
 
 
+@app.command()
+def capture(
+    silence_seconds: float = typer.Option(
+        None, "--silence", "-s",
+        help="Stop after this many seconds of silence (default from config).",
+    ),
+    save_audio: bool = typer.Option(
+        None, "--save-audio/--no-save-audio",
+        help="Override cfg.voice_save_audio.",
+    ),
+    label: str = typer.Option(
+        "voice note", "--label", "-l",
+        help="Document title prefix.",
+    ),
+) -> None:
+    """Voice-capture a note into the brain. Speak after the prompt, stop
+    when you're done — VAD detects silence and ends recording.
+
+    Requires the [voice] extra: ``pip install -e .[voice]``.
+
+    The transcript is ingested as a regular brain document (kind=document,
+    source=voice), so it's searchable via the same hybrid retrieval as
+    everything else. The chat agent can find your voice notes via
+    search_brain.
+    """
+    from .voice import VoiceCaptureUnavailable
+    from .voice import capture as voice_capture
+
+    cfg = load_config()
+    if save_audio is not None:
+        cfg.voice_save_audio = save_audio
+    conn, embedder = _open_state(cfg)
+
+    # Live status renderer — show a simple progress bar of recent volume
+    # so the user knows the mic is hearing them.
+    live_state = {"max_rms": 0.0, "started": False}
+
+    def status(kind: str, payload):
+        if kind == "start":
+            live_state["started"] = True
+            console.print("[bold green]●[/] recording — speak now…  "
+                          "[dim](stops after silence)[/]")
+        elif kind == "volume":
+            live_state["max_rms"] = max(live_state["max_rms"], payload)
+        elif kind == "stop":
+            reason = "silence detected" if payload == "silence" else (
+                "max-duration reached" if payload == "max_duration"
+                else str(payload)
+            )
+            console.print(f"[bold yellow]■[/] stopped ({reason})")
+
+    try:
+        result = voice_capture(
+            cfg, conn, embedder,
+            silence_seconds=silence_seconds, on_status=status,
+            note_label=label,
+        )
+    except VoiceCaptureUnavailable as e:
+        console.print(f"[red]capture failed:[/] {e}")
+        conn.close()
+        raise typer.Exit(code=1) from None
+    except KeyboardInterrupt:
+        console.print("\n[yellow]capture cancelled[/]")
+        conn.close()
+        raise typer.Exit(code=130) from None
+
+    if not result.transcript:
+        console.print(
+            f"[yellow]no transcript[/] (recorded {result.duration_seconds:.1f}s; "
+            "either silence or the mic captured nothing)"
+        )
+        conn.close()
+        return
+
+    console.print()
+    console.print(f"[dim]{result.duration_seconds:.1f}s · "
+                  f"{len(result.transcript)} chars · "
+                  f"{result.chunks_indexed} chunk(s) indexed[/]")
+    console.print(f"[dim]vp:[/] [cyan]{result.virtual_path}[/]")
+    if result.audio_path:
+        console.print(f"[dim]audio:[/] [cyan]{result.audio_path}[/]")
+    console.print()
+    console.print(result.transcript)
+    conn.close()
+
+
 read_app = typer.Typer(
     no_args_is_help=True,
     help="Reading queue. Watchlist runs auto-enqueue high-fit jobs and "

@@ -29,6 +29,13 @@ local = [
 whisper = [
     "faster-whisper>=1.0",
 ]
+voice = [
+    # Cross-platform audio recording for `secondbrain capture`. Auto-VAD
+    # stop (1.5s of silence) so you don't need a hotkey. sounddevice pulls
+    # numpy, which is already on the dep graph via sentence-transformers.
+    "sounddevice>=0.4",
+    "faster-whisper>=1.0",
+]
 ocr = [
     "pytesseract>=0.3",
 ]
