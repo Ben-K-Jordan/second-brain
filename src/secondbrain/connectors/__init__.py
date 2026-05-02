@@ -99,6 +99,7 @@ def all_connectors() -> list[type[Connector]]:
     network-bound ones. Gmail + Drive last because they're the slowest
     on first sync.
     """
+    from .bluesky import BlueskyConnector
     from .browser import BrowserHistoryConnector
     from .calendar import CalendarConnector
     from .github import GitHubConnector
@@ -107,15 +108,21 @@ def all_connectors() -> list[type[Connector]]:
     from .google_drive import GoogleDriveConnector
     from .hacker_news import HackerNewsConnector
     from .linear import LinearConnector
+    from .mastodon import MastodonConnector
     from .notion import NotionConnector
+    from .obsidian import ObsidianConnector
     from .pocket import PocketConnector
     from .reddit import RedditConnector
     from .slack import SlackConnector
+    from .substack import SubstackConnector
     from .x_archive import XArchiveConnector
 
     return [
+        # Local / fast first
         BrowserHistoryConnector,
-        XArchiveConnector,        # local zip read; fast
+        ObsidianConnector,
+        XArchiveConnector,
+        # Network-bound APIs
         GitHubConnector,
         LinearConnector,
         NotionConnector,
@@ -123,8 +130,12 @@ def all_connectors() -> list[type[Connector]]:
         RedditConnector,
         HackerNewsConnector,
         PocketConnector,
+        SubstackConnector,
+        BlueskyConnector,
+        MastodonConnector,
         CalendarConnector,
         GoogleCalendarConnector,
+        # Slowest first-sync last
         GmailConnector,
         GoogleDriveConnector,
     ]

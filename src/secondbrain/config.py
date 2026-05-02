@@ -182,6 +182,13 @@ class Config:
     # Run on demand via `secondbrain tag`; defaults to Haiku 4.5 (~$0.0003/chunk).
     tag_model: str = "claude-haiku-4-5"
 
+    # Connector-specific config (see secondbrain/connectors/*.py for details).
+    # Substack: list of feed URLs to ingest (RSS/Atom).
+    substack_feeds: tuple[str, ...] = ()
+    # Obsidian: vault root directories. Both this and OBSIDIAN_VAULTS work;
+    # the connector parses frontmatter + resolves [[wikilinks]] for retrieval.
+    obsidian_vaults: tuple[str, ...] = ()
+
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
     # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
@@ -410,6 +417,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.chat_max_tool_iterations = int(data["chat_max_tool_iterations"])
         if "chat_search_k" in data:
             cfg.chat_search_k = int(data["chat_search_k"])
+        if "substack_feeds" in data:
+            cfg.substack_feeds = tuple(data["substack_feeds"])
+        if "obsidian_vaults" in data:
+            cfg.obsidian_vaults = tuple(data["obsidian_vaults"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:
