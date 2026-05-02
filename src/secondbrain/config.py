@@ -225,6 +225,12 @@ class Config:
     # how far back/forward (in days) we ingest assignments + announcements.
     canvas_window_days: int = 60
 
+    # Oura ring — sleep / activity / readiness / workouts / tags.
+    # Set OURA_TOKEN env var (or run `secondbrain auth oura`) to enable.
+    # Ingests one daily-summary doc per day in the window, plus writes
+    # numeric metrics to the health_metrics table for trend queries.
+    oura_window_days: int = 90
+
     # Resume-fit scoring. Drop one or many resumes (PM-flavoured, eng-
     # flavoured, etc.) here; the watchlist runner embeds them and scores
     # job postings against them so "great fit" / "stretch" labels appear
@@ -569,6 +575,8 @@ def load_config(path: Path | None = None) -> Config:
                     setattr(cfg, k, str(v))
         if "canvas_window_days" in data:
             cfg.canvas_window_days = int(data["canvas_window_days"])
+        if "oura_window_days" in data:
+            cfg.oura_window_days = int(data["oura_window_days"])
         # Resume can be either a top-level `resume_paths = [...]` or a
         # nested `[resume] paths = [...]` block - support both.
         if "resume_paths" in data:

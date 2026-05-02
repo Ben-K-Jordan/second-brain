@@ -369,6 +369,27 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_click_path_ts ON click_log(path, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_click_ts ON click_log(ts DESC);
 
+        -- Health metrics (Phase 56): structured numeric values from
+        -- the Oura connector (and future Apple Health / Garmin etc).
+        -- Stored separately from doc bodies so trend / correlation
+        -- queries don't need to re-parse Markdown.
+        --
+        -- UNIQUE on (date, metric, source) so re-syncing the connector
+        -- updates rather than duplicates rows.
+        CREATE TABLE IF NOT EXISTS health_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,           -- 'YYYY-MM-DD'
+            metric TEXT NOT NULL,         -- 'sleep_score' | 'steps' | etc.
+            value REAL NOT NULL,
+            source TEXT NOT NULL,         -- 'oura' | future: 'apple_health'
+            recorded_at REAL NOT NULL,
+            UNIQUE(date, metric, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_health_date_metric
+            ON health_metrics(date DESC, metric);
+        CREATE INDEX IF NOT EXISTS idx_health_metric_date
+            ON health_metrics(metric, date DESC);
+
         -- Backlinks (Phase 52): pairs of files that are semantically
         -- similar enough to surface as "see also" context. Computed on
         -- ingest by averaging the new doc's chunk embeddings, querying

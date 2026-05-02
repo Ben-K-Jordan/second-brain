@@ -468,13 +468,71 @@ def _auth_canvas(cfg: Config) -> None:
     console.print("  [cyan]secondbrain sync canvas[/]")
 
 
+def _auth_oura(cfg: Config) -> None:
+    """Walk the user through saving an Oura personal access token.
+
+    No SSO dance — Oura PATs come straight from the cloud dashboard
+    and authenticate with plain Bearer auth. Same shape as `_auth_canvas`
+    but simpler.
+    """
+    import webbrowser
+
+    from .connectors.oura import (
+        _credentials_path,
+        save_oura_credentials,
+        verify_oura_token,
+    )
+
+    console.print("[bold green]Oura ring setup[/]")
+    console.print(
+        "Generate a Personal Access Token at the URL below. The token "
+        "uses simple Bearer auth — no OAuth dance, no expiry by default.\n"
+    )
+    pat_url = "https://cloud.ouraring.com/personal-access-tokens"
+    console.print(f"[bold]1.[/] Visit [cyan]{pat_url}[/]")
+    console.print("[bold]2.[/] Click [bold]+ Create New Personal Access Token[/].")
+    console.print("[bold]3.[/] Name it 'second-brain'; copy the token.")
+    console.print()
+
+    if console.input("Open the token page now? [Y/n]: ").strip().lower() not in ("n", "no"):
+        try:
+            webbrowser.open(pat_url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    token = console.input("\nPaste the access token here: ").strip()
+    if not token:
+        console.print("[red]No token provided.[/]")
+        raise typer.Exit(code=1)
+
+    console.print("\n[dim]Verifying...[/]")
+    me = verify_oura_token(token)
+    if me is None:
+        console.print(
+            "[red]Verification failed.[/]  Check the token's right and "
+            "that you have an active Oura subscription (the API requires it).",
+        )
+        raise typer.Exit(code=1)
+
+    save_oura_credentials(cfg, token)
+    email = me.get("email") or ""
+    console.print(
+        "[green]✓[/] Authorized"
+        + (f" as {email}" if email else "") + f". Saved to "
+        f"[dim]{_credentials_path(cfg)}[/]"
+    )
+    console.print()
+    console.print("Now try:")
+    console.print("  [cyan]secondbrain sync oura[/]")
+
+
 @app.command()
 def auth(
     provider: str = typer.Argument(
         "google",
         help="Auth provider to set up: 'google' (Gmail / Calendar / Drive), "
-             "'canvas' (LMS personal access token), or 'extension' "
-             "(browser-extension bearer token).",
+             "'canvas' (LMS personal access token), 'oura' (ring biometrics), "
+             "or 'extension' (browser-extension bearer token).",
     ),
 ) -> None:
     """Guided setup for a cloud provider.
@@ -516,9 +574,13 @@ def auth(
         _auth_canvas(cfg)
         return
 
+    if provider == "oura":
+        _auth_oura(cfg)
+        return
+
     if provider != "google":
         console.print(f"[red]Unknown auth provider:[/] {provider}")
-        console.print("Try: 'google', 'canvas', or 'extension'.")
+        console.print("Try: 'google', 'canvas', 'oura', or 'extension'.")
         raise typer.Exit(code=1)
 
     from .connectors._google_oauth import GoogleAuthError, run_oauth_flow
@@ -622,6 +684,20 @@ def sync(
             f"alias={counts.get('alias',0)} "
             f"errors={counts.get('error',0)}"
         )
+        # Phase 56: after the Oura connector runs, also write structured
+        # numeric values to health_metrics so trend/correlation queries
+        # don't need to re-parse doc Markdown. Best-effort — failure
+        # logs but doesn't block the rest of the sync.
+        if c.name == "oura":
+            try:
+                from .connectors.oura import fetch_summaries
+                from .health import ingest_summaries
+
+                summaries = fetch_summaries(cfg)
+                n = ingest_summaries(conn, summaries)
+                console.print(f"[dim]  health_metrics: {n} value(s) updated[/]")
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[yellow]  health_metrics ingest failed:[/] {e}")
 
     console.print()
     console.print(
@@ -1412,6 +1488,128 @@ def links_rebuild(
         conn, k=k, max_distance=max_distance, on_progress=on_progress,
     )
     console.print(f"[green]✓[/] Recorded {written} pair-rows.")
+    conn.close()
+
+
+health_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 56 health metrics. Sleep / activity / readiness from "
+         "Oura (and future biometric sources). The connector populates "
+         "the metrics table on each `sync oura`; these subcommands let "
+         "you inspect trends.",
+)
+app.add_typer(health_app, name="health")
+
+
+@health_app.command("show")
+def health_show(
+    metric: str = typer.Argument(
+        None,
+        help="Metric name. Omit to list every metric we have data for.",
+    ),
+    days: int = typer.Option(14, "--days", "-d"),
+    source: str = typer.Option("oura", "--source", "-s"),
+) -> None:
+    """Show recent values for a metric (or list available metrics)."""
+    from . import health as health_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if metric is None:
+        metrics = health_mod.list_metrics(conn, source=source)
+        if not metrics:
+            console.print(
+                f"[yellow]No {source} data yet.[/]  "
+                "Run [cyan]secondbrain sync oura[/] first.",
+            )
+            conn.close()
+            return
+        console.print("[bold]Available metrics[/] " + f"({source}):")
+        for m in metrics:
+            console.print(f"  - {m}")
+        conn.close()
+        return
+
+    summary = health_mod.summarise(
+        conn, metric, days=days, source=source,
+    )
+    console.print(health_mod.format_summary_line(summary))
+    points = health_mod.recent(conn, metric, days=days, source=source)
+    if points:
+        # Tiny ASCII sparkline so trends are visible without a plot lib.
+        spark = _ascii_sparkline([p.value for p in points])
+        console.print(f"  [dim]{spark}[/]")
+        console.print(
+            f"  [dim]({points[0].date} → {points[-1].date})[/]"
+        )
+    conn.close()
+
+
+def _ascii_sparkline(values: list[float]) -> str:
+    """Tiny inline trend chart. Eight levels mapped via Unicode block
+    glyphs — same trick a million CLI tools use. All-equal series
+    render as the middle level."""
+    if not values:
+        return ""
+    blocks = " ▁▂▃▄▅▆▇█"
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        return blocks[4] * len(values)
+    out = []
+    for v in values:
+        idx = int(round((v - lo) / (hi - lo) * (len(blocks) - 1)))
+        out.append(blocks[max(0, min(len(blocks) - 1, idx))])
+    return "".join(out)
+
+
+@health_app.command("summary")
+def health_summary(
+    days: int = typer.Option(14, "--days", "-d"),
+    source: str = typer.Option("oura", "--source", "-s"),
+) -> None:
+    """One-line summaries of every available metric (your "vitals at a glance")."""
+    from . import health as health_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    metrics = health_mod.list_metrics(conn, source=source)
+    if not metrics:
+        console.print(
+            f"[yellow]No {source} data yet.[/] "
+            "Run [cyan]secondbrain sync oura[/] first.",
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None,
+                  title=f"Health summary — last {days} day(s)")
+    table.add_column("metric")
+    table.add_column("avg", justify="right")
+    table.add_column("latest", justify="right")
+    table.add_column("min/max", justify="right", style="dim")
+    table.add_column("trend", style="dim")
+    for m in metrics:
+        s = health_mod.summarise(conn, m, days=days, source=source)
+        if s.n == 0:
+            continue
+        avg_s = (
+            f"{s.average:.1f}" if s.average is not None and s.average % 1
+            else f"{int(s.average) if s.average is not None else '—'}"
+        )
+        latest_s = (
+            f"{int(s.latest.value) if s.latest and s.latest.value % 1 == 0 else f'{s.latest.value:.1f}' if s.latest else '—'}"
+        )
+        mm = (
+            f"{int(s.minimum) if s.minimum is not None and s.minimum % 1 == 0 else s.minimum:.1f}"
+            if s.minimum is not None else "—"
+        )
+        mm_max = (
+            f"{int(s.maximum) if s.maximum is not None and s.maximum % 1 == 0 else s.maximum:.1f}"
+            if s.maximum is not None else "—"
+        )
+        points = health_mod.recent(conn, m, days=days, source=source)
+        spark = _ascii_sparkline([p.value for p in points])
+        table.add_row(m, avg_s, latest_s, f"{mm}–{mm_max}", spark)
+    console.print(table)
     conn.close()
 
 

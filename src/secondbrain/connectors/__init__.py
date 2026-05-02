@@ -116,6 +116,7 @@ def all_connectors() -> list[type[Connector]]:
     from .news import NewsConnector
     from .notion import NotionConnector
     from .obsidian import ObsidianConnector
+    from .oura import OuraConnector
     from .pocket import PocketConnector
     from .reddit import RedditConnector
     from .rss import RSSConnector
@@ -132,6 +133,7 @@ def all_connectors() -> list[type[Connector]]:
         # Network-bound APIs (small/cheap first)
         JobsConnector,            # public ATS APIs - quick
         CanvasConnector,          # LMS API - quick, scoped to active courses
+        OuraConnector,            # Oura cloud API - small per-day records
         NewsConnector,            # NewsAPI.org - quick
         RSSConnector,             # generic feeds - usually quick
         GitHubConnector,
