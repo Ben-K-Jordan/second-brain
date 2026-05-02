@@ -426,6 +426,47 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_person_mentions_file
             ON person_mentions(file_id);
 
+        -- PDF annotations (Phase 84). Highlights / notes / strikeouts
+        -- pulled from a PDF's annotation layer (the markup users add
+        -- in Preview, Acrobat, Drawboard, etc). One row per annotation;
+        -- linked back to the source PDF via file_id (CASCADE on delete).
+        --
+        -- We don't dedupe across re-extracts — a re-extract DELETEs
+        -- by file_id first then re-INSERTs. UNIQUE on (file_id,
+        -- page, anchor) keeps a single re-extract idempotent.
+        CREATE TABLE IF NOT EXISTS pdf_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            page INTEGER NOT NULL,            -- 1-indexed
+            kind TEXT NOT NULL,               -- 'highlight'|'note'|'underline'|'strike'
+            anchor TEXT NOT NULL,             -- the underlying text the annotation applies to
+            note TEXT,                        -- user-typed comment, if any
+            color TEXT,                       -- hex or color name
+            created_at REAL NOT NULL,
+            UNIQUE(file_id, page, anchor, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pdf_annot_file_page
+            ON pdf_annotations(file_id, page);
+
+        -- Citation graph (Phase 85). Edges between docs that cite
+        -- each other. Source is a file_id (the doc doing the citing);
+        -- target is either another file_id (when we resolved the
+        -- citation locally) OR a free-text 'Author 2024' style ref.
+        -- Built incrementally by the indexer for academic-style PDFs.
+        CREATE TABLE IF NOT EXISTS citations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            cited_file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+            cited_text TEXT NOT NULL,         -- "Smith et al., 2024" or full ref
+            year INTEGER,                     -- parsed year when known
+            created_at REAL NOT NULL,
+            UNIQUE(src_file_id, cited_text)
+        );
+        CREATE INDEX IF NOT EXISTS idx_citations_src
+            ON citations(src_file_id);
+        CREATE INDEX IF NOT EXISTS idx_citations_cited
+            ON citations(cited_file_id);
+
         -- Habits (Phase 79). Recurring intentions with streak tracking.
         -- A habit has a name, a target cadence (daily/weekly/N per
         -- week), and check-ins land in habit_checkins. Streaks and

@@ -57,6 +57,21 @@ def _link_after_index(conn, file_id: int) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("people: link failed for file_id=%s: %s",
                     file_id, e)
+    try:
+        # Phase 84/85 hook needs the file's path. We have file_id;
+        # pull path back so PDF annotation extraction can open the
+        # underlying file.
+        row = conn.execute(
+            "SELECT path FROM files WHERE id = ?", (file_id,),
+        ).fetchone()
+        if row:
+            from .pdf_annotations import process_after_index as _pa
+            _pa(conn, file_id, row["path"])
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "pdf_annotations: hook failed for file_id=%s: %s",
+            file_id, e,
+        )
 
 
 # Markitdown is the workhorse for documents; it handles PDF/DOCX/PPTX/HTML/etc.
