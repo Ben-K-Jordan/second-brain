@@ -701,6 +701,103 @@ def serve() -> None:
 
 
 @app.command()
+def chat(
+    question: str = typer.Argument(
+        None,
+        help="One-shot question. Omit for an interactive REPL.",
+    ),
+    no_rerank: bool = typer.Option(False, "--no-rerank"),
+) -> None:
+    """Ask your brain a question. Claude with `search_brain` as a tool;
+    answers cite their sources.
+
+    With no argument, drops into an interactive REPL. Conversation history
+    is kept in memory for the session; type `/reset` to start over.
+    Requires ANTHROPIC_API_KEY.
+    """
+    from .chat import stream_chat
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = None if no_rerank else make_reranker(cfg)
+    history: list[dict] = []
+
+    def run_turn(q: str) -> None:
+        # Stream tokens to stdout; print citations after.
+        last_citations: list[dict] = []
+        nonlocal_history: list[dict] | None = None
+        # We can't reassign `history` inside this closure easily without
+        # nonlocal — Typer's argument quirks make it cleaner to mutate.
+        printed_anything = False
+        for ev in stream_chat(cfg, conn, embedder, reranker, q, history):
+            if ev.kind == "text":
+                console.print(ev.data, end="", markup=False, highlight=False)
+                printed_anything = True
+            elif ev.kind == "search":
+                console.print(
+                    f"\n[dim]⌕ searching: {ev.data['query']} (k={ev.data['k']})[/]",
+                    highlight=False,
+                )
+            elif ev.kind == "results":
+                console.print(
+                    f"[dim]→ {len(ev.data)} chunk(s)[/]",
+                    highlight=False,
+                )
+            elif ev.kind == "done":
+                last_citations = ev.data.get("citations") or []
+                # Replace text if model emitted nothing during streaming
+                # (force-answer iteration after tool use).
+                if not printed_anything and ev.data.get("text"):
+                    console.print(ev.data["text"], markup=False, highlight=False)
+                nonlocal_history = ev.data.get("history")
+            elif ev.kind == "error":
+                console.print(f"\n[red]error:[/] {ev.data}")
+        console.print()  # newline after the answer
+        if last_citations:
+            console.print("[dim]Sources:[/]")
+            for i, c in enumerate(last_citations, 1):
+                console.print(
+                    f"  [dim]({i})[/] {c['file_path']} "
+                    f"[dim]· chunk {c['chunk_index']} · {c['score']:.3f}[/]"
+                )
+        if nonlocal_history is not None:
+            history.clear()
+            history.extend(nonlocal_history)
+
+    if question:
+        run_turn(question)
+        conn.close()
+        return
+
+    # REPL
+    console.print(
+        "[green]chat with your brain[/] · "
+        f"model={cfg.chat_model} · type [cyan]/reset[/] to clear history, "
+        "[cyan]/quit[/] or Ctrl-D to exit"
+    )
+    try:
+        while True:
+            try:
+                line = console.input("[bold]you ›[/] ")
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line in ("/quit", "/exit"):
+                break
+            if line == "/reset":
+                history.clear()
+                console.print("[dim]history cleared[/]")
+                continue
+            console.print("[bold]brain ›[/] ", end="")
+            run_turn(line)
+    finally:
+        conn.close()
+
+
+@app.command()
 def dashboard(
     port: int = typer.Option(8765, "--port", "-p", help="HTTP port."),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address (keep on localhost)."),

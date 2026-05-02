@@ -174,6 +174,14 @@ class Config:
     # Run on demand via `secondbrain tag`; defaults to Haiku 4.5 (~$0.0003/chunk).
     tag_model: str = "claude-haiku-4-5"
 
+    # Chat-with-your-brain: conversational interface over the index.
+    # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
+    # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
+    chat_model: str = "claude-sonnet-4-6"
+    chat_max_tokens: int = 1500
+    chat_max_tool_iterations: int = 4  # how many search rounds before forcing an answer
+    chat_search_k: int = 6  # default chunks per search_brain call
+
     # Daily spend caps in cents (so $5 = 500). Refuses paid calls once today's
     # cumulative spend hits the cap. Set to 0 to disable. Defense in depth -
     # catches runaway loops fast; not a substitute for provider-side billing limits.
@@ -380,6 +388,14 @@ def load_config(path: Path | None = None) -> Config:
             cfg.briefing_max_tokens = int(data["briefing_max_tokens"])
         if "tag_model" in data:
             cfg.tag_model = data["tag_model"]
+        if "chat_model" in data:
+            cfg.chat_model = data["chat_model"]
+        if "chat_max_tokens" in data:
+            cfg.chat_max_tokens = int(data["chat_max_tokens"])
+        if "chat_max_tool_iterations" in data:
+            cfg.chat_max_tool_iterations = int(data["chat_max_tool_iterations"])
+        if "chat_search_k" in data:
+            cfg.chat_search_k = int(data["chat_search_k"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

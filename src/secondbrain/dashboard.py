@@ -16,6 +16,7 @@ Pages:
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import threading
@@ -24,9 +25,11 @@ import urllib.parse
 import webbrowser
 from html import escape
 from pathlib import Path
+from typing import Any
 
 from .briefing import generate_briefing
 from .budget import spend_summary
+from .chat import stream_chat
 from .config import Config, load_config
 from .db import connect, init_schema, stats
 from .embedder import make_embedder
@@ -518,6 +521,168 @@ td.num { font-family: var(--mono); text-align: right; color: var(--amber); }
 """
 
 
+CHAT_JS = r"""
+(function () {
+    const log = document.getElementById('chat-log');
+    const form = document.getElementById('chat-form');
+    const input = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('chat-send');
+    if (!log || !form || !input) return;
+
+    function escapeHtml(s) {
+        return (s || "")
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function autoscroll() {
+        // Stay pinned to the bottom while the answer streams in.
+        log.scrollTop = log.scrollHeight;
+    }
+
+    function renderUser(text) {
+        const wrap = document.createElement('div');
+        wrap.className = 'chat-msg chat-user';
+        const bub = document.createElement('div');
+        bub.className = 'chat-bubble';
+        bub.textContent = text;
+        wrap.appendChild(bub);
+        log.appendChild(wrap);
+        autoscroll();
+    }
+
+    function newAssistantTurn() {
+        const wrap = document.createElement('div');
+        wrap.className = 'chat-msg chat-assistant';
+        const bub = document.createElement('div');
+        bub.className = 'chat-bubble chat-typing';
+        wrap.appendChild(bub);
+        const events = document.createElement('div');
+        events.className = 'chat-events';
+        wrap.appendChild(events);
+        const cites = document.createElement('div');
+        cites.className = 'chat-citations';
+        wrap.appendChild(cites);
+        log.appendChild(wrap);
+        autoscroll();
+        return { bub, events, cites };
+    }
+
+    function renderEvent(evEl, ev) {
+        if (ev.kind === 'search') {
+            const line = document.createElement('div');
+            line.className = 'chat-event-search';
+            line.textContent = `searching: ${ev.data.query} (k=${ev.data.k})`;
+            evEl.appendChild(line);
+        } else if (ev.kind === 'results') {
+            const line = document.createElement('div');
+            line.className = 'chat-event-result';
+            line.textContent = `→ ${ev.data.length} chunk(s)`;
+            evEl.appendChild(line);
+        }
+        autoscroll();
+    }
+
+    function renderCitations(citEl, citations) {
+        citEl.innerHTML = '';
+        if (!citations || citations.length === 0) return;
+        const header = document.createElement('div');
+        header.className = 'muted';
+        header.style.cssText = 'font-size:11px;letter-spacing:0.06em;text-transform:uppercase;';
+        header.textContent = `Sources (${citations.length})`;
+        citEl.appendChild(header);
+        citations.forEach((c) => {
+            const card = document.createElement('div');
+            card.className = 'chat-citation';
+            const link = document.createElement('a');
+            link.href = `/file?path=${encodeURIComponent(c.file_path)}`;
+            link.textContent = c.file_path + (c.chunk_index !== undefined ? ` · chunk ${c.chunk_index}` : '');
+            card.appendChild(link);
+            if (c.text) {
+                const sn = document.createElement('div');
+                sn.className = 'chat-citation-snippet';
+                sn.textContent = c.text;
+                card.appendChild(sn);
+            }
+            citEl.appendChild(card);
+        });
+    }
+
+    async function send(message) {
+        renderUser(message);
+        const { bub, events, cites } = newAssistantTurn();
+        const fd = new FormData();
+        fd.append('message', message);
+        let resp;
+        try {
+            resp = await fetch('/api/chat/message', { method: 'POST', body: fd });
+        } catch (e) {
+            bub.classList.remove('chat-typing');
+            bub.textContent = `[network error] ${e}`;
+            return;
+        }
+        if (!resp.ok || !resp.body) {
+            bub.classList.remove('chat-typing');
+            bub.textContent = `[error] HTTP ${resp.status}`;
+            return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let assembled = '';
+        let doneSeen = false;
+        while (!doneSeen) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop() || '';
+            for (const ln of lines) {
+                if (!ln.startsWith('data:')) continue;
+                const payload = ln.slice(5).trim();
+                if (payload === '[DONE]') { doneSeen = true; break; }
+                let ev;
+                try { ev = JSON.parse(payload); } catch (_) { continue; }
+                if (ev.kind === 'text') {
+                    assembled += ev.data;
+                    bub.textContent = assembled;
+                    autoscroll();
+                } else if (ev.kind === 'search' || ev.kind === 'results') {
+                    renderEvent(events, ev);
+                } else if (ev.kind === 'done') {
+                    if (ev.data && ev.data.text) {
+                        assembled = ev.data.text;
+                        bub.textContent = assembled;
+                    }
+                    renderCitations(cites, ev.data && ev.data.citations);
+                } else if (ev.kind === 'error') {
+                    assembled += `\n[error] ${ev.data}`;
+                    bub.textContent = assembled;
+                }
+            }
+        }
+        bub.classList.remove('chat-typing');
+    }
+
+    form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const text = (input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        sendBtn.disabled = true;
+        send(text).finally(() => { sendBtn.disabled = false; input.focus(); });
+    });
+    // Cmd/Ctrl-Enter to send.
+    input.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            e.preventDefault(); form.requestSubmit();
+        }
+    });
+    autoscroll();
+})();
+"""
+
+
 PALETTE_JS = r"""
 (function() {
     const backdrop = document.getElementById('palette-backdrop');
@@ -691,6 +856,7 @@ PALETTE_JS = r"""
 def _layout(title: str, body: str, active: str = "") -> str:
     nav_items = [
         ("Overview", "/"),
+        ("Chat", "/chat"),
         ("Search", "/search"),
         ("Graph", "/graph"),
         ("Entities", "/entities"),
@@ -1345,6 +1511,207 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 <p class="muted">{len(chunks)} chunks · {row["size"] / 1024:.1f} KB · {age:.1f}d ago</p>
 {body_chunks}"""
         return HTMLResponse(_layout(Path(path).name or path, body))
+
+    # --- Chat with your brain ----------------------------------------
+    # State lives in-process per session_id (cookie-based). Restarting the
+    # dashboard wipes it; that's fine for a single-user tool.
+    _chat_sessions: dict[str, list[dict]] = {}
+
+    def _chat_json_default(o: Any) -> Any:
+        """Make Anthropic SDK content-block objects JSON-serialisable.
+
+        We never *send* assistant content blocks to the client - only the
+        events we explicitly construct. But Pydantic BaseModel instances
+        sometimes leak through default=, so render them via .model_dump.
+        """
+        if hasattr(o, "model_dump"):
+            return o.model_dump(exclude_none=True)
+        if hasattr(o, "__dict__"):
+            return o.__dict__
+        return str(o)
+
+    def _serialize_chat_history(history: list[dict]) -> list[dict]:
+        """Persist a chat history into JSON-safe dicts.
+
+        Anthropic returns content blocks as Pydantic objects. We need to
+        convert them to plain dicts so the next request can pass them
+        straight back to the SDK without round-trip-via-pickle hazards.
+        """
+        out: list[dict] = []
+        for msg in history:
+            content = msg.get("content")
+            if isinstance(content, str):
+                out.append({"role": msg["role"], "content": content})
+                continue
+            if isinstance(content, list):
+                blocks: list[Any] = []
+                for b in content:
+                    if hasattr(b, "model_dump"):
+                        blocks.append(b.model_dump(exclude_none=True))
+                    elif isinstance(b, dict):
+                        blocks.append(b)
+                    else:
+                        blocks.append({"type": "text", "text": str(b)})
+                out.append({"role": msg["role"], "content": blocks})
+        return out
+
+    def _get_chat_session(request: Request, response_headers: dict | None = None) -> tuple[str, list[dict]]:
+        """Return (session_id, history) for this browser. Issues a fresh
+        session_id cookie on first contact (caller writes the Set-Cookie)."""
+        sid = request.cookies.get("sb_chat_sid", "")
+        if not sid or sid not in _chat_sessions:
+            sid = secrets.token_urlsafe(16)
+            _chat_sessions[sid] = []
+        return sid, _chat_sessions[sid]
+
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat_page(request: Request):
+        cfg, _, _, _ = get_state()
+        sid, history = _get_chat_session(request)
+        # Render any existing turns from the session so a refresh keeps state.
+        rendered = ""
+        for msg in history:
+            role = msg.get("role")
+            if role == "user":
+                content = msg.get("content")
+                txt = content if isinstance(content, str) else ""
+                if txt:
+                    rendered += (
+                        f'<div class="chat-msg chat-user"><div class="chat-bubble">'
+                        f'{escape(txt)}</div></div>'
+                    )
+            elif role == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    txt = "".join(
+                        getattr(b, "text", "") if hasattr(b, "text")
+                        else (b.get("text", "") if isinstance(b, dict) else "")
+                        for b in content
+                    )
+                    if txt.strip():
+                        rendered += (
+                            f'<div class="chat-msg chat-assistant"><div class="chat-bubble">'
+                            f'{escape(txt)}</div></div>'
+                        )
+        body = f"""
+<h1>Chat with your brain</h1>
+<p class="muted" style="margin-top:-8px;">
+    Conversational Q&amp;A grounded in everything you've indexed. Uses
+    <code>{escape(cfg.chat_model)}</code> with <code>search_brain</code> as a
+    tool — answers cite their sources. History resets on page reload only if
+    you click <a href="/chat/reset">reset</a>.
+</p>
+
+<div id="chat-log" class="chat-log">{rendered or '<div class="empty">Ask anything that lives in your brain.</div>'}</div>
+
+<form id="chat-form" class="chat-form">
+    <textarea id="chat-input" rows="2" placeholder="What was that thing about Voyage rate limits?" autofocus></textarea>
+    <div class="chat-form-row">
+        <button type="submit" id="chat-send">Send</button>
+        <a href="/chat/reset" class="chat-reset">reset conversation</a>
+    </div>
+</form>
+
+<style>
+.chat-log {{
+    display: flex; flex-direction: column; gap: 14px;
+    padding: 16px; min-height: 280px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px;
+}}
+.chat-msg {{ display: flex; }}
+.chat-user {{ justify-content: flex-end; }}
+.chat-bubble {{
+    max-width: 80%; padding: 10px 14px; border-radius: 4px;
+    border: 1px solid var(--border); white-space: pre-wrap; line-height: 1.55;
+}}
+.chat-user .chat-bubble {{ background: #16201a; border-color: var(--green-dim); }}
+.chat-assistant .chat-bubble {{ background: #111; }}
+.chat-events {{
+    margin-top: 6px; font-size: 11.5px; color: #888;
+    border-left: 2px solid var(--border); padding-left: 10px;
+}}
+.chat-event-search::before {{ content: "⌕ "; color: var(--green); }}
+.chat-event-result {{ font-family: var(--mono); margin-left: 10px; opacity: 0.85; }}
+.chat-citations {{ margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }}
+.chat-citation {{
+    background: #0f140f; border: 1px solid var(--border); border-left: 3px solid var(--green-dim);
+    padding: 8px 12px; font-size: 12.5px;
+}}
+.chat-citation a {{ color: var(--green); }}
+.chat-citation .chat-citation-snippet {{
+    margin-top: 6px; color: #aaa; white-space: pre-wrap; font-family: var(--mono);
+    font-size: 11.5px; max-height: 80px; overflow: hidden;
+}}
+.chat-form {{
+    margin-top: 14px; display: flex; flex-direction: column; gap: 8px;
+}}
+.chat-form textarea {{
+    width: 100%; box-sizing: border-box; resize: vertical;
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 10px 12px; font: 14px var(--mono);
+}}
+.chat-form-row {{ display: flex; align-items: center; gap: 14px; }}
+.chat-reset {{ color: #888; font-size: 12px; }}
+.chat-typing::after {{
+    content: "▮"; color: var(--green);
+    animation: chat-blink 1s steps(1) infinite;
+}}
+@keyframes chat-blink {{ 50% {{ opacity: 0; }} }}
+</style>
+
+<script>{CHAT_JS}</script>
+"""
+        html = _layout("Chat", body, "chat")
+        resp = HTMLResponse(html)
+        # Ensure the session cookie is set on first visit.
+        resp.set_cookie(
+            "sb_chat_sid", sid, httponly=True, samesite="strict", path="/",
+        )
+        return resp
+
+    @app.get("/chat/reset", response_class=HTMLResponse)
+    def chat_reset(request: Request):
+        sid = request.cookies.get("sb_chat_sid", "")
+        _chat_sessions.pop(sid, None)
+        return RedirectResponse(url="/chat", status_code=303)
+
+    @app.post("/api/chat/message")
+    async def chat_message(request: Request):
+        """SSE-style streaming: emits one JSON line per event, then [DONE].
+
+        Body: form field ``message``. Session cookie selects the history.
+        """
+        from fastapi.responses import StreamingResponse
+
+        cfg, conn, embedder, reranker = get_state()
+        sid, history = _get_chat_session(request)
+        form = await request.form()
+        user_msg = (form.get("message") or "").strip()
+
+        def gen():
+            if not user_msg:
+                yield 'data: {"kind":"error","data":"empty message"}\n\n'
+                yield 'data: [DONE]\n\n'
+                return
+            updated_history: list[dict] | None = None
+            for event in stream_chat(cfg, conn, embedder, reranker, user_msg, history):
+                payload = json.dumps(
+                    {"kind": event.kind, "data": event.data},
+                    default=_chat_json_default,
+                )
+                yield f"data: {payload}\n\n"
+                if event.kind == "done" and isinstance(event.data, dict):
+                    updated_history = event.data.get("history")
+            if updated_history is not None:
+                # Persist the new history for the session. The Anthropic SDK
+                # returns content-block objects; convert to plain dicts so
+                # they survive a round-trip through the next request.
+                _chat_sessions[sid] = _serialize_chat_history(updated_history)
+            yield 'data: [DONE]\n\n'
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):

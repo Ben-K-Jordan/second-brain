@@ -160,6 +160,28 @@ def search_brain(
 
 
 @mcp.tool()
+def ask_brain(question: str) -> str:
+    """One-shot grounded Q&A: ask Claude (Sonnet 4.6 by default) to answer a
+    question by searching your indexed knowledge.
+
+    Use this instead of ``search_brain`` when you want a synthesized answer
+    rather than raw chunks. The model decides how many searches to run, then
+    writes a concise answer with explicit citations to the chunks it used.
+    Costs a few cents per call against your Anthropic budget.
+    """
+    from .chat import ask_brain as _ask
+
+    cfg, conn, embedder, reranker = _get_state()
+    response = _ask(cfg, conn, embedder, reranker, question)
+    if not response.citations:
+        return response.text
+    cite_lines = ["", "## Sources"]
+    for i, c in enumerate(response.citations, 1):
+        cite_lines.append(f"({i}) {c.file_path} · chunk {c.chunk_index} · score {c.score:.3f}")
+    return response.text + "\n" + "\n".join(cite_lines)
+
+
+@mcp.tool()
 def vector_search(query: str, k: int = 10) -> str:
     """Pure semantic (vector) search. Best for conceptual questions where exact wording differs."""
     cfg, conn, embedder, reranker = _get_state()
