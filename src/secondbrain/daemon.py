@@ -387,6 +387,24 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _todoist_if_due(cfg, conn),
     ))
 
+    # Phase 82: email triage — classify recent IMAP docs.
+    from .email_assist import classify_due as _email_classify
+    sched.register(Job(
+        name="email_triage",
+        schedule=IntervalSchedule(seconds=15 * 60),
+        fn=lambda cfg, conn: _email_classify(conn, cfg),
+    ))
+
+    # Phase 83: draft generation. Slower cadence — Sonnet calls cost
+    # more than Haiku triage; spread out so cumulative spend stays
+    # well below the 'email_draft' bucket cap.
+    from .email_assist import generate_drafts_due as _email_drafts
+    sched.register(Job(
+        name="email_drafts",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _email_drafts(conn, cfg),
+    ))
+
     return sched
 
 
