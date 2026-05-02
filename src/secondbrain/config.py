@@ -248,6 +248,10 @@ class Config:
     # numeric metrics to the health_metrics table for trend queries.
     oura_window_days: int = 90
 
+    # Phase 78 — Readwise highlights. READWISE_TOKEN env var enables
+    # the connector. Window controls how far back to pull each sync.
+    readwise_window_days: int = 365
+
     # Resume-fit scoring. Drop one or many resumes (PM-flavoured, eng-
     # flavoured, etc.) here; the watchlist runner embeds them and scores
     # job postings against them so "great fit" / "stretch" labels appear
@@ -611,6 +615,8 @@ def load_config(path: Path | None = None) -> Config:
             cfg.canvas_window_days = int(data["canvas_window_days"])
         if "oura_window_days" in data:
             cfg.oura_window_days = int(data["oura_window_days"])
+        if "readwise_window_days" in data:
+            cfg.readwise_window_days = int(data["readwise_window_days"])
         if "capture_imap_folders" in data:
             cfg.capture_imap_folders = tuple(data["capture_imap_folders"])
         if "photo_capture_folder" in data:

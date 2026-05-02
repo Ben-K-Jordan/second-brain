@@ -377,6 +377,16 @@ def _build_daemon_scheduler(
         ),
     ))
 
+    # Phase 76: Todoist sync — push new tasks + pull remote completions.
+    # 30-min cadence is responsive enough for "did I just finish that
+    # in Todoist?" without burning through the rate limit.
+    from .tasks_sync import run_if_due as _todoist_if_due
+    sched.register(Job(
+        name="todoist_sync",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda cfg, conn: _todoist_if_due(cfg, conn),
+    ))
+
     return sched
 
 

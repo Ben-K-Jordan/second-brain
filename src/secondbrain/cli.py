@@ -1850,6 +1850,53 @@ def health_summary(
 
 
 @app.command()
+def vault(
+    out: Path = typer.Argument(
+        ..., help="Vault root directory (created if missing).",
+    ),
+    clean: bool = typer.Option(
+        False, "--clean",
+        help="Wipe the vault first — useful when paths shifted.",
+    ),
+    limit: int = typer.Option(
+        None, "--limit",
+        help="Cap files exported (testing).",
+    ),
+) -> None:
+    """Phase 77: snapshot the brain to an Obsidian-compatible Markdown
+    vault. Each file gets YAML frontmatter + body + Related backlinks
+    + People mentions rendered as wikilinks."""
+    from .vault_export import export_vault
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    result = export_vault(conn, out, clean=clean, limit=limit)
+    console.print(
+        f"[green]✓[/] Wrote [bold]{result.files_written}[/] file(s) "
+        f"({result.bytes_written / 1024:.1f} KB) to [cyan]{result.vault_root}[/]",
+    )
+    if result.errors:
+        console.print(f"[yellow]{result.errors} error(s) skipped.[/]")
+    conn.close()
+
+
+@app.command(name="todoist-sync")
+def todoist_sync() -> None:
+    """Phase 76: bidirectional Todoist sync. Push open tasks → Todoist,
+    pull remote completions → mark done locally. Requires TODOIST_TOKEN."""
+    from .tasks_sync import sync as ts_sync
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    result = ts_sync(conn)
+    console.print(
+        f"[green]✓[/] Pushed {result.pushed}, "
+        f"pulled {result.pulled_done} done, errors {result.errors}",
+    )
+    conn.close()
+
+
+@app.command()
 def review(
     markdown: bool = typer.Option(
         False, "--markdown/--no-markdown",
