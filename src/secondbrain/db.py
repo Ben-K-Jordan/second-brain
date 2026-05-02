@@ -200,16 +200,25 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
     if "start_offset" not in cols:
         conn.execute("ALTER TABLE chunks ADD COLUMN start_offset INTEGER")
 
+    # Migration: chat_conversations.system_prompt was added in Phase 24.
+    # Older DBs created with Phase 18 still need the column.
+    chat_cols = {row["name"] for row in conn.execute("PRAGMA table_info(chat_conversations)")}
+    if chat_cols and "system_prompt" not in chat_cols:
+        conn.execute("ALTER TABLE chat_conversations ADD COLUMN system_prompt TEXT")
+
     # Chat conversations: each conversation has many turns, each turn has a
     # role (user / assistant) and a content blob. Citations are stored per
     # assistant turn so we can re-render past chats with their sources.
+    # An optional system_prompt overrides the default chat persona for this
+    # one conversation ("you are my code reviewer", etc.).
     # Kept in the same DB so a `secondbrain reset` clears chat history too.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS chat_conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            system_prompt TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chat_conv_updated
             ON chat_conversations(updated_at DESC);
@@ -559,6 +568,36 @@ def chat_rename_conversation(
         (title, conversation_id),
     )
     conn.commit()
+
+
+def chat_set_system_prompt(
+    conn: sqlite3.Connection, conversation_id: int, system_prompt: str | None,
+) -> None:
+    """Override the default chat persona for a single conversation.
+
+    Pass ``None`` (or empty string) to clear and revert to the default
+    system prompt baked into ``chat.py``.
+    """
+    if system_prompt is not None and not system_prompt.strip():
+        system_prompt = None
+    conn.execute(
+        "UPDATE chat_conversations SET system_prompt = ? WHERE id = ?",
+        (system_prompt, conversation_id),
+    )
+    conn.commit()
+
+
+def chat_get_system_prompt(
+    conn: sqlite3.Connection, conversation_id: int,
+) -> str | None:
+    row = conn.execute(
+        "SELECT system_prompt FROM chat_conversations WHERE id = ?",
+        (conversation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    val = row["system_prompt"]
+    return val if val and val.strip() else None
 
 
 # --- Click-feedback ---------------------------------------------------

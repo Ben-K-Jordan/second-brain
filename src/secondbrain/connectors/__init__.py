@@ -102,6 +102,7 @@ def all_connectors() -> list[type[Connector]]:
     from .bluesky import BlueskyConnector
     from .browser import BrowserHistoryConnector
     from .calendar import CalendarConnector
+    from .chat_history import ChatHistoryConnector
     from .github import GitHubConnector
     from .gmail import GmailConnector
     from .google_calendar import GoogleCalendarConnector
@@ -119,6 +120,7 @@ def all_connectors() -> list[type[Connector]]:
 
     return [
         # Local / fast first
+        ChatHistoryConnector,     # always enabled; reads our own DB
         BrowserHistoryConnector,
         ObsidianConnector,
         XArchiveConnector,

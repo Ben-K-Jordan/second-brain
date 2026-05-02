@@ -722,6 +722,15 @@ CHAT_JS = r"""
             e.preventDefault(); form.requestSubmit();
         }
     });
+    // System-prompt editor toggle.
+    const editLink = document.getElementById('chat-edit-prompt');
+    const spForm = document.getElementById('chat-sp-form');
+    if (editLink && spForm) {
+        editLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            spForm.style.display = spForm.style.display === 'none' ? 'flex' : 'none';
+        });
+    }
     autoscroll();
 })();
 """
@@ -1687,16 +1696,37 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return cid
 
     def _chat_page_body(cfg: Config, history_html: str, cid: int | None,
-                       title: str | None) -> str:
+                       title: str | None, system_prompt: str | None = None) -> str:
         """Shared HTML for /chat (new) and /chat/N (existing)."""
         title_bar = ""
         if cid is not None:
+            sp_indicator = (
+                ' <span class="chat-sp-indicator" title="Custom system prompt active">●</span>'
+                if system_prompt else ""
+            )
             title_bar = (
                 f'<div class="chat-titlebar">'
-                f'  <span class="chat-title">{escape(title or "(untitled)")}</span>'
+                f'  <span class="chat-title">{escape(title or "(untitled)")}{sp_indicator}</span>'
+                f'  <a href="#" class="chat-titlebar-link" id="chat-edit-prompt">edit prompt</a>'
                 f'  <a href="/chat/list" class="chat-titlebar-link">all chats</a>'
                 f'  <a href="/chat" class="chat-titlebar-link">+ new</a>'
                 f'</div>'
+                # Hidden by default; toggled open by chat-edit-prompt link.
+                f'<form id="chat-sp-form" method="post" action="/chat/{cid}/system_prompt" '
+                f'      class="chat-sp-form" style="display:none;">'
+                f'  <label class="muted">Custom system prompt for this conversation only:</label>'
+                f'  <textarea name="system_prompt" rows="4" '
+                f'            placeholder="e.g. You are my code reviewer. Always cite specific lines.">'
+                f'{escape(system_prompt or "")}</textarea>'
+                f'  <div class="chat-form-row">'
+                f'    <button type="submit">Save</button>'
+                f'    <button type="submit" name="clear" value="1" '
+                f'            class="chat-sp-clear">Clear (use default)</button>'
+                f'    <span class="muted" style="font-size:11px;">'
+                f'      Empty = use the built-in search-grounded brain prompt.'
+                f'    </span>'
+                f'  </div>'
+                f'</form>'
             )
         else:
             title_bar = (
@@ -1736,8 +1766,22 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     background: #0c0c0c; font-size: 12.5px;
 }}
 .chat-title {{ flex: 1; color: var(--green); font-family: var(--mono); }}
-.chat-titlebar-link {{ color: #888; font-size: 12px; }}
+.chat-titlebar-link {{ color: #888; font-size: 12px; cursor: pointer; }}
 .chat-titlebar-link:hover {{ color: var(--green); }}
+.chat-sp-indicator {{ color: var(--green); margin-left: 4px; }}
+.chat-sp-form {{
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 0 0 14px 0; padding: 12px;
+    border: 1px solid var(--green-dim); border-radius: 4px;
+    background: #0a140a;
+}}
+.chat-sp-form textarea {{
+    width: 100%; box-sizing: border-box; resize: vertical;
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 8px 10px; font: 12.5px var(--mono);
+}}
+.chat-sp-clear {{ background: transparent; color: #888; }}
 .chat-log {{
     display: flex; flex-direction: column; gap: 14px;
     padding: 16px; min-height: 280px;
@@ -1849,7 +1893,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/chat/{cid:int}", response_class=HTMLResponse)
     def chat_view(cid: int, request: Request):
-        from .db import chat_get_conversation
+        from .db import chat_get_conversation, chat_get_system_prompt
 
         cfg, conn, _, _ = get_state()
         row = chat_get_conversation(conn, cid)
@@ -1858,7 +1902,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 _layout("Chat", "<h1>Not found</h1>", "chat"), status_code=404,
             )
         history_html = _render_history_html(conn, cid)
-        body = _chat_page_body(cfg, history_html, cid, row["title"])
+        sp = chat_get_system_prompt(conn, cid)
+        body = _chat_page_body(cfg, history_html, cid, row["title"], system_prompt=sp)
         resp = HTMLResponse(_layout("Chat", body, "chat"))
         # Stick the user to this conversation for subsequent message posts.
         resp.set_cookie(
@@ -1866,6 +1911,22 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             httponly=True, samesite="strict", path="/",
         )
         return resp
+
+    @app.post("/chat/{cid:int}/system_prompt")
+    async def chat_set_prompt(cid: int, request: Request):
+        """Save (or clear) the per-conversation system prompt."""
+        from .db import chat_get_conversation, chat_set_system_prompt
+
+        _, conn, _, _ = get_state()
+        if chat_get_conversation(conn, cid) is None:
+            return HTMLResponse("<h1>Not found</h1>", status_code=404)
+        form = await request.form()
+        if form.get("clear"):
+            chat_set_system_prompt(conn, cid, None)
+        else:
+            sp = (form.get("system_prompt") or "").strip()
+            chat_set_system_prompt(conn, cid, sp or None)
+        return RedirectResponse(url=f"/chat/{cid}", status_code=303)
 
     @app.post("/chat/{cid:int}/delete")
     def chat_delete(cid: int):
@@ -1891,6 +1952,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .db import (
             chat_append_message,
             chat_create_conversation,
+            chat_get_system_prompt,
         )
 
         cfg, conn, embedder, reranker = get_state()
@@ -1908,6 +1970,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
         # Replay history from DB so multi-turn context works across reloads.
         history = _load_history_from_db(conn, active_cid) if active_cid else []
+        system_prompt = (
+            chat_get_system_prompt(conn, active_cid) if active_cid else None
+        )
 
         def gen():
             if not user_msg:
@@ -1921,7 +1986,10 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             )
             updated_history: list[dict] | None = None
             citations_for_assistant: list[dict] = []
-            for event in stream_chat(cfg, conn, embedder, reranker, user_msg, history):
+            for event in stream_chat(
+                cfg, conn, embedder, reranker, user_msg, history,
+                system_prompt=system_prompt,
+            ):
                 payload = json.dumps(
                     {"kind": event.kind, "data": event.data},
                     default=_chat_json_default,

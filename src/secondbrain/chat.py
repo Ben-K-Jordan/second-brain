@@ -185,6 +185,7 @@ def stream_chat(
     reranker: Reranker | None,
     user_message: str,
     history: list[dict] | None = None,
+    system_prompt: str | None = None,
 ) -> Iterator[ChatTurnEvent]:
     """Run one chat turn, streaming events to the caller.
 
@@ -194,6 +195,11 @@ def stream_chat(
     (with possible tool-call rounds), and yield a final ``done`` event whose
     data includes the assistant's reply and updated history. The caller
     should replace its history with that updated list.
+
+    ``system_prompt`` overrides the default search-grounded persona. Passing
+    e.g. "You are my code reviewer" lets the user keep one conversation
+    pinned to a different role without burning through chat history. None
+    means "use the built-in default".
     """
     if not user_message.strip():
         yield ChatTurnEvent("error", "empty user message")
@@ -215,6 +221,10 @@ def stream_chat(
     messages = _normalize_history(history)
     messages.append({"role": "user", "content": user_message})
 
+    # Use the conversation-specific persona when provided. Default falls
+    # back to the search-grounded brain prompt.
+    active_system_prompt = (system_prompt or "").strip() or _SYSTEM_PROMPT
+
     citations_by_id: dict[int, Citation] = {}
     final_text_parts: list[str] = []
 
@@ -222,14 +232,28 @@ def stream_chat(
         # Force a no-tools final answer on the last allowed iteration so the
         # model can't loop us forever even if its instruction-following slips.
         force_answer = iteration == cfg.chat_max_tool_iterations
+        # True SDK streaming: emit text-delta events as they arrive instead
+        # of waiting for the full response. The dashboard's SSE consumer
+        # picks up each delta and paints it into the bubble immediately,
+        # so long answers feel instant rather than batchy.
         try:
-            response = client.messages.create(
+            with client.messages.stream(
                 model=cfg.chat_model,
                 max_tokens=cfg.chat_max_tokens,
-                system=_SYSTEM_PROMPT,
+                system=active_system_prompt,
                 tools=[] if force_answer else [_SEARCH_TOOL],
                 messages=messages,
-            )
+            ) as stream:
+                this_iter_text: list[str] = []
+                # text_stream yields plain str deltas - one per token-ish
+                # chunk. We only emit non-empty deltas to keep the wire quiet.
+                for delta in stream.text_stream:
+                    if not delta:
+                        continue
+                    this_iter_text.append(delta)
+                    yield ChatTurnEvent("text", delta)
+                # After exit the stream has fully resolved the final Message.
+                response = stream.get_final_message()
         except anthropic.APIError as e:
             log.warning("chat API call failed: %s", e)
             yield ChatTurnEvent("error", f"Anthropic API error: {e}")
@@ -245,13 +269,13 @@ def stream_chat(
         except Exception as e:  # noqa: BLE001
             log.warning("chat usage recording failed: %s", e)
 
-        # Stream text blocks first, defer tool_use blocks for after.
+        # Pull text into the running tally and surface tool calls (which
+        # don't appear in text_stream and live only in the resolved blocks).
         tool_calls: list[Any] = []
         for block in response.content:
             if block.type == "text":
                 if block.text:
                     final_text_parts.append(block.text)
-                    yield ChatTurnEvent("text", block.text)
             elif block.type == "tool_use":
                 tool_calls.append(block)
 
@@ -345,6 +369,7 @@ def ask_brain(
     reranker: Reranker | None,
     question: str,
     history: list[dict] | None = None,
+    system_prompt: str | None = None,
 ) -> ChatResponse:
     """One-shot blocking version of ``stream_chat`` for MCP / scripts.
 
@@ -357,7 +382,10 @@ def ask_brain(
     iterations = 0
     error: str | None = None
 
-    for event in stream_chat(cfg, conn, embedder, reranker, question, history):
+    for event in stream_chat(
+        cfg, conn, embedder, reranker, question, history,
+        system_prompt=system_prompt,
+    ):
         if event.kind == "text":
             text_parts.append(event.data)
         elif event.kind == "search":

@@ -26,15 +26,15 @@ def test_registry_is_nonempty_and_unique():
 
 def test_each_connector_implements_protocol(tmp_cfg):
     """Every registered connector should be runtime-Protocol compatible
-    AND report disabled when the env is empty."""
+    AND report disabled when the env is empty (with a few documented
+    exceptions: browser, which scans for installed browser profiles, and
+    chat_history, which reads our own DB and is always enabled)."""
+    always_enabled = {"browser", "chat_history"}
     for cls in all_connectors():
         instance = cls()
         assert isinstance(instance, Connector), f"{cls.__name__} doesn't satisfy Connector"
         assert isinstance(instance.name, str) and instance.name
-        # No env vars are set thanks to the autouse fixture; everything that
-        # needs creds should report disabled. (browser is the exception:
-        # it returns True if any browser profile exists on disk.)
-        if instance.name == "browser":
+        if instance.name in always_enabled:
             continue
         assert instance.is_enabled(tmp_cfg) is False, (
             f"{instance.name} should be disabled when its env / config is empty"
