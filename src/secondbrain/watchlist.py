@@ -30,6 +30,7 @@ from .budget import BudgetExceededError, daily_spend_cents
 from .chat import ChatResponse, ask_brain
 from .config import Config
 from .db import (
+    applied_role_urls,
     connect,
     init_schema,
     watchlist_due,
@@ -42,6 +43,7 @@ from .db import (
 from .embedder import make_embedder
 from .notify import notify
 from .reranker import make_reranker
+from .resume import load_resumes, score_against_text
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +104,15 @@ def run_watchlist(
     except Exception:  # noqa: BLE001
         pass
 
-    cites_payload = [
-        {
+    # Resume-fit scoring (Phase 37): for each citation, pick the best
+    # resume (when multiple are configured) and tag the citation with its
+    # cosine score + label. Cheap — one embed per citation, no LLM call.
+    # Skipped automatically when no resume_paths are configured.
+    resumes = load_resumes(cfg, embedder)
+
+    cites_payload: list[dict] = []
+    for c in response.citations:
+        d: dict = {
             "kind": c.kind,
             "file_path": c.file_path,
             "url": c.url,
@@ -112,8 +121,16 @@ def run_watchlist(
             "score": round(c.score, 4),
             "text": c.text if len(c.text) <= 600 else c.text[:600] + "…",
         }
-        for c in response.citations
-    ]
+        if resumes and c.text:
+            try:
+                fit = score_against_text(resumes, embedder, c.text)
+                if fit is not None:
+                    d["fit_score"] = round(fit[0], 4)
+                    d["fit_resume"] = fit[1]
+                    d["fit_label"] = fit[2]
+            except Exception as e:  # noqa: BLE001
+                log.warning("fit scoring failed for %s: %s", c.file_path, e)
+        cites_payload.append(d)
 
     # Diff against the previous successful run: which citation paths
     # weren't in the prior run? Used by the dashboard's "what's new"
@@ -170,26 +187,40 @@ def _compute_new_paths(
     conn, watchlist_id: int, this_run_id: int,
     cites_payload: list[dict],
 ) -> tuple[list[str], int]:
-    """Return (new_paths, new_count): paths in this run not in the previous.
+    """Return (new_paths, new_count): paths in this run not in the previous,
+    and not already in the user's application tracker.
 
     Identity = file_path (which is the URL for web citations and the
     virtual_path for brain citations). On first run with no prior, we
     treat every citation as new since there's nothing to diff against -
     the caller decides whether to notify.
+
+    Application-aware filtering: if the user has saved a job application
+    with role_url matching one of this run's citations, that citation is
+    NOT counted as new. So a watchlist that surfaces "PM internships" won't
+    keep flagging roles you've already applied to.
     """
     this_paths = [c.get("file_path") for c in cites_payload if c.get("file_path")]
     if not this_paths:
         return [], 0
+
+    # Pull "already applied" set once. Empty when the table is fresh.
+    try:
+        applied = applied_role_urls(conn)
+    except Exception:  # noqa: BLE001
+        applied = set()
+
     prev = watchlist_previous_run(conn, watchlist_id, this_run_id)
     if prev is None or not prev["citations_json"]:
-        # Nothing to diff against - everything is "new".
-        return list(this_paths), len(this_paths)
+        # Nothing to diff against - everything not already-applied is "new".
+        new_paths = [p for p in this_paths if p not in applied]
+        return new_paths, len(new_paths)
     try:
         prev_cites = json.loads(prev["citations_json"]) or []
     except json.JSONDecodeError:
         prev_cites = []
     prev_paths = {c.get("file_path") for c in prev_cites if c.get("file_path")}
-    new_paths = [p for p in this_paths if p not in prev_paths]
+    new_paths = [p for p in this_paths if p not in prev_paths and p not in applied]
     return new_paths, len(new_paths)
 
 

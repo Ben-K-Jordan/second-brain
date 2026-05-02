@@ -702,6 +702,129 @@ def serve() -> None:
     run()
 
 
+apply_app = typer.Typer(
+    no_args_is_help=True,
+    help="Track jobs you've applied to. The watchlist agent skips "
+         "already-applied roles when surfacing 'new' items, and the chat "
+         "agent can answer 'have I applied to X?' against this list.",
+)
+app.add_typer(apply_app, name="apply")
+
+
+@apply_app.command("add")
+def apply_add(
+    company: str = typer.Argument(..., help="Company name (e.g. 'Anthropic')."),
+    role: str = typer.Argument(..., help="Role title (e.g. 'PM Intern, Summer 2026')."),
+    url: str | None = typer.Option(None, "--url", "-u", help="Canonical posting URL."),
+    source: str | None = typer.Option(
+        None, "--source", "-s",
+        help="Where you found it: 'linkedin', 'greenhouse:anthropic', 'referral', etc.",
+    ),
+    notes: str | None = typer.Option(None, "--notes", "-n"),
+) -> None:
+    """Record a new application."""
+    from .db import application_create
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    aid = application_create(
+        conn, company=company, role_title=role,
+        role_url=url, source=source, notes=notes,
+    )
+    console.print(
+        f"[green]Recorded[/] application #{aid}: [bold]{company}[/] · {role}"
+    )
+    if url:
+        console.print(f"  url: [dim]{url}[/]")
+    conn.close()
+
+
+@apply_app.command("list")
+def apply_list(
+    status: str | None = typer.Option(None, "--status"),
+    company: str | None = typer.Option(None, "--company"),
+) -> None:
+    """List applications, optionally filtered by status / company."""
+    from .db import application_list
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = application_list(conn, status=status, company=company)
+    if not rows:
+        console.print("[yellow]No applications match.[/]")
+        return
+    table = Table(show_header=True, box=None, title="Applications")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("company")
+    table.add_column("role")
+    table.add_column("status", justify="center")
+    table.add_column("applied", style="dim")
+    table.add_column("source", style="dim")
+    for r in rows:
+        when = time.strftime(
+            "%Y-%m-%d", time.localtime(r["applied_at"]),
+        )
+        status_color = {
+            "applied": "cyan", "screen": "yellow", "interview": "yellow",
+            "offer": "green", "rejected": "red", "withdrawn": "dim",
+            "ghosted": "dim",
+        }.get(r["status"], "white")
+        table.add_row(
+            str(r["id"]),
+            r["company"],
+            r["role_title"][:50],
+            f"[{status_color}]{r['status']}[/]",
+            when,
+            r["source"] or "",
+        )
+    console.print(table)
+    console.print(f"[dim]{len(rows)} application(s)[/]")
+    conn.close()
+
+
+@apply_app.command("status")
+def apply_status(
+    application_id: int = typer.Argument(..., help="Application id."),
+    new_status: str = typer.Argument(
+        ..., help="New status: applied / screen / interview / offer / rejected / withdrawn / ghosted",
+    ),
+    notes: str | None = typer.Option(None, "--notes", "-n"),
+) -> None:
+    """Update an application's status (e.g. moved from 'applied' to 'interview')."""
+    from .db import APPLICATION_STATUSES, application_get, application_set_status
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if new_status not in APPLICATION_STATUSES:
+        console.print(
+            f"[red]Unknown status[/] {new_status!r}. "
+            f"Valid: {', '.join(APPLICATION_STATUSES)}"
+        )
+        conn.close()
+        raise typer.Exit(code=1)
+    if application_get(conn, application_id) is None:
+        console.print(f"[red]Application #{application_id} not found.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    application_set_status(conn, application_id, new_status, notes=notes)
+    console.print(f"[green]Updated[/] #{application_id} → {new_status}")
+    conn.close()
+
+
+@apply_app.command("remove")
+def apply_remove(
+    application_id: int = typer.Argument(..., help="Application id."),
+) -> None:
+    """Delete an application record."""
+    from .db import application_delete
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    application_delete(conn, application_id)
+    console.print(f"[green]Deleted[/] application #{application_id}.")
+    conn.close()
+
+
 digest_app = typer.Typer(
     no_args_is_help=True,
     help="Send / inspect the daily watchlist email digest. Configure SMTP "

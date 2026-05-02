@@ -102,6 +102,7 @@ def all_connectors() -> list[type[Connector]]:
     from .bluesky import BlueskyConnector
     from .browser import BrowserHistoryConnector
     from .calendar import CalendarConnector
+    from .canvas import CanvasConnector
     from .chat_history import ChatHistoryConnector
     from .github import GitHubConnector
     from .gmail import GmailConnector
@@ -130,6 +131,7 @@ def all_connectors() -> list[type[Connector]]:
         XArchiveConnector,
         # Network-bound APIs (small/cheap first)
         JobsConnector,            # public ATS APIs - quick
+        CanvasConnector,          # LMS API - quick, scoped to active courses
         NewsConnector,            # NewsAPI.org - quick
         RSSConnector,             # generic feeds - usually quick
         GitHubConnector,

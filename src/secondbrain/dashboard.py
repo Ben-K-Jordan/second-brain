@@ -927,6 +927,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Chat", "/chat"),
         ("Search", "/search"),
         ("Watch", "/watch"),
+        ("Apps", "/applications"),
         ("Graph", "/graph"),
         ("Entities", "/entities"),
         ("Folders", "/folders"),
@@ -2125,19 +2126,34 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                             ' <span class="watch-cite-new">NEW</span>'
                             if is_new else ""
                         )
+                        # Fit chip — only when a resume is configured and
+                        # the watchlist runner attached fit_label to this
+                        # citation.
+                        fit_chip = ""
+                        if c.get("fit_label"):
+                            klass = (
+                                "watch-cite-fit "
+                                f"watch-cite-fit-{c['fit_label'].split()[0]}"
+                            )
+                            fit_chip = (
+                                f' <span class="{klass}" '
+                                f'title="resume: {escape(c.get("fit_resume", ""))} '
+                                f'· cosine {c.get("fit_score", 0):.2f}">'
+                                f'{escape(c["fit_label"])}</span>'
+                            )
                         if kind == "web":
                             url = c.get("url") or c.get("file_path", "")
                             label = c.get("page_title") or url
                             cite_pieces.append(
                                 f'<a href="{escape(url)}" target="_blank" '
                                 f'rel="noopener noreferrer" class="watch-cite watch-cite-web">'
-                                f'↗ {escape(label)}{new_chip}</a>'
+                                f'↗ {escape(label)}{new_chip}{fit_chip}</a>'
                             )
                         else:
                             fp = c.get("file_path", "")
                             cite_pieces.append(
                                 f'<a href="/file?path={urllib.parse.quote_plus(fp)}" '
-                                f'class="watch-cite">{escape(fp)}{new_chip}</a>'
+                                f'class="watch-cite">{escape(fp)}{new_chip}{fit_chip}</a>'
                             )
                     cite_html = (
                         '<div class="watch-cites">' + "".join(cite_pieces) + "</div>"
@@ -2265,6 +2281,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     border-radius: 2px;
     vertical-align: middle;
 }}
+.watch-cite-fit {{
+    display: inline-block; margin-left: 6px;
+    padding: 0 5px; font-size: 9.5px; letter-spacing: 0.04em;
+    border-radius: 2px; vertical-align: middle; cursor: help;
+    border: 1px solid var(--border);
+}}
+.watch-cite-fit-great {{ background: #16201a; color: #b8ffb8; border-color: #4abe4a; }}
+.watch-cite-fit-decent {{ background: #1c1c1c; color: #ffd566; border-color: #5a4a14; }}
+.watch-cite-fit-stretch {{ background: #1a1414; color: #ffaa66; border-color: #5a3a14; }}
+.watch-cite-fit-weak {{ background: #1a1414; color: #888; }}
 .watch-actions {{
     display: flex; gap: 10px; margin-top: 10px;
 }}
@@ -2370,6 +2396,221 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 row["id"], row["query"], row["last_run_at"],
             )
         return RedirectResponse(url="/watch", status_code=303)
+
+    # --- Application tracker -----------------------------------------
+
+    @app.get("/applications", response_class=HTMLResponse)
+    def applications_page(status: str | None = None):
+        from .db import APPLICATION_STATUSES, application_list
+
+        _, conn, _, _ = get_state()
+        rows = application_list(conn, status=status)
+        # Status counts for the filter chips at the top.
+        all_rows = application_list(conn)
+        counts: dict[str, int] = dict.fromkeys(APPLICATION_STATUSES, 0)
+        for r in all_rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+        chips = ['<a href="/applications" '
+                 f'class="apps-chip{" apps-chip-active" if not status else ""}">'
+                 f'all ({len(all_rows)})</a>']
+        for sname in APPLICATION_STATUSES:
+            n = counts.get(sname, 0)
+            klass = "apps-chip" + (" apps-chip-active" if status == sname else "")
+            chips.append(
+                f'<a href="/applications?status={sname}" class="{klass}">'
+                f'{escape(sname)} ({n})</a>'
+            )
+
+        rows_html: list[str] = []
+        for r in rows:
+            when = time.strftime("%Y-%m-%d", time.localtime(r["applied_at"]))
+            url_html = (
+                f'<a href="{escape(r["role_url"])}" target="_blank" '
+                f'rel="noopener noreferrer" class="apps-url">link ↗</a>'
+                if r["role_url"] else ""
+            )
+            notes_html = (
+                f'<div class="apps-notes">{escape(r["notes"])}</div>'
+                if r["notes"] else ""
+            )
+            # Inline status-update form: each option is a button.
+            buttons = "".join(
+                f'<button name="new_status" value="{s}" '
+                f'class="apps-status-btn apps-status-{s}'
+                f'{" apps-status-on" if s == r["status"] else ""}">{s}</button>'
+                for s in APPLICATION_STATUSES
+            )
+            rows_html.append(f"""
+<tr class="apps-row">
+    <td class="apps-co">{escape(r['company'])}</td>
+    <td class="apps-role">{escape(r['role_title'])}</td>
+    <td class="apps-meta">{escape(r['source'] or '')} · {when}</td>
+    <td class="apps-actions">{url_html}</td>
+    <td>
+        <form method="post" action="/applications/{r['id']}/status" class="apps-status-form">
+            {buttons}
+        </form>
+    </td>
+    <td>
+        <form method="post" action="/applications/{r['id']}/delete"
+              class="apps-delete-form">
+            <button type="submit" class="apps-delete-btn"
+                    onclick="return confirm('Delete this application?');">×</button>
+        </form>
+    </td>
+</tr>
+{('<tr><td colspan="6" class="apps-notes-row">' + notes_html + '</td></tr>') if notes_html else ''}
+""")
+
+        rows_body = (
+            "".join(rows_html)
+            or '<tr><td colspan="6" class="empty">No applications yet.</td></tr>'
+        )
+
+        body = f"""
+<h1>Applications</h1>
+<p class="muted" style="margin-top:-8px;">
+    Track jobs you've applied to. Watchlists skip already-applied roles
+    when surfacing "new" items, and the chat agent can answer "have I
+    applied to X?" against this list.
+</p>
+
+<div class="apps-chips">{"".join(chips)}</div>
+
+<form method="post" action="/applications/new" class="apps-new card">
+    <div class="apps-new-row">
+        <input type="text" name="company" placeholder="Company" required>
+        <input type="text" name="role_title" placeholder="Role title" required>
+    </div>
+    <div class="apps-new-row">
+        <input type="text" name="role_url" placeholder="Posting URL (optional but recommended)">
+        <input type="text" name="source" placeholder="Source: linkedin / referral / handshake / ..."
+            style="max-width:280px;">
+    </div>
+    <textarea name="notes" rows="2" placeholder="Notes (recruiter contact, deadline, etc.)"></textarea>
+    <button type="submit">+ record application</button>
+</form>
+
+<table class="apps-table">{rows_body}</table>
+
+<style>
+.apps-chips {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }}
+.apps-chip {{
+    padding: 4px 10px; font-size: 12px; font-family: var(--mono);
+    background: #0e0e0e; color: #888; border: 1px solid var(--border);
+    border-radius: 2px; text-decoration: none;
+}}
+.apps-chip:hover {{ color: var(--green); border-color: var(--green-dim); }}
+.apps-chip-active {{ color: var(--green); border-color: var(--green-dim); background: #131c14; }}
+.apps-new {{
+    display: flex; flex-direction: column; gap: 8px; margin: 8px 0 18px 0;
+}}
+.apps-new-row {{ display: flex; gap: 8px; }}
+.apps-new input, .apps-new textarea {{
+    flex: 1; box-sizing: border-box;
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 8px 10px; font: 13px var(--mono);
+}}
+.apps-new textarea {{ resize: vertical; }}
+.apps-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+.apps-row td {{
+    padding: 8px 10px; border-bottom: 1px dashed var(--border);
+    vertical-align: middle;
+}}
+.apps-co {{ font-family: var(--mono); color: var(--green); white-space: nowrap; }}
+.apps-meta {{ color: #888; font-size: 11.5px; white-space: nowrap; }}
+.apps-url {{ color: var(--green); font-family: var(--mono); font-size: 11.5px; }}
+.apps-status-form {{ display: flex; gap: 2px; flex-wrap: wrap; }}
+.apps-status-btn {{
+    background: transparent; color: #888; border: 1px solid var(--border);
+    border-radius: 2px; padding: 2px 6px; font-size: 10.5px;
+    font-family: var(--mono); cursor: pointer; letter-spacing: 0.04em;
+}}
+.apps-status-btn:hover {{ color: var(--green); border-color: var(--green-dim); }}
+.apps-status-on {{ background: #131c14; color: var(--green); border-color: var(--green-dim); }}
+.apps-status-offer.apps-status-on {{ background: #16201a; color: #b8ffb8; }}
+.apps-status-rejected.apps-status-on {{ background: #2a1414; color: #ff8c8c; border-color: #5a2828; }}
+.apps-delete-form {{ display: inline; }}
+.apps-delete-btn {{
+    background: transparent; color: #555; border: none; cursor: pointer;
+    font-size: 18px; padding: 0 4px;
+}}
+.apps-delete-btn:hover {{ color: #ff5c5c; }}
+.apps-notes-row {{ padding: 0 !important; }}
+.apps-notes {{
+    padding: 8px 14px; background: #0a0a0a; color: #aaa; font-size: 12.5px;
+    border-bottom: 1px solid var(--border);
+}}
+</style>"""
+        return HTMLResponse(_layout("Applications", body, "applications"))
+
+    @app.post("/applications/new")
+    async def applications_new(request: Request):
+        from .db import application_create
+
+        _, conn, _, _ = get_state()
+        # Same-origin guard.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        company = (form.get("company") or "").strip()
+        role = (form.get("role_title") or "").strip()
+        if not company or not role:
+            return RedirectResponse(url="/applications", status_code=303)
+        application_create(
+            conn, company=company, role_title=role,
+            role_url=(form.get("role_url") or "").strip() or None,
+            source=(form.get("source") or "").strip() or None,
+            notes=(form.get("notes") or "").strip() or None,
+        )
+        return RedirectResponse(url="/applications", status_code=303)
+
+    @app.post("/applications/{aid:int}/status")
+    async def applications_status(aid: int, request: Request):
+        from .db import APPLICATION_STATUSES, application_get, application_set_status
+
+        _, conn, _, _ = get_state()
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        new_status = (form.get("new_status") or "").strip()
+        if (
+            application_get(conn, aid) is None
+            or new_status not in APPLICATION_STATUSES
+        ):
+            return RedirectResponse(url="/applications", status_code=303)
+        application_set_status(conn, aid, new_status)
+        return RedirectResponse(url="/applications", status_code=303)
+
+    @app.post("/applications/{aid:int}/delete")
+    async def applications_delete(aid: int, request: Request):
+        from .db import application_delete
+
+        _, conn, _, _ = get_state()
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        application_delete(conn, aid)
+        return RedirectResponse(url="/applications", status_code=303)
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):

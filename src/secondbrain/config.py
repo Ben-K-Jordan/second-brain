@@ -220,6 +220,17 @@ class Config:
     imap_window_days: int = 14
     imap_max_per_folder: int = 1000
 
+    # Canvas LMS — assignments + announcements + syllabi. Set
+    # CANVAS_BASE_URL + CANVAS_TOKEN env vars to enable. Window controls
+    # how far back/forward (in days) we ingest assignments + announcements.
+    canvas_window_days: int = 60
+
+    # Resume-fit scoring. Drop one or many resumes (PM-flavoured, eng-
+    # flavoured, etc.) here; the watchlist runner embeds them and scores
+    # job postings against them so "great fit" / "stretch" labels appear
+    # next to citations on the dashboard.
+    resume_paths: tuple[str, ...] = ()
+
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
     # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
@@ -536,6 +547,14 @@ def load_config(path: Path | None = None) -> Config:
                     setattr(cfg, k, int(v))
                 else:
                     setattr(cfg, k, str(v))
+        if "canvas_window_days" in data:
+            cfg.canvas_window_days = int(data["canvas_window_days"])
+        # Resume can be either a top-level `resume_paths = [...]` or a
+        # nested `[resume] paths = [...]` block - support both.
+        if "resume_paths" in data:
+            cfg.resume_paths = tuple(data["resume_paths"])
+        if isinstance(data.get("resume"), dict) and "paths" in data["resume"]:
+            cfg.resume_paths = tuple(data["resume"]["paths"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

@@ -289,6 +289,26 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_wlruns_wl_started
             ON watchlist_runs(watchlist_id, started_at DESC);
 
+        -- Application tracker: jobs you've actually applied to. Lets the
+        -- chat agent answer "have I already applied to X?" and the
+        -- watchlist agent skip duplicates. role_url is the canonical
+        -- identity (matches a posting's url / virtual_path so the
+        -- existing brain can hop from posting → application status).
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company TEXT NOT NULL,
+            role_title TEXT NOT NULL,
+            role_url TEXT,                  -- canonical posting URL when known
+            applied_at REAL NOT NULL,       -- epoch seconds
+            status TEXT NOT NULL DEFAULT 'applied',  -- 'applied'|'screen'|'interview'|'offer'|'rejected'|'withdrawn'|'ghosted'
+            source TEXT,                    -- e.g. 'linkedin', 'greenhouse:anthropic', 'referral'
+            notes TEXT,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_apps_role_url ON applications(role_url);
+        CREATE INDEX IF NOT EXISTS idx_apps_status ON applications(status);
+        CREATE INDEX IF NOT EXISTS idx_apps_applied_at ON applications(applied_at DESC);
+
         -- Click-feedback: records which result paths the user actually
         -- opened from /search, /chat, /entity, etc. Used as a passive
         -- recency-weighted boost in ranking.
@@ -836,6 +856,134 @@ def watchlist_latest_run(
         "ORDER BY started_at DESC, id DESC LIMIT 1",
         (watchlist_id,),
     ).fetchone()
+
+
+# --- Application tracker ----------------------------------------------
+
+# Single source of truth for valid statuses; CLI + dashboard use this.
+APPLICATION_STATUSES = (
+    "applied", "screen", "interview", "offer", "rejected", "withdrawn", "ghosted",
+)
+
+
+def application_create(
+    conn: sqlite3.Connection,
+    company: str,
+    role_title: str,
+    role_url: str | None = None,
+    applied_at: float | None = None,
+    status: str = "applied",
+    source: str | None = None,
+    notes: str | None = None,
+) -> int:
+    """Record a job application. Returns the new id.
+
+    ``role_url`` is the canonical posting URL when known (matches a
+    JobsConnector virtual_path or a careers.* page). The watchlist agent
+    uses it to dedupe "you've already applied to this" so it doesn't
+    keep surfacing applied roles as "new".
+    """
+    if status not in APPLICATION_STATUSES:
+        raise ValueError(
+            f"unknown status {status!r}; valid: {', '.join(APPLICATION_STATUSES)}"
+        )
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO applications"
+        "(company, role_title, role_url, applied_at, status, source, notes, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        (
+            company.strip(), role_title.strip(),
+            (role_url or "").strip() or None,
+            applied_at if applied_at is not None else now,
+            status, (source or None), (notes or None), now,
+        ),
+    )
+    aid = cur.fetchone()["id"]
+    conn.commit()
+    return aid
+
+
+def application_list(
+    conn: sqlite3.Connection,
+    status: str | None = None,
+    company: str | None = None,
+) -> list[sqlite3.Row]:
+    """List applications, optionally filtered. Most recently applied first."""
+    where: list[str] = []
+    params: list = []
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if company:
+        where.append("LOWER(company) = LOWER(?)")
+        params.append(company)
+    sql = "SELECT * FROM applications"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY applied_at DESC"
+    return conn.execute(sql, params).fetchall()
+
+
+def application_get(
+    conn: sqlite3.Connection, application_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM applications WHERE id = ?", (application_id,),
+    ).fetchone()
+
+
+def application_find_by_url(
+    conn: sqlite3.Connection, url: str,
+) -> sqlite3.Row | None:
+    """Find an application by canonical posting URL. Used by the watchlist
+    agent to detect "I already applied to this" before surfacing it as
+    a "new" item."""
+    if not url:
+        return None
+    return conn.execute(
+        "SELECT * FROM applications WHERE role_url = ? ORDER BY applied_at DESC LIMIT 1",
+        (url,),
+    ).fetchone()
+
+
+def application_set_status(
+    conn: sqlite3.Connection, application_id: int, status: str,
+    notes: str | None = None,
+) -> None:
+    if status not in APPLICATION_STATUSES:
+        raise ValueError(
+            f"unknown status {status!r}; valid: {', '.join(APPLICATION_STATUSES)}"
+        )
+    now = time.time()
+    if notes is None:
+        conn.execute(
+            "UPDATE applications SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, application_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE applications SET status = ?, notes = ?, updated_at = ? "
+            "WHERE id = ?",
+            (status, notes, now, application_id),
+        )
+    conn.commit()
+
+
+def application_delete(conn: sqlite3.Connection, application_id: int) -> None:
+    conn.execute("DELETE FROM applications WHERE id = ?", (application_id,))
+    conn.commit()
+
+
+def applied_role_urls(conn: sqlite3.Connection) -> set[str]:
+    """All canonical role_urls the user has on file. Convenience for the
+    watchlist agent to filter "already applied" out of new-item lists.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT role_url FROM applications WHERE role_url IS NOT NULL "
+        "AND role_url != ''",
+    ).fetchall()
+    return {r["role_url"] for r in rows}
 
 
 # --- Click-feedback ---------------------------------------------------
