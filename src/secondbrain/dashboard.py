@@ -926,6 +926,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Overview", "/"),
         ("Chat", "/chat"),
         ("Briefings", "/briefings"),
+        ("Queue", "/queue"),
         ("Search", "/search"),
         ("Watch", "/watch"),
         ("Apps", "/applications"),
@@ -2837,6 +2838,217 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return RedirectResponse(url="/briefings", status_code=303)
         generate_for_event(cfg, conn, embedder, reranker, ev)
         return RedirectResponse(url="/briefings", status_code=303)
+
+    # --- Reading queue ----------------------------------------------
+
+    @app.get("/queue", response_class=HTMLResponse)
+    def queue_page(history: int = 0):
+        from .db import (
+            reading_queue_history,
+            reading_queue_unread,
+            reading_queue_unread_count,
+        )
+
+        _, conn, _, _ = get_state()
+        rows = (
+            reading_queue_history(conn, limit=200) if history
+            else reading_queue_unread(conn, limit=200)
+        )
+        unread_count = reading_queue_unread_count(conn)
+
+        items_html: list[str] = []
+        for r in rows:
+            added = time.strftime("%Y-%m-%d", time.localtime(r["added_at"]))
+            title = r["title"] or r["url"]
+            host = ""
+            try:
+                from urllib.parse import urlparse as _urlparse
+                host = _urlparse(r["url"]).netloc
+            except Exception:  # noqa: BLE001
+                pass
+            fit_chip = ""
+            if r["fit_label"]:
+                cls = f"queue-fit-{r['fit_label'].split()[0]}"
+                fit_chip = (
+                    f'<span class="queue-fit {cls}">{escape(r["fit_label"])}</span>'
+                )
+            if r["summary_error"]:
+                summary_block = (
+                    f'<div class="queue-error">summary error: '
+                    f'{escape(r["summary_error"][:200])}</div>'
+                )
+            elif r["summary"]:
+                summary_block = (
+                    f'<div class="queue-summary">'
+                    f'{escape(r["summary"]).replace(chr(10), "<br>")}'
+                    f'</div>'
+                )
+            else:
+                summary_block = (
+                    '<div class="queue-pending">summary pending…</div>'
+                )
+
+            actions_html = ""
+            if not history:
+                actions_html = f"""
+<form method="post" action="/queue/{r['id']}/action" class="queue-actions">
+    <button name="action" value="read" class="queue-btn queue-btn-read">read</button>
+    <button name="action" value="skipped" class="queue-btn queue-btn-skip">skip</button>
+</form>"""
+            else:
+                if r["read_at"]:
+                    actions_html = '<span class="queue-status-read">✓ read</span>'
+                elif r["skipped_at"]:
+                    actions_html = '<span class="queue-status-skip">skipped</span>'
+
+            items_html.append(f"""
+<article class="queue-card">
+  <header class="queue-head">
+    <a href="{escape(r['url'])}" target="_blank" rel="noopener noreferrer"
+       class="queue-title">{escape(title)} ↗</a>
+    {fit_chip}
+  </header>
+  <div class="queue-meta">
+    <span>{escape(host)}</span>
+    <span>{escape(r['source'])}</span>
+    <span>{added}</span>
+  </div>
+  {summary_block}
+  {actions_html}
+</article>""")
+
+        items = (
+            "".join(items_html)
+            or '<div class="empty">'
+            + ('No history yet.' if history else 'Nothing in your queue.')
+            + '</div>'
+        )
+
+        toggle = (
+            '<a href="/queue" class="queue-toggle">unread (' + str(unread_count) + ')</a> · '
+            '<a href="/queue?history=1" class="queue-toggle queue-toggle-on">history</a>'
+            if history else
+            '<a href="/queue" class="queue-toggle queue-toggle-on">unread (' + str(unread_count) + ')</a> · '
+            '<a href="/queue?history=1" class="queue-toggle">history</a>'
+        )
+
+        body = f"""
+<h1>Reading queue</h1>
+<p class="muted" style="margin-top:-8px;">
+    Your watchlists auto-enqueue high-fit jobs and every news/research
+    hit. The daemon writes a 60-second pre-read summary so you can scan
+    instead of opening every tab. Mark <strong>read</strong> when you've
+    finished one; <strong>skip</strong> when you don't care.
+</p>
+
+<div class="queue-toggles">{toggle}</div>
+
+<form method="post" action="/queue/add" class="queue-add card">
+    <input type="text" name="url" placeholder="https://... (manual add)" required>
+    <input type="text" name="title" placeholder="Optional title">
+    <button type="submit">+ queue this URL</button>
+</form>
+
+<div class="queue-list">{items}</div>
+
+<style>
+.queue-toggles {{ margin: 12px 0; font-family: var(--mono); font-size: 12px; }}
+.queue-toggle {{ color: #888; text-decoration: none; padding: 0 4px; }}
+.queue-toggle:hover {{ color: var(--green); }}
+.queue-toggle-on {{ color: var(--green); }}
+.queue-add {{ display: flex; gap: 8px; margin: 12px 0; }}
+.queue-add input {{
+    flex: 1; box-sizing: border-box;
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 8px 10px; font: 13px var(--mono);
+}}
+.queue-card {{
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--green-dim);
+    padding: 14px 16px; margin: 10px 0;
+}}
+.queue-head {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }}
+.queue-title {{ color: var(--green); font-weight: 600; flex: 1; word-break: break-word; }}
+.queue-meta {{
+    display: flex; gap: 14px; margin: 6px 0;
+    color: #888; font-size: 11.5px; font-family: var(--mono);
+}}
+.queue-summary {{
+    margin: 10px 0 6px 0; padding: 10px 14px;
+    background: #0a0a0a; border-left: 2px solid var(--border);
+    line-height: 1.6; font-size: 13px;
+}}
+.queue-pending {{ color: #888; font-size: 11.5px; font-style: italic; padding: 8px 0; }}
+.queue-error {{ color: #ff5c5c; font-size: 12px; padding: 6px 0; }}
+.queue-fit {{
+    display: inline-block; padding: 1px 6px; font-size: 10.5px;
+    border-radius: 2px; border: 1px solid var(--border);
+    letter-spacing: 0.04em;
+}}
+.queue-fit-great {{ background: #16201a; color: #b8ffb8; border-color: #4abe4a; }}
+.queue-fit-decent {{ background: #1c1c1c; color: #ffd566; border-color: #5a4a14; }}
+.queue-fit-stretch {{ background: #1a1414; color: #ffaa66; border-color: #5a3a14; }}
+.queue-actions {{ display: flex; gap: 6px; margin-top: 6px; }}
+.queue-btn {{
+    background: transparent; border: 1px solid var(--border);
+    color: #888; padding: 4px 10px; cursor: pointer;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
+    border-radius: 2px;
+}}
+.queue-btn-read:hover {{ color: var(--green); border-color: var(--green-dim); }}
+.queue-btn-skip:hover {{ color: #ff5c5c; border-color: #5a2828; }}
+.queue-status-read {{ color: var(--green); font-size: 11.5px; font-family: var(--mono); }}
+.queue-status-skip {{ color: #888; font-size: 11.5px; font-family: var(--mono); }}
+</style>"""
+        return HTMLResponse(_layout("Queue", body, "queue"))
+
+    @app.post("/queue/add")
+    async def queue_add(request: Request):
+        from .db import reading_queue_enqueue
+
+        _, conn, _, _ = get_state()
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        url = (form.get("url") or "").strip()
+        title = (form.get("title") or "").strip()
+        if url:
+            reading_queue_enqueue(conn, url=url, title=title, source="manual")
+        return RedirectResponse(url="/queue", status_code=303)
+
+    @app.post("/queue/{qid:int}/action")
+    async def queue_action(qid: int, request: Request):
+        from .db import (
+            reading_queue_get,
+            reading_queue_mark_read,
+            reading_queue_mark_skipped,
+        )
+
+        _, conn, _, _ = get_state()
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        action = (form.get("action") or "").strip()
+        if reading_queue_get(conn, qid) is None:
+            return RedirectResponse(url="/queue", status_code=303)
+        if action == "read":
+            reading_queue_mark_read(conn, qid)
+        elif action == "skipped":
+            reading_queue_mark_skipped(conn, qid)
+        return RedirectResponse(url="/queue", status_code=303)
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):

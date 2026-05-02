@@ -25,6 +25,7 @@ from .event_briefing import run_briefings_if_due
 from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder
+from .reading_queue import run_summariser_if_due
 from .reranker import make_reranker
 from .transcriber import make_transcriber
 from .watcher import Watcher
@@ -226,6 +227,18 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
                         )
                 except Exception as e:  # noqa: BLE001
                     log.warning("event briefing scheduler crashed: %s", e)
+                # Reading-queue summariser — picks off items that watchlist
+                # runs enqueued and writes 60-second precis. Cheap relative
+                # to watchlist runs themselves.
+                try:
+                    n_sum = run_summariser_if_due(cfg, conn, embedder, reranker)
+                    if n_sum:
+                        log.info(
+                            "read-queue summariser: generated %d summar(ies)",
+                            n_sum,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("read-queue summariser crashed: %s", e)
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:

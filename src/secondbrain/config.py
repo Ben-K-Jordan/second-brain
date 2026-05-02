@@ -238,6 +238,12 @@ class Config:
     briefing_lookahead_minutes: int = 30  # how far ahead to brief
     briefing_max_per_run: int = 5         # cost guard per minute
 
+    # Reading queue: high-fit/news watchlist items get a 60-second
+    # auto-summary so you can scan on the train. Cost: ~$0.01-0.05 each.
+    read_queue_enabled: bool = True
+    read_queue_summarise_per_run: int = 5  # per-tick cap
+    read_queue_notify_threshold: int = 5   # tray ping when unread >= this
+
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
     # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
@@ -568,6 +574,12 @@ def load_config(path: Path | None = None) -> Config:
             cfg.briefing_lookahead_minutes = int(data["briefing_lookahead_minutes"])
         if "briefing_max_per_run" in data:
             cfg.briefing_max_per_run = int(data["briefing_max_per_run"])
+        if "read_queue_enabled" in data:
+            cfg.read_queue_enabled = bool(data["read_queue_enabled"])
+        if "read_queue_summarise_per_run" in data:
+            cfg.read_queue_summarise_per_run = int(data["read_queue_summarise_per_run"])
+        if "read_queue_notify_threshold" in data:
+            cfg.read_queue_notify_threshold = int(data["read_queue_notify_threshold"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

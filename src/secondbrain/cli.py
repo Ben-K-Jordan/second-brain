@@ -793,6 +793,165 @@ def serve() -> None:
     run()
 
 
+read_app = typer.Typer(
+    no_args_is_help=True,
+    help="Reading queue. Watchlist runs auto-enqueue high-fit jobs and "
+         "every news/research item; the daemon writes a 60-second pre-read "
+         "summary so you can scan instead of opening every link.",
+)
+app.add_typer(read_app, name="read")
+
+
+@read_app.command("list")
+def read_list(
+    history: bool = typer.Option(
+        False, "--history", "-H",
+        help="Show read + skipped items instead of unread.",
+    ),
+    limit: int = typer.Option(20, "--limit", "-n"),
+) -> None:
+    """List items in your reading queue (or history)."""
+    from .db import reading_queue_history, reading_queue_unread
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = (
+        reading_queue_history(conn, limit=limit) if history
+        else reading_queue_unread(conn, limit=limit)
+    )
+    if not rows:
+        msg = "No history yet." if history else "Nothing in your queue."
+        console.print(f"[yellow]{msg}[/]")
+        conn.close()
+        return
+    label = "History" if history else "Unread reading queue"
+    table = Table(show_header=True, box=None, title=label)
+    table.add_column("id", style="dim", width=4)
+    table.add_column("title")
+    table.add_column("source", style="dim", width=14)
+    table.add_column("fit", justify="center", width=10)
+    table.add_column("status" if history else "summary", justify="center")
+    for r in rows:
+        title = (r["title"] or r["url"])[:60]
+        fit = r["fit_label"] or ""
+        if history:
+            if r["read_at"]:
+                status = "[green]read[/]"
+            elif r["skipped_at"]:
+                status = "[dim]skipped[/]"
+            else:
+                status = "[dim]?[/]"
+        elif r["summary_error"]:
+            status = "[red]err[/]"
+        elif r["summary"]:
+            status = "[green]✓[/]"
+        else:
+            status = "[dim]…[/]"
+        table.add_row(str(r["id"]), title, r["source"], fit, status)
+    console.print(table)
+    if not history:
+        console.print(
+            "\n[dim]use[/] [cyan]secondbrain read show <id>[/] [dim]to read a summary[/]"
+        )
+    conn.close()
+
+
+@read_app.command("show")
+def read_show(
+    queue_id: int = typer.Argument(..., help="Queue id from `read list`."),
+) -> None:
+    """Print the summary for a queued item."""
+    from .db import reading_queue_get
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    row = reading_queue_get(conn, queue_id)
+    if row is None:
+        console.print(f"[red]No queue item #{queue_id}.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print(f"[bold]{row['title'] or row['url']}[/]")
+    console.print(f"[dim]{row['url']}[/]")
+    console.print(f"[dim]source: {row['source']} · fit: {row['fit_label'] or 'n/a'}[/]")
+    console.print()
+    if row["summary_error"]:
+        console.print(f"[red]summary errored:[/] {row['summary_error']}")
+    elif row["summary"]:
+        console.print(row["summary"])
+    else:
+        console.print("[dim](summary still pending — daemon will pick it up)[/]")
+    conn.close()
+
+
+@read_app.command("add")
+def read_add(
+    url: str = typer.Argument(..., help="URL to summarise."),
+    title: str = typer.Option("", "--title", "-t",
+                              help="Optional human title."),
+) -> None:
+    """Manually enqueue a URL to read later (with auto-summary)."""
+    from .db import reading_queue_enqueue
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rid = reading_queue_enqueue(
+        conn, url=url, title=title, source="manual",
+    )
+    if rid is None:
+        console.print(f"[yellow]Already in queue:[/] {url}")
+    else:
+        console.print(f"[green]Queued #{rid}:[/] {url}")
+    conn.close()
+
+
+@read_app.command("mark")
+def read_mark(
+    queue_id: int = typer.Argument(...),
+    state: str = typer.Argument(
+        "read",
+        help="One of 'read' or 'skipped'.",
+    ),
+) -> None:
+    """Mark a queue item as read or skipped (removes from unread view)."""
+    from .db import (
+        reading_queue_get,
+        reading_queue_mark_read,
+        reading_queue_mark_skipped,
+    )
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if reading_queue_get(conn, queue_id) is None:
+        console.print(f"[red]No queue item #{queue_id}.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    if state == "read":
+        reading_queue_mark_read(conn, queue_id)
+    elif state == "skipped":
+        reading_queue_mark_skipped(conn, queue_id)
+    else:
+        console.print(f"[red]Unknown state[/] {state!r}; use 'read' or 'skipped'.")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print(f"[green]✓[/] #{queue_id} marked {state}")
+    conn.close()
+
+
+@read_app.command("summarise")
+def read_summarise(
+    limit: int = typer.Option(5, "--limit", "-n"),
+) -> None:
+    """Run the summariser now for up to N pending items."""
+    from .reading_queue import summarise_pending
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = make_reranker(cfg)
+    n = summarise_pending(cfg, conn, embedder, reranker)
+    console.print(f"[green]Generated {n} summar{'y' if n == 1 else 'ies'}.[/]")
+    conn.close()
+
+
 brief_app = typer.Typer(
     no_args_is_help=True,
     help="Pre-event briefings. The daemon auto-generates these for events "

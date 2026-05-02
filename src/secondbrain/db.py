@@ -289,6 +289,30 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_wlruns_wl_started
             ON watchlist_runs(watchlist_id, started_at DESC);
 
+        -- Reading queue: high-value items pulled from watchlist runs and
+        -- (optionally) news syncs, with a 60-second pre-summary so you
+        -- can decide on the train whether to read the full thing.
+        -- UNIQUE on url so the same posting/article doesn't queue twice.
+        CREATE TABLE IF NOT EXISTS reading_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            title TEXT,
+            source TEXT NOT NULL,           -- 'watchlist:<id>' | 'news' | 'manual'
+            added_at REAL NOT NULL,
+            summary TEXT,                   -- null until summariser runs
+            summary_generated_at REAL,
+            summary_error TEXT,
+            read_at REAL,
+            skipped_at REAL,
+            -- Optional context inherited from the source — for watchlist
+            -- items we copy fit_label / fit_score so the queue UI can
+            -- show "great fit" without re-running the embedder.
+            fit_label TEXT,
+            fit_score REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_unread
+            ON reading_queue(read_at, skipped_at, added_at DESC);
+
         -- Pre-event briefings: one row per event we've ever briefed for.
         -- Triggered by the daemon when an event is starting within the
         -- configured lookahead window. UNIQUE on (event_id, event_source)
@@ -879,6 +903,128 @@ def watchlist_latest_run(
         "ORDER BY started_at DESC, id DESC LIMIT 1",
         (watchlist_id,),
     ).fetchone()
+
+
+# --- Reading queue ----------------------------------------------------
+
+def reading_queue_enqueue(
+    conn: sqlite3.Connection,
+    url: str,
+    title: str | None,
+    source: str,
+    fit_label: str | None = None,
+    fit_score: float | None = None,
+) -> int | None:
+    """Add a URL to the reading queue. Returns the id (or None if the
+    URL was already queued — UNIQUE constraint).
+
+    Idempotent: if the same URL is already in the queue, the existing row
+    is left alone. This is important because watchlist runs surface the
+    same items multiple times (it's the diff that's new, not always the
+    URL); we don't want to keep re-summarising and re-notifying.
+    """
+    if not url:
+        return None
+    try:
+        cur = conn.execute(
+            "INSERT INTO reading_queue(url, title, source, added_at, "
+            "fit_label, fit_score) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            (url, title or "", source, time.time(), fit_label, fit_score),
+        )
+        rid = cur.fetchone()["id"]
+        conn.commit()
+        return rid
+    except sqlite3.IntegrityError:
+        # Already queued — leave the existing row in place.
+        return None
+
+
+def reading_queue_pending_summary(
+    conn: sqlite3.Connection, limit: int = 10,
+) -> list[sqlite3.Row]:
+    """Items whose summary hasn't been generated yet (and haven't errored).
+
+    The daemon picks these up after each watchlist tick and generates
+    summaries one at a time. Errored ones aren't auto-retried — the
+    user can click "regenerate" from the queue UI.
+    """
+    return conn.execute(
+        "SELECT * FROM reading_queue "
+        "WHERE summary IS NULL AND summary_error IS NULL "
+        "AND read_at IS NULL AND skipped_at IS NULL "
+        "ORDER BY added_at ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def reading_queue_set_summary(
+    conn: sqlite3.Connection,
+    queue_id: int,
+    summary: str | None,
+    error: str | None = None,
+) -> None:
+    conn.execute(
+        "UPDATE reading_queue SET summary = ?, summary_error = ?, "
+        "summary_generated_at = ? WHERE id = ?",
+        (summary, error, time.time(), queue_id),
+    )
+    conn.commit()
+
+
+def reading_queue_unread(
+    conn: sqlite3.Connection, limit: int = 100,
+) -> list[sqlite3.Row]:
+    """Everything you haven't read or skipped, newest first."""
+    return conn.execute(
+        "SELECT * FROM reading_queue "
+        "WHERE read_at IS NULL AND skipped_at IS NULL "
+        "ORDER BY added_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def reading_queue_history(
+    conn: sqlite3.Connection, limit: int = 100,
+) -> list[sqlite3.Row]:
+    """Read + skipped rows for the dashboard's archive view."""
+    return conn.execute(
+        "SELECT * FROM reading_queue "
+        "WHERE read_at IS NOT NULL OR skipped_at IS NOT NULL "
+        "ORDER BY COALESCE(read_at, skipped_at) DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def reading_queue_get(
+    conn: sqlite3.Connection, queue_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reading_queue WHERE id = ?", (queue_id,),
+    ).fetchone()
+
+
+def reading_queue_mark_read(conn: sqlite3.Connection, queue_id: int) -> None:
+    conn.execute(
+        "UPDATE reading_queue SET read_at = ? WHERE id = ?",
+        (time.time(), queue_id),
+    )
+    conn.commit()
+
+
+def reading_queue_mark_skipped(conn: sqlite3.Connection, queue_id: int) -> None:
+    conn.execute(
+        "UPDATE reading_queue SET skipped_at = ? WHERE id = ?",
+        (time.time(), queue_id),
+    )
+    conn.commit()
+
+
+def reading_queue_unread_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM reading_queue "
+        "WHERE read_at IS NULL AND skipped_at IS NULL",
+    ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 # --- Pre-event briefings ----------------------------------------------

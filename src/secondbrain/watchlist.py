@@ -153,6 +153,24 @@ def run_watchlist(
         new_count,
     )
 
+    # Enqueue eligible new items into the reading queue. Job-flavoured
+    # watchlists only enqueue "great fit" matches; news/ai/markets/research
+    # presets enqueue everything new (one summary per item).
+    if new_count > 0:
+        try:
+            from .reading_queue import enqueue_from_watchlist_run, watchlist_preset_for
+            preset = watchlist_preset_for(conn, watchlist_id)
+            new_items = [c for c in cites_payload if c.get("file_path") in set(new_paths)]
+            queued = enqueue_from_watchlist_run(
+                conn, watchlist_id=watchlist_id,
+                watchlist_preset=preset,
+                new_items=new_items,
+            )
+            if queued:
+                log.info("watchlist %s queued %d item(s) for read-summary", watchlist_id, queued)
+        except Exception as e:  # noqa: BLE001
+            log.warning("read-queue enqueue failed for watchlist %s: %s", watchlist_id, e)
+
     # Tray / desktop notification when there's something genuinely new.
     # The first run has no prior to compare against; we treat it as
     # "everything new" by setting new_count to len(citations), but skip
