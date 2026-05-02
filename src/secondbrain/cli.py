@@ -1291,6 +1291,35 @@ def brief_regenerate(
     conn.close()
 
 
+@brief_app.command("today")
+def brief_today(
+    markdown: bool = typer.Option(
+        False, "--markdown/--no-markdown",
+        help="Print raw Markdown (e.g. for piping into a file or email).",
+    ),
+) -> None:
+    """Phase 44: morning brief that aggregates everything else.
+
+    Pulls together today's calendar, Canvas assignments due in the next
+    72h, open action items from recent meeting transcripts, the top of
+    your reading queue, and watchlist hits from the last day. Pure
+    aggregation — no LLM call, no network beyond the calendar fetch.
+    """
+    from .daily_brief import generate_brief_markdown
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    md = generate_brief_markdown(cfg, conn)
+    if markdown:
+        # Bypass Rich's markdown renderer so the output stays exactly
+        # what we'll send by email / save to a file.
+        print(md)
+    else:
+        from rich.markdown import Markdown
+        console.print(Markdown(md))
+    conn.close()
+
+
 apply_app = typer.Typer(
     no_args_is_help=True,
     help="Track jobs you've applied to. The watchlist agent skips "
