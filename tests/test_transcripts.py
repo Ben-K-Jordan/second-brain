@@ -298,6 +298,205 @@ def test_imap_connector_falls_back_to_email_for_non_transcripts(monkeypatch):
     assert doc is None
 
 
+# =============================== Granola =============================
+
+GRANOLA_SAMPLE = """\
+Date: 2026-04-15 14:30
+Attendees: Ben Jordan, Sarah Smith, Alex Lee
+
+## Summary
+Quarterly planning sync. Decided to ship the new pricing experiment in
+March, with Sarah owning the ramp.
+
+## Key Points
+- Pricing experiment ramps over 4 weeks
+- Customer interviews continue through end of February
+- Need to align with marketing on launch comms
+
+## Action Items
+- [ ] Sarah to draft the pricing one-pager by Friday
+- [x] Ben to send out the customer interview slots
+- [ ] Alex to sync with marketing on the launch plan
+
+## Transcript
+Sarah Smith: Let's lock in the experiment dates.
+Ben Jordan: I think March 15 is realistic.
+Alex Lee: I'll handle marketing alignment.
+Sarah Smith: Great, we'll go with that.
+"""
+
+
+def test_detect_granola_via_sender():
+    t = detect_transcript(
+        "noreply@granola.so", "Notes from Quarterly planning",
+        GRANOLA_SAMPLE,
+    )
+    assert t is not None
+    assert t.provider == "granola"
+
+
+def test_granola_extracts_summary():
+    t = detect_transcript("noreply@granola.so", "Notes", GRANOLA_SAMPLE)
+    assert t is not None
+    assert "Quarterly planning sync" in t.summary
+    assert "ship the new pricing" in t.summary
+
+
+def test_granola_extracts_action_items():
+    """Granola's checklist syntax (- [ ] / - [x]) should round-trip into
+    the action_items list, with checkbox markers stripped."""
+    t = detect_transcript("noreply@granola.so", "Notes", GRANOLA_SAMPLE)
+    assert t is not None
+    assert len(t.action_items) == 3
+    assert any("pricing one-pager" in item for item in t.action_items)
+    # Checked-off item still surfaces — the user might want to review
+    # what was already shipped.
+    assert any("customer interview slots" in item for item in t.action_items)
+    # Markers stripped (no "- [ ]" / "- [x]" prefixes).
+    for item in t.action_items:
+        assert not item.startswith("- [")
+        assert not item.startswith("[ ]")
+
+
+def test_granola_extracts_attendees_from_header():
+    t = detect_transcript("noreply@granola.so", "Notes", GRANOLA_SAMPLE)
+    assert t is not None
+    assert set(t.attendees) >= {"Ben Jordan", "Sarah Smith", "Alex Lee"}
+
+
+def test_granola_extracts_recording_time():
+    t = detect_transcript("noreply@granola.so", "Notes", GRANOLA_SAMPLE)
+    assert t is not None
+    assert t.recorded_at > 0
+
+
+def test_granola_extracts_transcript_speakers():
+    """Speakers come from the ## Transcript section, not the attendees
+    line — different sections may include different people."""
+    t = detect_transcript("noreply@granola.so", "Notes", GRANOLA_SAMPLE)
+    assert t is not None
+    assert "Sarah Smith" in t.speakers
+    assert "Ben Jordan" in t.speakers
+
+
+def test_granola_strips_subject_prefix():
+    """'Notes from "Quarterly planning"' → title 'Quarterly planning'."""
+    t = detect_transcript(
+        "noreply@granola.so", 'Notes from "Quarterly planning"',
+        GRANOLA_SAMPLE,
+    )
+    assert t is not None
+    assert t.title == "Quarterly planning"
+
+
+def test_granola_detected_by_body_shape_when_sender_unknown():
+    """If a Granola note is forwarded from a personal email, body-shape
+    detection should still pick it up via canonical headings."""
+    t = detect_transcript(
+        "ben@personal.com", "Fwd: Notes from sync", GRANOLA_SAMPLE,
+    )
+    assert t is not None
+    assert t.provider == "granola"
+
+
+def test_granola_without_transcript_section():
+    """A Granola note that's notes-only (no transcript) should still
+    parse — body becomes the structured notes themselves."""
+    body = """\
+## Summary
+Quick alignment on the launch.
+
+## Action Items
+- [ ] Send the spec
+- [ ] Schedule design review
+"""
+    t = detect_transcript("noreply@granola.so", "Notes from sync", body)
+    assert t is not None
+    assert t.provider == "granola"
+    assert "Quick alignment" in t.summary
+    assert len(t.action_items) == 2
+
+
+def test_granola_imap_doc_uses_meeting_prefix_when_event_match(monkeypatch):
+    """When a Granola transcript matches a calendar event, the IMAP-built
+    doc should prefix the title with [meeting] and surface event metadata."""
+    # Stub the calendar matcher to return a deterministic match.
+    import secondbrain.transcripts as tx_mod
+    from secondbrain.connectors.imap_email import ImapEmailConnector
+    monkeypatch.setattr(
+        tx_mod, "match_calendar_event",
+        lambda cfg, t, **kw: ("primary/abc", "google_calendar",
+                              "Quarterly planning"),
+    )
+
+    class FakeCfg:
+        pass
+
+    c = ImapEmailConnector()
+    doc = c._maybe_build_transcript_doc(
+        from_="noreply@granola.so",
+        subject="Notes from Quarterly planning",
+        body=GRANOLA_SAMPLE,
+        date_hdr="Tue, 15 Apr 2026 15:00:00 +0000",
+        mtime=0.0, folder="Granola", msg_id="m1", uid=b"1",
+        cfg=FakeCfg(),
+    )
+    assert doc is not None
+    assert "[meeting]" in doc.title
+    assert doc.metadata["event_id"] == "primary/abc"
+    assert doc.metadata["event_source"] == "google_calendar"
+    assert doc.metadata["event_title"] == "Quarterly planning"
+    # Action items rendered into the body so they're searchable.
+    assert "## Action items" in doc.content
+
+
+def test_granola_imap_doc_skips_calendar_match_without_cfg():
+    """When cfg isn't passed (e.g. tests, ad-hoc ingest), event matching
+    is skipped silently rather than crashing."""
+    from secondbrain.connectors.imap_email import ImapEmailConnector
+
+    c = ImapEmailConnector()
+    doc = c._maybe_build_transcript_doc(
+        from_="noreply@granola.so",
+        subject="Notes from Quarterly planning",
+        body=GRANOLA_SAMPLE,
+        date_hdr="Tue, 15 Apr 2026 15:00:00 +0000",
+        mtime=0.0, folder="Granola", msg_id="m1", uid=b"1",
+        cfg=None,
+    )
+    assert doc is not None
+    # Untagged transcript still ingests, just without [meeting] prefix.
+    assert "[meeting]" not in doc.title
+    assert doc.metadata["event_id"] == ""
+
+
+def test_granola_imap_doc_tolerates_event_match_crash(monkeypatch):
+    """A crash in the calendar-match path shouldn't take down the
+    transcript ingest; we log + ingest untagged."""
+    import secondbrain.transcripts as tx_mod
+    from secondbrain.connectors.imap_email import ImapEmailConnector
+
+    def boom(*a, **kw):
+        raise RuntimeError("network unreachable")
+
+    monkeypatch.setattr(tx_mod, "match_calendar_event", boom)
+
+    class FakeCfg:
+        pass
+
+    c = ImapEmailConnector()
+    doc = c._maybe_build_transcript_doc(
+        from_="noreply@granola.so",
+        subject="Notes from sync",
+        body=GRANOLA_SAMPLE,
+        date_hdr="", mtime=0.0,
+        folder="Granola", msg_id="m1", uid=b"1",
+        cfg=FakeCfg(),
+    )
+    assert doc is not None
+    assert doc.metadata["event_id"] == ""
+
+
 def test_imap_connector_uses_recording_timestamp_as_mtime():
     """When Plaud's body says recorded_at = X, that beats the email's
     Date header so time-decay surfaces lectures by when they happened,

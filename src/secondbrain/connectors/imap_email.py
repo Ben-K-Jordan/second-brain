@@ -165,6 +165,7 @@ class ImapEmailConnector:
             for folder in config["folders"]:
                 yield from self._fetch_folder(
                     imap, folder, config["window_days"], config["max_per_folder"],
+                    cfg=cfg,
                 )
         finally:
             try:
@@ -176,6 +177,7 @@ class ImapEmailConnector:
 
     def _fetch_folder(
         self, imap: imaplib.IMAP4_SSL, folder: str, window_days: int, cap: int,
+        cfg: Config | None = None,
     ) -> Iterator[ConnectorDocument]:
         # Gmail labels with spaces/special chars need quoted folder names.
         select_arg = f'"{folder}"' if (" " in folder or "/" in folder) else folder
@@ -200,12 +202,13 @@ class ImapEmailConnector:
         # Most-recent first, capped.
         uids = list(reversed(uids))[:cap]
         for uid in uids:
-            doc = self._fetch_one(imap, folder, uid)
+            doc = self._fetch_one(imap, folder, uid, cfg=cfg)
             if doc is not None:
                 yield doc
 
     def _fetch_one(
         self, imap: imaplib.IMAP4_SSL, folder: str, uid: bytes,
+        cfg: Config | None = None,
     ) -> ConnectorDocument | None:
         try:
             status, data = imap.fetch(uid, "(RFC822)")
@@ -244,6 +247,7 @@ class ImapEmailConnector:
             from_=from_, subject=subject, body=body,
             date_hdr=date_hdr, mtime=mtime,
             folder=folder, msg_id=msg_id, uid=uid,
+            cfg=cfg,
         )
         if transcript_doc is not None:
             return transcript_doc
@@ -281,26 +285,51 @@ class ImapEmailConnector:
     def _maybe_build_transcript_doc(
         self, *, from_: str, subject: str, body: str,
         date_hdr: str, mtime: float, folder: str,
-        msg_id: str, uid: bytes,
+        msg_id: str, uid: bytes, cfg: Config | None = None,
     ) -> ConnectorDocument | None:
         """When the email looks like a transcript, return a structured
         ConnectorDocument with ``source="transcript:<provider>"``. None
-        otherwise (caller falls back to the generic email rendering)."""
+        otherwise (caller falls back to the generic email rendering).
+
+        Two tagging passes:
+          1. Course matching (Canvas) — best for class lectures via
+             Plaud, where the subject usually has a course code.
+          2. Calendar event matching — best for meetings via Granola
+             or any tool that records calendar appointments. Hits
+             Google Calendar / ICS for events within ±30 min of the
+             transcript's recording timestamp.
+
+        At most one tag wins (course preferred). Untagged transcripts
+        still ingest, just without a back-link.
+        """
         try:
-            from ..transcripts import detect_transcript, match_canvas_course
+            from ..transcripts import (
+                detect_transcript,
+                match_calendar_event,
+                match_canvas_course,
+            )
         except ImportError:
             return None
         t = detect_transcript(from_, subject, body)
         if t is None:
             return None
-        # Try to tag with a Canvas course code. We don't fetch live
-        # course list here (that requires network); we rely on the
-        # subject/title regex which works for "BME 410 lecture ...".
+        # Try Canvas course first — cheap (regex-only, no network).
         course = match_canvas_course(t)
         if course:
             t.course_code = course
+        # If no course matched and we have a recording timestamp, hit
+        # the calendar API for an event in the recording window. This
+        # is what makes Granola → Google Calendar linking automatic.
+        if not course and t.recorded_at and cfg is not None:
+            try:
+                ev_match = match_calendar_event(cfg, t)
+            except Exception as e:  # noqa: BLE001
+                log.warning("transcript event-match crashed: %s", e)
+                ev_match = None
+            if ev_match is not None:
+                t.event_id, t.event_source, t.event_title = ev_match
         # mtime: prefer the recording timestamp when known, fall back
-        # to the email date so time-decay surfaces recent lectures.
+        # to the email date so time-decay surfaces recent transcripts.
         eff_mtime = t.recorded_at or mtime
         # virtual_path: use the message-id when present so the same
         # transcript doesn't double-ingest if it lands twice.
@@ -309,17 +338,23 @@ class ImapEmailConnector:
         else:
             uid_s = uid.decode("ascii", errors="replace")
             vp = f"transcript://{t.provider}/{folder}/{uid_s}"
-        title = (
-            f"[{course}] {t.title}" if course else t.title
-        )
+        # Title prefix: [course] for lectures, [meeting] for calendar-
+        # linked transcripts, untagged otherwise. Lets retrieval scope
+        # cleanly via path filter.
+        if course:
+            title = f"[{course}] {t.title}"
+        elif t.event_title:
+            title = f"[meeting] {t.title}"
+        else:
+            title = t.title
         # Build a readable rendering: header with metadata + summary +
-        # transcript body. Searchable as one document; chunking happens
-        # downstream in index_text.
+        # action items + transcript body.
         lines: list[str] = [f"# {title}", ""]
         if course:
             lines.append(f"Course: {course}")
+        if t.event_title:
+            lines.append(f"Meeting: {t.event_title}")
         if t.recorded_at:
-            from datetime import datetime
             lines.append(
                 "Recorded: "
                 + datetime.fromtimestamp(t.recorded_at, tz=UTC)
@@ -327,6 +362,8 @@ class ImapEmailConnector:
             )
         if t.duration_seconds:
             lines.append(f"Duration: {t.duration_seconds // 60} min")
+        if t.attendees:
+            lines.append(f"Attendees: {', '.join(t.attendees[:12])}")
         if t.speakers:
             lines.append(f"Speakers: {', '.join(t.speakers[:8])}")
         lines.append(f"Provider: {t.provider}")
@@ -334,6 +371,11 @@ class ImapEmailConnector:
         if t.summary:
             lines.append("## Summary")
             lines.append(t.summary)
+            lines.append("")
+        if t.action_items:
+            lines.append("## Action items")
+            for item in t.action_items:
+                lines.append(f"- {item}")
             lines.append("")
         lines.append("## Transcript")
         lines.append(t.body)
@@ -346,9 +388,14 @@ class ImapEmailConnector:
             metadata={
                 "provider": t.provider,
                 "course_code": course,
+                "event_id": t.event_id,
+                "event_source": t.event_source,
+                "event_title": t.event_title,
                 "recorded_at": t.recorded_at,
                 "duration_seconds": t.duration_seconds,
                 "speakers": t.speakers,
+                "attendees": t.attendees,
+                "action_items": t.action_items,
                 "summary": t.summary,
                 "from": from_,
                 "folder": folder,
