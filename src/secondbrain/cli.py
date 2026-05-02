@@ -386,21 +386,108 @@ def watch(
         conn.close()
 
 
+def _auth_canvas(cfg: Config) -> None:
+    """Walk the user through generating + saving a Canvas personal access
+    token. Designed for institutions with SSO + Duo (Cornell, etc.) — the
+    one-time SSO+Duo happens in their browser when they visit the token
+    page; the token itself is plain Bearer auth from then on.
+    """
+    import webbrowser
+
+    from .connectors.canvas import (
+        _credentials_path,
+        save_canvas_credentials,
+        verify_canvas_token,
+    )
+
+    console.print("[bold green]Canvas LMS setup[/]")
+    console.print(
+        "We'll generate a personal access token. The Canvas web UI requires "
+        "your school's SSO + Duo, but the token itself doesn't — once "
+        "generated, the connector authenticates with just the token. No "
+        "SSO checks per sync.\n"
+    )
+
+    # Smart default: if the user already has CANVAS_BASE_URL set, use it.
+    default_base = (os.environ.get("CANVAS_BASE_URL") or "").strip()
+    prompt = (
+        f"Canvas root URL [{default_base}]: " if default_base
+        else "Canvas root URL (e.g. https://canvas.cornell.edu): "
+    )
+    base = console.input(prompt).strip() or default_base
+    if not base:
+        console.print("[red]Need a Canvas URL.[/]")
+        raise typer.Exit(code=1)
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    base = base.rstrip("/")
+
+    settings_url = f"{base}/profile/settings"
+    console.print()
+    console.print("[bold]1.[/] Sign into Canvas (this is when SSO + Duo happen).")
+    console.print(f"[bold]2.[/] Visit [cyan]{settings_url}[/]")
+    console.print("[bold]3.[/] Scroll to [bold]Approved Integrations[/] → "
+                  "click [bold]+ New Access Token[/].")
+    console.print("[bold]4.[/] Set Purpose = 'second-brain'. "
+                  "Leave [bold]Expires[/] blank for a long-lived token.")
+    console.print("[bold]5.[/] Click [bold]Generate Token[/], then copy the "
+                  "long string Canvas shows you (it's only shown once).")
+    console.print()
+
+    if console.input("Open the settings page now? [Y/n]: ").strip().lower() not in ("n", "no"):
+        try:
+            webbrowser.open(settings_url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    token = console.input("\nPaste the access token here: ").strip()
+    if not token:
+        console.print("[red]No token provided.[/]")
+        raise typer.Exit(code=1)
+
+    console.print("\n[dim]Verifying...[/]")
+    me = verify_canvas_token(base, token)
+    if me is None:
+        console.print(
+            "[red]Verification failed.[/]  Check:\n"
+            "  - The base URL is your Canvas root (e.g. https://canvas.cornell.edu)\n"
+            "  - You pasted the full token (it's a long string, no spaces)\n"
+            "  - Your school hasn't disabled personal access tokens "
+            "(rare, but the iCal fallback is documented in the connector)"
+        )
+        raise typer.Exit(code=1)
+
+    save_canvas_credentials(cfg, base, token)
+    name = me.get("name") or me.get("short_name") or "?"
+    login = me.get("login_id") or me.get("primary_email") or ""
+    console.print(f"[green]✓[/] Authorized as [bold]{name}[/]"
+                  + (f" ({login})" if login else ""))
+    console.print(f"  saved to [dim]{_credentials_path(cfg)}[/]")
+    console.print()
+    console.print("Now try:")
+    console.print("  [cyan]secondbrain sync canvas[/]")
+
+
 @app.command()
 def auth(
     provider: str = typer.Argument(
         "google",
-        help="Auth provider to set up: 'google' (Gmail / Calendar / Drive) "
-             "or 'extension' (browser-extension bearer token).",
+        help="Auth provider to set up: 'google' (Gmail / Calendar / Drive), "
+             "'canvas' (LMS personal access token), or 'extension' "
+             "(browser-extension bearer token).",
     ),
 ) -> None:
-    """One-time OAuth flow for a cloud provider, or print the extension token.
+    """Guided setup for a cloud provider.
 
     For 'google': make sure you've created an OAuth Desktop client in
     https://console.cloud.google.com and saved the JSON as
     ~/.secondbrain/google_client_secret.json. Then this command opens a
     browser, captures the redirect, and stores credentials. Subsequent
     Gmail / Google Calendar syncs auto-refresh.
+
+    For 'canvas': opens the Canvas token-generation page in your browser
+    (you'll do SSO + Duo *once*), prompts for the token, verifies it, and
+    saves it. From then on, syncs use the API directly — no SSO each time.
 
     For 'extension': prints (and creates if missing) the per-install bearer
     token for the browser extension. Paste it into the extension popup; the
@@ -425,9 +512,13 @@ def auth(
         )
         return
 
+    if provider == "canvas":
+        _auth_canvas(cfg)
+        return
+
     if provider != "google":
         console.print(f"[red]Unknown auth provider:[/] {provider}")
-        console.print("Try: 'google' or 'extension'.")
+        console.print("Try: 'google', 'canvas', or 'extension'.")
         raise typer.Exit(code=1)
 
     from .connectors._google_oauth import GoogleAuthError, run_oauth_flow

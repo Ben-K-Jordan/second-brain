@@ -178,6 +178,147 @@ def test_canvas_render_assignment_missing_id_returns_none():
     assert c._render_assignment("https://x", 1, "C", "C", {"name": "no id"}) is None
 
 
+# ---- Canvas credential plumbing (token saved to file vs. env vars) ----
+
+def test_canvas_save_and_load_credentials(tmp_cfg):
+    """Round-trip the token through the credentials file."""
+    from secondbrain.connectors.canvas import (
+        load_canvas_credentials,
+        save_canvas_credentials,
+    )
+
+    save_canvas_credentials(tmp_cfg, "https://canvas.cornell.edu", "abc123")
+    base, token = load_canvas_credentials(tmp_cfg)
+    assert base == "https://canvas.cornell.edu"
+    assert token == "abc123"
+
+
+def test_canvas_save_normalizes_url(tmp_cfg):
+    """Saving a bare hostname should add the scheme + strip trailing /."""
+    from secondbrain.connectors.canvas import (
+        load_canvas_credentials,
+        save_canvas_credentials,
+    )
+
+    save_canvas_credentials(tmp_cfg, "canvas.cornell.edu/", "tok")
+    base, _ = load_canvas_credentials(tmp_cfg)
+    assert base == "https://canvas.cornell.edu"
+
+
+def test_canvas_load_credentials_missing_file_returns_none(tmp_cfg):
+    from secondbrain.connectors.canvas import load_canvas_credentials
+
+    assert load_canvas_credentials(tmp_cfg) is None
+
+
+def test_canvas_load_credentials_corrupt_json_returns_none(tmp_cfg):
+    """Hand-edited / truncated credentials.json shouldn't crash sync."""
+    from secondbrain.connectors.canvas import (
+        _credentials_path,
+        load_canvas_credentials,
+    )
+
+    p = _credentials_path(tmp_cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("not valid json {{{", encoding="utf-8")
+    assert load_canvas_credentials(tmp_cfg) is None
+
+
+def test_canvas_required_env_prefers_env_over_file(tmp_cfg, monkeypatch):
+    """Env vars should win over the saved file so a one-off override works."""
+    from secondbrain.connectors.canvas import (
+        _required_env,
+        save_canvas_credentials,
+    )
+
+    save_canvas_credentials(tmp_cfg, "https://canvas.from-file.edu", "file-token")
+    monkeypatch.setenv("CANVAS_BASE_URL", "https://canvas.from-env.edu")
+    monkeypatch.setenv("CANVAS_TOKEN", "env-token")
+    base, token = _required_env(tmp_cfg)
+    assert base == "https://canvas.from-env.edu"
+    assert token == "env-token"
+
+
+def test_canvas_required_env_falls_back_to_file(tmp_cfg, monkeypatch):
+    """When env vars aren't set, the saved file is used."""
+    from secondbrain.connectors.canvas import (
+        _required_env,
+        save_canvas_credentials,
+    )
+
+    monkeypatch.delenv("CANVAS_BASE_URL", raising=False)
+    monkeypatch.delenv("CANVAS_TOKEN", raising=False)
+    save_canvas_credentials(tmp_cfg, "https://canvas.cornell.edu", "saved-tok")
+    base, token = _required_env(tmp_cfg)
+    assert base == "https://canvas.cornell.edu"
+    assert token == "saved-tok"
+
+
+def test_canvas_required_env_returns_none_when_unset(tmp_cfg, monkeypatch):
+    from secondbrain.connectors.canvas import _required_env
+
+    monkeypatch.delenv("CANVAS_BASE_URL", raising=False)
+    monkeypatch.delenv("CANVAS_TOKEN", raising=False)
+    assert _required_env(tmp_cfg) is None
+
+
+def test_canvas_is_enabled_via_saved_credentials(tmp_cfg, monkeypatch):
+    """is_enabled honours the saved credentials file, not just env vars,
+    so users who set up via `secondbrain auth canvas` don't need to also
+    export env vars in every shell."""
+    from secondbrain.connectors.canvas import (
+        CanvasConnector,
+        save_canvas_credentials,
+    )
+
+    monkeypatch.delenv("CANVAS_BASE_URL", raising=False)
+    monkeypatch.delenv("CANVAS_TOKEN", raising=False)
+    assert CanvasConnector().is_enabled(tmp_cfg) is False
+    save_canvas_credentials(tmp_cfg, "https://canvas.cornell.edu", "tok")
+    assert CanvasConnector().is_enabled(tmp_cfg) is True
+
+
+def test_canvas_verify_token_handles_401(monkeypatch):
+    """Bad token → returns None, doesn't raise."""
+    from secondbrain.connectors import canvas as cmod
+
+    class FakeResp:
+        status_code = 401
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(
+        cmod.requests, "get", lambda *a, **kw: FakeResp(),
+    )
+    assert cmod.verify_canvas_token("https://canvas.x.edu", "bad") is None
+
+
+def test_canvas_verify_token_returns_user_on_success(monkeypatch):
+    from secondbrain.connectors import canvas as cmod
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"id": 42, "name": "Test User", "login_id": "tu1@cornell.edu"}
+
+    monkeypatch.setattr(
+        cmod.requests, "get", lambda *a, **kw: FakeResp(),
+    )
+    me = cmod.verify_canvas_token("https://canvas.x.edu", "good")
+    assert me is not None
+    assert me["name"] == "Test User"
+
+
+def test_canvas_verify_token_handles_network_error(monkeypatch):
+    from secondbrain.connectors import canvas as cmod
+
+    def boom(*a, **kw):
+        raise cmod.requests.ConnectionError("dns fail")
+
+    monkeypatch.setattr(cmod.requests, "get", boom)
+    assert cmod.verify_canvas_token("https://canvas.x.edu", "tok") is None
+
+
 # ========================= Application tracker ========================
 
 def test_application_create_minimal(fresh_db):

@@ -5,15 +5,37 @@ gives you the full assignment description (rubrics, submission types,
 attachments, link to the Canvas page) plus your current submission
 status and grade — not just a date on a calendar.
 
-Setup:
-  1. In Canvas: Account → Settings → Approved Integrations → "+ New
-     Access Token". Copy the token.
-  2. Find your Canvas root URL (e.g. ``https://canvas.illinois.edu`` or
-     ``https://<school>.instructure.com``).
-  3. Set env vars::
+How auth actually works (re: SSO + Duo)
+---------------------------------------
+The Canvas web UI requires your school's SSO + Duo each time. The API
+does NOT. You generate a *personal access token* once (which itself
+requires one SSO+Duo login, since the token-generation page lives in
+Canvas), and from then on the connector authenticates with just
+``Authorization: Bearer <token>``. No SSO. No Duo. No browser dance.
 
-        CANVAS_BASE_URL=https://canvas.illinois.edu
+Easiest setup (recommended):
+
+    secondbrain auth canvas
+
+That command opens the token-generation page, walks you through it,
+verifies the token works, and saves it to
+``~/.secondbrain/canvas_credentials.json``.
+
+Manual setup (if you prefer env vars):
+  1. In Canvas: Account → Settings → Approved Integrations
+     → "+ New Access Token". Leave "Expires" blank for a non-expiring
+     token. Copy the value (it's only shown once).
+  2. Set env vars::
+
+        CANVAS_BASE_URL=https://canvas.<school>.edu  (or *.instructure.com)
         CANVAS_TOKEN=<your token>
+
+If your school disables personal access tokens (rare; Cornell + most
+US universities allow them), fall back to the iCal route: in Canvas
+go to Calendar → "Calendar Feed", copy the URL, and set
+``CALENDAR_ICS_URL=<that url>`` so the existing ICS calendar
+connector picks up assignment due dates as plain calendar events
+(without rubrics / grades / submissions).
 
 Optional config (in ``~/.secondbrain/config.toml``):
 
@@ -84,24 +106,113 @@ def _format_when(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _required_env() -> tuple[str, str] | None:
-    base = (os.environ.get("CANVAS_BASE_URL") or "").strip().rstrip("/")
-    token = (os.environ.get("CANVAS_TOKEN") or "").strip()
+# --- Credential plumbing ---------------------------------------------
+
+import json as _json  # noqa: E402  (kept local-scope feel; module is small)
+from pathlib import Path as _Path  # noqa: E402
+
+
+def _credentials_path(cfg: Config) -> _Path:
+    """Where ``secondbrain auth canvas`` writes the saved token."""
+    return cfg.data_dir / "canvas_credentials.json"
+
+
+def save_canvas_credentials(cfg: Config, base_url: str, token: str) -> None:
+    """Persist a Canvas base URL + token to a 0600 file in the data dir.
+
+    Mirrors the Google OAuth scaffold's storage style. The token is the
+    only secret in the file; we don't include anything PII-heavy.
+    """
+    base_url = base_url.strip().rstrip("/")
+    if base_url and not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    path = _credentials_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({"base_url": base_url, "token": token}, f)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Windows ignores the bits anyway; fine.
+        pass
+
+
+def load_canvas_credentials(cfg: Config) -> tuple[str, str] | None:
+    """Read the saved (base_url, token) tuple, or None if missing/corrupt."""
+    path = _credentials_path(cfg)
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (OSError, _json.JSONDecodeError):
+        return None
+    base = (data.get("base_url") or "").strip().rstrip("/")
+    token = (data.get("token") or "").strip()
     if not base or not token:
         return None
-    if not base.startswith(("http://", "https://")):
-        base = "https://" + base
     return base, token
+
+
+def verify_canvas_token(base_url: str, token: str) -> dict | None:
+    """Probe ``/api/v1/users/self`` to confirm the token works.
+
+    Returns the user JSON on success, None on any failure (bad token,
+    base URL typo, network error). Cheap — one quick GET.
+    """
+    base_url = base_url.strip().rstrip("/")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    try:
+        r = requests.get(
+            f"{base_url}/api/v1/users/self",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        log.warning("Canvas token verify failed: %s", type(e).__name__)
+        return None
+    if r.status_code != 200:
+        log.warning("Canvas token verify HTTP %s", r.status_code)
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
+def _required_env(cfg: Config | None = None) -> tuple[str, str] | None:
+    """Resolve the (base_url, token) pair from env vars or saved creds.
+
+    Env vars win over the credentials file, so you can override on the
+    command line for one-off testing. ``cfg`` is required to read the
+    saved-credentials file; passed as None means "env only".
+    """
+    base = (os.environ.get("CANVAS_BASE_URL") or "").strip().rstrip("/")
+    token = (os.environ.get("CANVAS_TOKEN") or "").strip()
+    if base and token:
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+        return base, token
+    if cfg is not None:
+        saved = load_canvas_credentials(cfg)
+        if saved is not None:
+            return saved
+    return None
 
 
 class CanvasConnector:
     name = "canvas"
 
     def is_enabled(self, cfg: Config) -> bool:
-        return _required_env() is not None
+        return _required_env(cfg) is not None
 
     def fetch(self, cfg: Config) -> Iterator[ConnectorDocument]:
-        creds = _required_env()
+        creds = _required_env(cfg)
         if creds is None:
             return
         base, token = creds
