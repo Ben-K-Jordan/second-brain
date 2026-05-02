@@ -1320,6 +1320,169 @@ def brief_today(
     conn.close()
 
 
+tasks_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 47 tasks. First-class action items extracted from "
+         "meeting transcripts (Granola, Plaud, generic) and ad-hoc "
+         "ones you add manually. Use `tasks list` for what's open and "
+         "`tasks done <id>` to close one.",
+)
+app.add_typer(tasks_app, name="tasks")
+
+
+@tasks_app.command("list")
+def tasks_list(
+    show_done: bool = typer.Option(
+        False, "--done/--no-done",
+        help="Also show recently-completed tasks.",
+    ),
+    extract: bool = typer.Option(
+        True, "--extract/--no-extract",
+        help="Materialise tasks from recent transcripts before listing.",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """List open tasks (and recently-done with ``--done``)."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if extract:
+        n = tasks_mod.materialize_from_transcripts(conn)
+        if n:
+            console.print(f"[dim]extracted {n} new task(s) from transcripts[/]")
+    open_rows = tasks_mod.list_open(conn, limit=limit)
+    if not open_rows and not show_done:
+        console.print("[green]Inbox zero.[/] No open tasks.")
+        conn.close()
+        return
+    if open_rows:
+        table = Table(show_header=True, box=None, title="Open tasks")
+        table.add_column("id", style="dim", width=4)
+        table.add_column("text")
+        table.add_column("source", style="dim")
+        for t in open_rows:
+            src = "" if t.source_path == "manual" else t.source_title
+            table.add_row(str(t.id), t.text, src[:40])
+        console.print(table)
+        console.print(f"[dim]{len(open_rows)} open task(s)[/]")
+    if show_done:
+        done = tasks_mod.list_recent_done(conn, limit=limit)
+        if done:
+            table = Table(
+                show_header=True, box=None, title="Recently done",
+            )
+            table.add_column("id", style="dim", width=4)
+            table.add_column("text")
+            table.add_column("done", style="dim")
+            for t in done:
+                when = (
+                    time.strftime("%Y-%m-%d %H:%M",
+                                  time.localtime(t.completed_at))
+                    if t.completed_at else "—"
+                )
+                table.add_row(str(t.id), t.text, when)
+            console.print(table)
+    conn.close()
+
+
+@tasks_app.command("add")
+def tasks_add(
+    text: str = typer.Argument(..., help="Task text. Quote it if it has spaces."),
+) -> None:
+    """Add a manual task. Useful for things that didn't come out of a
+    meeting (or that you want to track outside the brain)."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    tid = tasks_mod.add_manual(conn, text)
+    if tid is None:
+        console.print("[red]Empty task text — nothing to add.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print(f"[green]Added task #{tid}:[/] {text}")
+    conn.close()
+
+
+@tasks_app.command("done")
+def tasks_done(
+    task_id: int = typer.Argument(..., help="Task id (from `tasks list`)."),
+) -> None:
+    """Mark a task complete. It stops showing up in the daily brief."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    t = tasks_mod.get(conn, task_id)
+    if t is None:
+        console.print(f"[red]Task #{task_id} not found.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    if not tasks_mod.mark_done(conn, task_id):
+        console.print(f"[yellow]Task #{task_id} was already done.[/]")
+    else:
+        console.print(f"[green]✓[/] #{task_id}: {t.text}")
+    conn.close()
+
+
+@tasks_app.command("cancel")
+def tasks_cancel(
+    task_id: int = typer.Argument(..., help="Task id."),
+) -> None:
+    """Mark a task cancelled (didn't do it; not going to)."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    t = tasks_mod.get(conn, task_id)
+    if t is None:
+        console.print(f"[red]Task #{task_id} not found.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    tasks_mod.mark_cancelled(conn, task_id)
+    console.print(f"[dim]✗[/] #{task_id}: {t.text}")
+    conn.close()
+
+
+@tasks_app.command("rm")
+def tasks_rm(
+    task_id: int = typer.Argument(..., help="Task id."),
+) -> None:
+    """Hard-delete a task. Useful for fixing typos in manual adds."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if not tasks_mod.delete(conn, task_id):
+        console.print(f"[red]Task #{task_id} not found.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print(f"[dim]Deleted #{task_id}[/]")
+    conn.close()
+
+
+@tasks_app.command("extract")
+def tasks_extract(
+    days: int = typer.Option(
+        14, "--days", "-d",
+        help="How many days of transcripts to scan.",
+    ),
+) -> None:
+    """Force-extract tasks from recent transcripts. Idempotent —
+    won't duplicate tasks you've already extracted or completed."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    n = tasks_mod.materialize_from_transcripts(conn, lookback_days=days)
+    if n == 0:
+        console.print("[dim]No new tasks found.[/]")
+    else:
+        console.print(f"[green]Extracted {n} new task(s).[/]")
+    conn.close()
+
+
 apply_app = typer.Typer(
     no_args_is_help=True,
     help="Track jobs you've applied to. The watchlist agent skips "

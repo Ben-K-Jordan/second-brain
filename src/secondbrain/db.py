@@ -368,6 +368,33 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         );
         CREATE INDEX IF NOT EXISTS idx_click_path_ts ON click_log(path, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_click_ts ON click_log(ts DESC);
+
+        -- Tasks (Phase 47): first-class action items. Materialised lazily
+        -- from transcript-shaped docs (Granola action items, generic
+        -- meeting `- [ ]` checkboxes) and from manual `tasks add` calls.
+        --
+        -- UNIQUE on (text_lower, source_path) so the same item can't
+        -- double-extract on every brief render. ``source_path`` is the
+        -- transcript:// virtual path (or 'manual' for ad-hoc tasks).
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            text_lower TEXT NOT NULL,
+            source_path TEXT NOT NULL,        -- transcript:// path or 'manual'
+            source_title TEXT,                -- doc title for back-reference UX
+            status TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'done' | 'cancelled'
+            created_at REAL NOT NULL,
+            completed_at REAL,
+            due_at REAL,                      -- nullable; future use
+            -- External-sync hooks (Phase 47.x). Empty string when not
+            -- synced; provider names: 'apple_reminders' | 'todoist' | ''.
+            external_id TEXT NOT NULL DEFAULT '',
+            external_provider TEXT NOT NULL DEFAULT '',
+            UNIQUE(text_lower, source_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_created
+            ON tasks(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_source_path ON tasks(source_path);
     """)
 
     existing_dim = get_meta(conn, "embedding_dim")

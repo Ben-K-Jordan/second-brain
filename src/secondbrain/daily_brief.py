@@ -237,42 +237,34 @@ def _read_canvas_title_and_url(
 # ---- section: open action items --------------------------------------
 
 def _open_action_items(conn: sqlite3.Connection) -> list[ActionItem]:
-    """Pull Markdown ``- [ ]`` checkboxes from recent transcript-shaped
-    docs. Caps the list so one long meeting doesn't dominate.
+    """Open tasks, sourced from the ``tasks`` table (Phase 47).
 
-    We only look at ``transcript://`` paths — those are the ones the
-    Granola / Plaud / generic transcript pipeline produces with
-    structured action-items sections.
+    Materialises any new action items from recently-ingested
+    transcripts on the fly so the brief always reflects the latest
+    meeting — without re-extracting items the user has already ticked
+    off (those stay ``done`` in the table).
     """
-    cutoff = time.time() - _ACTION_ITEM_LOOKBACK_DAYS * 86400
-    rows = conn.execute(
-        "SELECT f.id AS fid, f.path AS path, c.text AS text "
-        "FROM chunks c JOIN files f ON f.id = c.file_id "
-        "WHERE f.path LIKE 'transcript://%' "
-        "  AND f.indexed_at >= ? "
-        "  AND c.text LIKE '%[ ]%' "
-        "ORDER BY f.indexed_at DESC, f.id DESC, c.chunk_index ASC",
-        (cutoff,),
-    ).fetchall()
-    out: list[ActionItem] = []
-    seen: set[tuple[str, str]] = set()  # dedupe by (path, text-lower)
-    for r in rows:
-        text = r["text"] or ""
-        title = _read_doc_title(conn, r["fid"], r["path"])
-        for m in _CHECKBOX_RE.finditer(text):
-            item = m.group(1).strip()
-            if not item:
-                continue
-            key = (r["path"], item.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(ActionItem(
-                text=item, source_path=r["path"], source_title=title,
-            ))
-            if len(out) >= _ACTION_ITEM_MAX:
-                return out
-    return out
+    from . import tasks as tasks_mod
+
+    # Idempotent — INSERT-OR-IGNORE per item, so this is safe to call
+    # on every brief render.
+    try:
+        tasks_mod.materialize_from_transcripts(
+            conn, lookback_days=_ACTION_ITEM_LOOKBACK_DAYS,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Materialisation is best-effort — a malformed chunk shouldn't
+        # take down the whole brief.
+        log.warning("daily brief: task materialisation failed: %s", e)
+    rows = tasks_mod.list_open(conn, limit=_ACTION_ITEM_MAX)
+    return [
+        ActionItem(
+            text=t.text,
+            source_path=t.source_path,
+            source_title=t.source_title,
+        )
+        for t in rows
+    ]
 
 
 def _read_doc_title(
