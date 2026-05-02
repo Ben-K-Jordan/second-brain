@@ -147,6 +147,14 @@ class Config:
     download_path_prefixes: tuple[str, ...] = ("/Downloads/",)
     download_path_demote: float = 0.85
 
+    # Click-feedback ranking: paths the user opened recently get a small
+    # multiplicative boost on subsequent searches. Decays with a half-life
+    # so a path you clicked once last month doesn't dominate forever.
+    # Set click_boost_max to 1.0 to disable entirely.
+    click_boost_enabled: bool = True
+    click_boost_max: float = 1.25  # multiplier when clicked just now
+    click_boost_half_life_days: float = 14.0
+
     # Media transcription (audio/video -> text via faster-whisper)
     transcribe_enabled: bool = True
     whisper_model_size: str = "small"  # tiny/base/small/medium/large-v3
@@ -366,6 +374,12 @@ def load_config(path: Path | None = None) -> Config:
             cfg.download_path_prefixes = tuple(data["download_path_prefixes"])
         if "download_path_demote" in data:
             cfg.download_path_demote = float(data["download_path_demote"])
+        if "click_boost_enabled" in data:
+            cfg.click_boost_enabled = bool(data["click_boost_enabled"])
+        if "click_boost_max" in data:
+            cfg.click_boost_max = float(data["click_boost_max"])
+        if "click_boost_half_life_days" in data:
+            cfg.click_boost_half_life_days = float(data["click_boost_half_life_days"])
         if "transcribe_enabled" in data:
             cfg.transcribe_enabled = bool(data["transcribe_enabled"])
         if "whisper_model_size" in data:

@@ -143,6 +143,8 @@ def search_brain(
         personal_boost=cfg.personal_path_boost,
         download_prefixes=cfg.download_path_prefixes,
         download_demote=cfg.download_path_demote,
+        click_boost_max=cfg.click_boost_max if cfg.click_boost_enabled else 1.0,
+        click_boost_half_life_days=cfg.click_boost_half_life_days,
         cfg=cfg,
     )
     _log_query(cfg, query, "search_brain", results)

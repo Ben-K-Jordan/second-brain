@@ -190,6 +190,27 @@ def _path_score_multiplier(
     return 1.0
 
 
+def _click_recency_multiplier(
+    last_click_ts: float | None,
+    boost_max: float,
+    half_life_days: float,
+    now: float | None = None,
+) -> float:
+    """Exponential decay from ``boost_max`` (just clicked) down to 1.0
+    (never clicked / clicked long ago). At one half-life, multiplier is
+    halfway between 1.0 and ``boost_max``.
+
+    Click feedback is gentle on purpose: a recent click is a positive signal
+    but shouldn't drown out a better-matching new result.
+    """
+    if not last_click_ts or boost_max <= 1.0:
+        return 1.0
+    now = now if now is not None else time.time()
+    age_days = max(0.0, (now - last_click_ts) / 86400.0)
+    decay = math.exp(-math.log(2) * age_days / max(1e-6, half_life_days))
+    return 1.0 + (boost_max - 1.0) * decay
+
+
 def _vector_search(
     conn: sqlite3.Connection, query_embedding: list[float], k: int
 ) -> list[tuple[int, float]]:
@@ -322,6 +343,8 @@ def hybrid_search(
     personal_boost: float = 1.0,
     download_prefixes: tuple[str, ...] = (),
     download_demote: float = 1.0,
+    click_boost_max: float = 1.0,
+    click_boost_half_life_days: float = 14.0,
     cfg: Config | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search and return up to k merged results.
@@ -384,6 +407,35 @@ def hybrid_search(
         (personal_prefixes and personal_boost != 1.0)
         or (download_prefixes and download_demote != 1.0)
     )
+    apply_click_boost = click_boost_max > 1.0
+    click_index: dict[str, float] = {}
+    if apply_click_boost:
+        # Pull recent clicks once for the whole result set. Cheap query;
+        # ~one row per path the user has opened in the last 30 days.
+        from .db import recent_clicks_by_path
+        try:
+            click_index = recent_clicks_by_path(conn)
+        except Exception:  # noqa: BLE001
+            # Fresh DBs without the click_log table (very old install) just
+            # skip the boost rather than crash the search.
+            click_index = {}
+            apply_click_boost = False
+
+    def _multipliers(path: str) -> float:
+        m = 1.0
+        if apply_path_boost:
+            m *= _path_score_multiplier(
+                path, personal_prefixes, personal_boost,
+                download_prefixes, download_demote,
+            )
+        if apply_click_boost:
+            ts = click_index.get(path)
+            if ts is not None:
+                m *= _click_recency_multiplier(
+                    ts, click_boost_max, click_boost_half_life_days,
+                )
+        return m
+
     if time_decay_weight > 0 and candidates:
         max_rrf = max(s for _, (s, _) in candidates) or 1.0
         decayed: list[tuple[int, float, set[str]]] = []
@@ -395,25 +447,17 @@ def hybrid_search(
             recency = _time_decay_factor(mtime, time_decay_half_life_days, now=now)
             normalized = rrf_score / max_rrf
             blended = (1 - time_decay_weight) * normalized + time_decay_weight * recency
-            if apply_path_boost:
-                blended *= _path_score_multiplier(
-                    path, personal_prefixes, personal_boost,
-                    download_prefixes, download_demote,
-                )
+            blended *= _multipliers(path)
             decayed.append((cid, blended, sources))
         decayed.sort(key=lambda x: -x[1])
         ordered_candidates = decayed
-    elif apply_path_boost and candidates:
+    elif (apply_path_boost or apply_click_boost) and candidates:
         boosted: list[tuple[int, float, set[str]]] = []
         for cid, (rrf_score, sources) in candidates:
             if cid not in hydrated:
                 continue
             path = hydrated[cid][0]
-            mult = _path_score_multiplier(
-                path, personal_prefixes, personal_boost,
-                download_prefixes, download_demote,
-            )
-            boosted.append((cid, rrf_score * mult, sources))
+            boosted.append((cid, rrf_score * _multipliers(path), sources))
         boosted.sort(key=lambda x: -x[1])
         ordered_candidates = boosted
     else:

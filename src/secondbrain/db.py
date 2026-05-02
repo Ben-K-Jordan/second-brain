@@ -200,6 +200,48 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
     if "start_offset" not in cols:
         conn.execute("ALTER TABLE chunks ADD COLUMN start_offset INTEGER")
 
+    # Chat conversations: each conversation has many turns, each turn has a
+    # role (user / assistant) and a content blob. Citations are stored per
+    # assistant turn so we can re-render past chats with their sources.
+    # Kept in the same DB so a `secondbrain reset` clears chat history too.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS chat_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_conv_updated
+            ON chat_conversations(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL
+                REFERENCES chat_conversations(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,            -- 'user' | 'assistant'
+            content_json TEXT NOT NULL,    -- JSON string ('text' for user; blocks list for assistant)
+            citations_json TEXT,           -- JSON list of citation dicts (assistant only)
+            created_at REAL NOT NULL,
+            UNIQUE(conversation_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_msgs_conv
+            ON chat_messages(conversation_id, seq);
+
+        -- Click-feedback: records which result paths the user actually
+        -- opened from /search, /chat, /entity, etc. Used as a passive
+        -- recency-weighted boost in ranking.
+        CREATE TABLE IF NOT EXISTS click_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            chunk_id INTEGER,              -- nullable: clicks from non-search paths
+            source TEXT NOT NULL,          -- 'search' | 'chat' | 'palette' | 'entity'
+            ts REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_click_path_ts ON click_log(path, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_click_ts ON click_log(ts DESC);
+    """)
+
     existing_dim = get_meta(conn, "embedding_dim")
     existing_embedder = get_meta(conn, "embedder_name")
     if existing_dim and int(existing_dim) != embedding_dim:
@@ -425,6 +467,132 @@ def insert_entities(
             "VALUES (?, ?, ?, ?)",
             (chunk_id, text, text.lower(), label),
         )
+
+
+def chat_create_conversation(conn: sqlite3.Connection, title: str) -> int:
+    """Make a new chat conversation; return its id."""
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO chat_conversations(title, created_at, updated_at) "
+        "VALUES (?, ?, ?) RETURNING id",
+        (title, now, now),
+    )
+    cid = cur.fetchone()["id"]
+    conn.commit()
+    return cid
+
+
+def chat_append_message(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    role: str,
+    content_json: str,
+    citations_json: str | None = None,
+) -> int:
+    """Append a message to a conversation. Returns the new message id."""
+    now = time.time()
+    seq_row = conn.execute(
+        "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq "
+        "FROM chat_messages WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchone()
+    seq = seq_row["next_seq"]
+    cur = conn.execute(
+        "INSERT INTO chat_messages"
+        "(conversation_id, seq, role, content_json, citations_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        (conversation_id, seq, role, content_json, citations_json, now),
+    )
+    mid = cur.fetchone()["id"]
+    conn.execute(
+        "UPDATE chat_conversations SET updated_at = ? WHERE id = ?",
+        (now, conversation_id),
+    )
+    conn.commit()
+    return mid
+
+
+def chat_list_conversations(
+    conn: sqlite3.Connection, limit: int = 50
+) -> list[sqlite3.Row]:
+    """Most-recently-updated conversations first, with message counts."""
+    return conn.execute(
+        "SELECT c.id, c.title, c.created_at, c.updated_at, "
+        "       (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id) AS n_messages "
+        "FROM chat_conversations c "
+        "ORDER BY c.updated_at DESC "
+        "LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def chat_get_conversation(
+    conn: sqlite3.Connection, conversation_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM chat_conversations WHERE id = ?",
+        (conversation_id,),
+    ).fetchone()
+
+
+def chat_get_messages(
+    conn: sqlite3.Connection, conversation_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY seq ASC",
+        (conversation_id,),
+    ).fetchall()
+
+
+def chat_delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
+    conn.execute(
+        "DELETE FROM chat_conversations WHERE id = ?", (conversation_id,)
+    )
+    conn.commit()
+
+
+def chat_rename_conversation(
+    conn: sqlite3.Connection, conversation_id: int, title: str
+) -> None:
+    conn.execute(
+        "UPDATE chat_conversations SET title = ? WHERE id = ?",
+        (title, conversation_id),
+    )
+    conn.commit()
+
+
+# --- Click-feedback ---------------------------------------------------
+
+def log_click(
+    conn: sqlite3.Connection,
+    path: str,
+    source: str,
+    chunk_id: int | None = None,
+) -> None:
+    """Record that the user opened ``path`` from a result list. Recent
+    clicks bump the path's ranking via ``recent_click_boost``."""
+    conn.execute(
+        "INSERT INTO click_log(path, chunk_id, source, ts) VALUES (?, ?, ?, ?)",
+        (path, chunk_id, source, time.time()),
+    )
+    conn.commit()
+
+
+def recent_clicks_by_path(
+    conn: sqlite3.Connection, since_seconds: float = 30 * 86400
+) -> dict[str, float]:
+    """Return ``{path: most_recent_click_ts}`` for clicks newer than the cutoff.
+
+    Used by the search ranker to compute a small recency boost on paths the
+    user has actually opened recently. Default window is 30 days.
+    """
+    cutoff = time.time() - since_seconds
+    rows = conn.execute(
+        "SELECT path, MAX(ts) AS last_ts FROM click_log "
+        "WHERE ts >= ? GROUP BY path",
+        (cutoff,),
+    ).fetchall()
+    return {r["path"]: r["last_ts"] for r in rows}
 
 
 def stats(conn: sqlite3.Connection) -> dict[str, int | str | None]:

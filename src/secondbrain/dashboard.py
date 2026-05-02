@@ -521,6 +521,40 @@ td.num { font-family: var(--mono); text-align: right; color: var(--amber); }
 """
 
 
+CLICK_BEACON_JS = r"""
+(function () {
+    // Listens for clicks on any [data-sb-click] link and fires a tiny POST
+    // to /api/click before the navigation happens. Uses sendBeacon when
+    // available so the request reliably ships even though we're leaving
+    // the page. Falls back to a fire-and-forget fetch otherwise.
+    document.addEventListener('click', function (ev) {
+        const a = ev.target && ev.target.closest && ev.target.closest('[data-sb-click]');
+        if (!a) return;
+        const path = a.getAttribute('data-sb-path') || '';
+        const chunkId = a.getAttribute('data-sb-chunk') || '';
+        const source = a.getAttribute('data-sb-source') || 'unknown';
+        if (!path) return;
+        const payload = JSON.stringify({ path, chunk_id: chunkId, source });
+        try {
+            if (navigator.sendBeacon) {
+                navigator.sendBeacon(
+                    '/api/click',
+                    new Blob([payload], { type: 'application/json' })
+                );
+            } else {
+                fetch('/api/click', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: payload,
+                    keepalive: true,
+                }).catch(() => { /* best-effort */ });
+            }
+        } catch (_) { /* swallow */ }
+    }, true);
+})();
+"""
+
+
 CHAT_JS = r"""
 (function () {
     const log = document.getElementById('chat-log');
@@ -655,6 +689,16 @@ CHAT_JS = r"""
                         bub.textContent = assembled;
                     }
                     renderCitations(cites, ev.data && ev.data.citations);
+                } else if (ev.kind === 'meta') {
+                    // First message of a fresh conversation: server tells us
+                    // the new conversation id. Update the URL (and the page
+                    // title bar) without forcing a full reload, so the user
+                    // can deep-link or refresh and stay on the same chat.
+                    if (ev.data && ev.data.created_now && ev.data.cid) {
+                        try {
+                            window.history.replaceState({}, '', `/chat/${ev.data.cid}`);
+                        } catch (_) { /* old browser; harmless */ }
+                    }
                 } else if (ev.kind === 'error') {
                     assembled += `\n[error] ${ev.data}`;
                     bub.textContent = assembled;
@@ -902,20 +946,26 @@ def _layout(title: str, body: str, active: str = "") -> str:
         </div>
     </div>
     <script>{PALETTE_JS}</script>
+    <script>{CLICK_BEACON_JS}</script>
 </body>
 </html>
 """
 
 
-def _result_block(r) -> str:
+def _result_block(r, source_label: str = "search") -> str:
     sources = "+".join(r.sources) if r.sources else "rerank"
     age = ""
     if r.mtime is not None:
         days = (time.time() - r.mtime) / 86400
         age = f" · {days:.1f}d ago"
     snippet = escape(r.text if len(r.text) <= 1500 else r.text[:1500] + "…")
+    # data-* attributes drive the click-feedback beacon. The JS in CLICK_JS
+    # listens for clicks anywhere inside .result and POSTs /api/click with
+    # the path/chunk_id; subsequent searches lift recently-opened paths.
     file_link = (
-        f'<a href="/file?path={urllib.parse.quote_plus(r.file_path)}">'
+        f'<a href="/file?path={urllib.parse.quote_plus(r.file_path)}" '
+        f'data-sb-click="1" data-sb-path="{escape(r.file_path)}" '
+        f'data-sb-chunk="{r.chunk_id}" data-sb-source="{escape(source_label)}">'
         f"{escape(r.file_path)}</a>"
     )
     return f"""
@@ -1080,6 +1130,8 @@ def create_app():
                 personal_boost=cfg.personal_path_boost,
                 download_prefixes=cfg.download_path_prefixes,
                 download_demote=cfg.download_path_demote,
+                click_boost_max=cfg.click_boost_max if cfg.click_boost_enabled else 1.0,
+                click_boost_half_life_days=cfg.click_boost_half_life_days,
                 cfg=cfg,
             )
             if results:
@@ -1513,17 +1565,13 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout(Path(path).name or path, body))
 
     # --- Chat with your brain ----------------------------------------
-    # State lives in-process per session_id (cookie-based). Restarting the
-    # dashboard wipes it; that's fine for a single-user tool.
-    _chat_sessions: dict[str, list[dict]] = {}
+    # Conversations persist to the index DB (chat_conversations + chat_messages),
+    # so a `secondbrain reset` clears them with everything else. The browser
+    # session cookie tracks which conversation is "current" for that browser.
+    # Switching to /chat/N picks up that conversation; /chat/new starts fresh.
 
     def _chat_json_default(o: Any) -> Any:
-        """Make Anthropic SDK content-block objects JSON-serialisable.
-
-        We never *send* assistant content blocks to the client - only the
-        events we explicitly construct. But Pydantic BaseModel instances
-        sometimes leak through default=, so render them via .model_dump.
-        """
+        """Make Anthropic SDK content-block objects JSON-serialisable."""
         if hasattr(o, "model_dump"):
             return o.model_dump(exclude_none=True)
         if hasattr(o, "__dict__"):
@@ -1531,12 +1579,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return str(o)
 
     def _serialize_chat_history(history: list[dict]) -> list[dict]:
-        """Persist a chat history into JSON-safe dicts.
-
-        Anthropic returns content blocks as Pydantic objects. We need to
-        convert them to plain dicts so the next request can pass them
-        straight back to the SDK without round-trip-via-pickle hazards.
-        """
+        """Convert a chat history (mix of strings + Anthropic content blocks)
+        into JSON-safe dicts so it survives a DB round-trip."""
         out: list[dict] = []
         for msg in history:
             content = msg.get("content")
@@ -1555,72 +1599,153 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 out.append({"role": msg["role"], "content": blocks})
         return out
 
-    def _get_chat_session(request: Request, response_headers: dict | None = None) -> tuple[str, list[dict]]:
-        """Return (session_id, history) for this browser. Issues a fresh
-        session_id cookie on first contact (caller writes the Set-Cookie)."""
-        sid = request.cookies.get("sb_chat_sid", "")
-        if not sid or sid not in _chat_sessions:
-            sid = secrets.token_urlsafe(16)
-            _chat_sessions[sid] = []
-        return sid, _chat_sessions[sid]
+    def _load_history_from_db(conn, conversation_id: int) -> list[dict]:
+        """Replay chat_messages rows into Anthropic-format history."""
+        from .db import chat_get_messages
 
-    @app.get("/chat", response_class=HTMLResponse)
-    def chat_page(request: Request):
-        cfg, _, _, _ = get_state()
-        sid, history = _get_chat_session(request)
-        # Render any existing turns from the session so a refresh keeps state.
-        rendered = ""
-        for msg in history:
-            role = msg.get("role")
+        history: list[dict] = []
+        for row in chat_get_messages(conn, conversation_id):
+            try:
+                content = json.loads(row["content_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            history.append({"role": row["role"], "content": content})
+        return history
+
+    def _render_history_html(conn, conversation_id: int) -> str:
+        """Render past turns of a saved conversation as HTML for /chat/N."""
+        from .db import chat_get_messages
+
+        chunks: list[str] = []
+        for row in chat_get_messages(conn, conversation_id):
+            role = row["role"]
+            try:
+                content = json.loads(row["content_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
             if role == "user":
-                content = msg.get("content")
                 txt = content if isinstance(content, str) else ""
-                if txt:
-                    rendered += (
-                        f'<div class="chat-msg chat-user"><div class="chat-bubble">'
-                        f'{escape(txt)}</div></div>'
-                    )
+                if not txt:
+                    continue
+                chunks.append(
+                    f'<div class="chat-msg chat-user"><div class="chat-bubble">'
+                    f'{escape(txt)}</div></div>'
+                )
             elif role == "assistant":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    txt = "".join(
-                        getattr(b, "text", "") if hasattr(b, "text")
-                        else (b.get("text", "") if isinstance(b, dict) else "")
-                        for b in content
-                    )
-                    if txt.strip():
-                        rendered += (
-                            f'<div class="chat-msg chat-assistant"><div class="chat-bubble">'
-                            f'{escape(txt)}</div></div>'
+                if not isinstance(content, list):
+                    continue
+                txt = "".join(
+                    b.get("text", "") if isinstance(b, dict) and b.get("type") == "text" else ""
+                    for b in content
+                )
+                if not txt.strip():
+                    continue
+                cite_html = ""
+                if row["citations_json"]:
+                    try:
+                        cites = json.loads(row["citations_json"])
+                    except json.JSONDecodeError:
+                        cites = []
+                    if cites:
+                        cite_html = (
+                            '<div class="chat-citations">'
+                            '<div class="muted" style="font-size:11px;letter-spacing:0.06em;'
+                            f'text-transform:uppercase;">Sources ({len(cites)})</div>'
                         )
-        body = f"""
+                        for c in cites:
+                            href = "/file?path=" + urllib.parse.quote_plus(c.get("file_path", ""))
+                            label = escape(c.get("file_path", "")) + (
+                                f' · chunk {c.get("chunk_index")}'
+                                if c.get("chunk_index") is not None else ""
+                            )
+                            snip = escape(c.get("text", ""))
+                            cite_html += (
+                                f'<div class="chat-citation"><a href="{href}">{label}</a>'
+                                f'<div class="chat-citation-snippet">{snip}</div></div>'
+                            )
+                        cite_html += "</div>"
+                chunks.append(
+                    f'<div class="chat-msg chat-assistant"><div class="chat-bubble">'
+                    f'{escape(txt)}</div>{cite_html}</div>'
+                )
+        return "".join(chunks)
+
+    def _resolve_active_cid(request: Request, conn) -> int | None:
+        """Return the conversation_id this browser session is currently on,
+        or None if the user is on the 'new' chat page."""
+        from .db import chat_get_conversation
+
+        raw = request.cookies.get("sb_chat_cid", "")
+        if not raw:
+            return None
+        try:
+            cid = int(raw)
+        except ValueError:
+            return None
+        if chat_get_conversation(conn, cid) is None:
+            return None
+        return cid
+
+    def _chat_page_body(cfg: Config, history_html: str, cid: int | None,
+                       title: str | None) -> str:
+        """Shared HTML for /chat (new) and /chat/N (existing)."""
+        title_bar = ""
+        if cid is not None:
+            title_bar = (
+                f'<div class="chat-titlebar">'
+                f'  <span class="chat-title">{escape(title or "(untitled)")}</span>'
+                f'  <a href="/chat/list" class="chat-titlebar-link">all chats</a>'
+                f'  <a href="/chat" class="chat-titlebar-link">+ new</a>'
+                f'</div>'
+            )
+        else:
+            title_bar = (
+                '<div class="chat-titlebar">'
+                '  <span class="chat-title">New conversation</span>'
+                '  <a href="/chat/list" class="chat-titlebar-link">all chats</a>'
+                '</div>'
+            )
+        empty_state = (
+            '<div class="empty">Ask anything that lives in your brain.</div>'
+        )
+        return f"""
 <h1>Chat with your brain</h1>
 <p class="muted" style="margin-top:-8px;">
     Conversational Q&amp;A grounded in everything you've indexed. Uses
     <code>{escape(cfg.chat_model)}</code> with <code>search_brain</code> as a
-    tool — answers cite their sources. History resets on page reload only if
-    you click <a href="/chat/reset">reset</a>.
+    tool — answers cite their sources. Conversations persist; revisit them
+    on the <a href="/chat/list">all chats</a> page.
 </p>
-
-<div id="chat-log" class="chat-log">{rendered or '<div class="empty">Ask anything that lives in your brain.</div>'}</div>
+{title_bar}
+<div id="chat-log" class="chat-log">{history_html or empty_state}</div>
 
 <form id="chat-form" class="chat-form">
     <textarea id="chat-input" rows="2" placeholder="What was that thing about Voyage rate limits?" autofocus></textarea>
     <div class="chat-form-row">
         <button type="submit" id="chat-send">Send</button>
-        <a href="/chat/reset" class="chat-reset">reset conversation</a>
+        <span style="flex:1"></span>
+        {"<a href='/chat' class='chat-reset'>start new conversation</a>" if cid else ""}
     </div>
 </form>
 
 <style>
+.chat-titlebar {{
+    display: flex; align-items: center; gap: 14px;
+    padding: 8px 12px; margin-bottom: 8px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: #0c0c0c; font-size: 12.5px;
+}}
+.chat-title {{ flex: 1; color: var(--green); font-family: var(--mono); }}
+.chat-titlebar-link {{ color: #888; font-size: 12px; }}
+.chat-titlebar-link:hover {{ color: var(--green); }}
 .chat-log {{
     display: flex; flex-direction: column; gap: 14px;
     padding: 16px; min-height: 280px;
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 4px;
 }}
-.chat-msg {{ display: flex; }}
-.chat-user {{ justify-content: flex-end; }}
+.chat-msg {{ display: flex; flex-direction: column; }}
+.chat-user {{ align-items: flex-end; }}
 .chat-bubble {{
     max-width: 80%; padding: 10px 14px; border-radius: 4px;
     border: 1px solid var(--border); white-space: pre-wrap; line-height: 1.55;
@@ -1663,39 +1788,139 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
 <script>{CHAT_JS}</script>
 """
-        html = _layout("Chat", body, "chat")
-        resp = HTMLResponse(html)
-        # Ensure the session cookie is set on first visit.
+
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat_page(request: Request):
+        """New conversation. Doesn't create a row until the user sends."""
+        cfg, conn, _, _ = get_state()
+        # If the user just clicked "new", clear their cookie so the next
+        # message starts a fresh row.
+        body = _chat_page_body(cfg, "", None, None)
+        resp = HTMLResponse(_layout("Chat", body, "chat"))
+        resp.delete_cookie("sb_chat_cid", path="/")
+        return resp
+
+    @app.get("/chat/list", response_class=HTMLResponse)
+    def chat_list_page():
+        """All saved conversations, most recent first."""
+        from .db import chat_list_conversations
+
+        cfg, conn, _, _ = get_state()
+        rows = chat_list_conversations(conn, limit=200)
+        if not rows:
+            body = (
+                "<h1>Past conversations</h1>"
+                "<div class='empty'>No saved chats yet. "
+                "<a href='/chat'>Start one →</a></div>"
+            )
+            return HTMLResponse(_layout("Chat history", body, "chat"))
+        items: list[str] = []
+        for r in rows:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated_at"]))
+            items.append(
+                f'<a class="chat-listrow" href="/chat/{r["id"]}">'
+                f'  <div class="chat-listrow-title">{escape(r["title"])}</div>'
+                f'  <div class="chat-listrow-meta">'
+                f'    <span>{when}</span>'
+                f'    <span>{r["n_messages"]} message{"" if r["n_messages"] == 1 else "s"}</span>'
+                f'  </div>'
+                f'</a>'
+            )
+        body = f"""
+<h1>Past conversations</h1>
+<p class="muted" style="margin-top:-8px;">
+    All your previous chats. Click to revisit; new turns continue the
+    same conversation. <a href="/chat">Start a new one →</a>
+</p>
+<div class="chat-list">{"".join(items)}</div>
+<style>
+.chat-list {{ display: flex; flex-direction: column; gap: 8px; }}
+.chat-listrow {{
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 12px 14px; background: #0e0e0e;
+    border: 1px solid var(--border); border-left: 3px solid var(--green-dim);
+    color: var(--fg); text-decoration: none;
+}}
+.chat-listrow:hover {{ background: #131c14; }}
+.chat-listrow-title {{ font-family: var(--mono); color: var(--green); }}
+.chat-listrow-meta {{ display: flex; gap: 16px; color: #888; font-size: 11.5px; }}
+</style>"""
+        return HTMLResponse(_layout("Chat history", body, "chat"))
+
+    @app.get("/chat/{cid:int}", response_class=HTMLResponse)
+    def chat_view(cid: int, request: Request):
+        from .db import chat_get_conversation
+
+        cfg, conn, _, _ = get_state()
+        row = chat_get_conversation(conn, cid)
+        if row is None:
+            return HTMLResponse(
+                _layout("Chat", "<h1>Not found</h1>", "chat"), status_code=404,
+            )
+        history_html = _render_history_html(conn, cid)
+        body = _chat_page_body(cfg, history_html, cid, row["title"])
+        resp = HTMLResponse(_layout("Chat", body, "chat"))
+        # Stick the user to this conversation for subsequent message posts.
         resp.set_cookie(
-            "sb_chat_sid", sid, httponly=True, samesite="strict", path="/",
+            "sb_chat_cid", str(cid),
+            httponly=True, samesite="strict", path="/",
         )
         return resp
 
-    @app.get("/chat/reset", response_class=HTMLResponse)
-    def chat_reset(request: Request):
-        sid = request.cookies.get("sb_chat_sid", "")
-        _chat_sessions.pop(sid, None)
-        return RedirectResponse(url="/chat", status_code=303)
+    @app.post("/chat/{cid:int}/delete")
+    def chat_delete(cid: int):
+        from .db import chat_delete_conversation
+
+        _, conn, _, _ = get_state()
+        chat_delete_conversation(conn, cid)
+        return RedirectResponse(url="/chat/list", status_code=303)
 
     @app.post("/api/chat/message")
     async def chat_message(request: Request):
         """SSE-style streaming: emits one JSON line per event, then [DONE].
 
-        Body: form field ``message``. Session cookie selects the history.
+        On the first message of a fresh chat, lazily creates the conversation
+        row and returns its id in the ``done`` event so the client can update
+        its URL. Subsequent messages append to the same conversation.
+
+        Body: form field ``message``. Cookie ``sb_chat_cid`` selects which
+        conversation to append to.
         """
         from fastapi.responses import StreamingResponse
 
+        from .db import (
+            chat_append_message, chat_create_conversation, chat_get_conversation,
+            chat_rename_conversation,
+        )
+
         cfg, conn, embedder, reranker = get_state()
-        sid, history = _get_chat_session(request)
         form = await request.form()
         user_msg = (form.get("message") or "").strip()
+        # Resolve current conversation, creating one lazily on first send.
+        active_cid = _resolve_active_cid(request, conn)
+        created_now = False
+        if active_cid is None and user_msg:
+            # Title with a truncated version of the first message; the user
+            # can rename later if we add the UI.
+            title = user_msg[:60] + ("…" if len(user_msg) > 60 else "")
+            active_cid = chat_create_conversation(conn, title)
+            created_now = True
+
+        # Replay history from DB so multi-turn context works across reloads.
+        history = _load_history_from_db(conn, active_cid) if active_cid else []
 
         def gen():
             if not user_msg:
                 yield 'data: {"kind":"error","data":"empty message"}\n\n'
                 yield 'data: [DONE]\n\n'
                 return
+            # Persist the user turn before streaming, so a crash mid-stream
+            # still leaves a coherent record (assistant turn just won't exist).
+            chat_append_message(
+                conn, active_cid, "user", json.dumps(user_msg),
+            )
             updated_history: list[dict] | None = None
+            citations_for_assistant: list[dict] = []
             for event in stream_chat(cfg, conn, embedder, reranker, user_msg, history):
                 payload = json.dumps(
                     {"kind": event.kind, "data": event.data},
@@ -1704,14 +1929,34 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 yield f"data: {payload}\n\n"
                 if event.kind == "done" and isinstance(event.data, dict):
                     updated_history = event.data.get("history")
+                    citations_for_assistant = event.data.get("citations") or []
             if updated_history is not None:
-                # Persist the new history for the session. The Anthropic SDK
-                # returns content-block objects; convert to plain dicts so
-                # they survive a round-trip through the next request.
-                _chat_sessions[sid] = _serialize_chat_history(updated_history)
+                serialized = _serialize_chat_history(updated_history)
+                # Find the assistant turn we just generated (last role==assistant)
+                # and persist its content + citations.
+                for msg in reversed(serialized):
+                    if msg.get("role") == "assistant":
+                        chat_append_message(
+                            conn, active_cid, "assistant",
+                            json.dumps(msg["content"]),
+                            citations_json=json.dumps(citations_for_assistant),
+                        )
+                        break
+            # Tell the client which conversation this belonged to so it can
+            # update its URL without a full page navigation.
+            yield (
+                f'data: {{"kind":"meta","data":{{"cid":{active_cid},'
+                f'"created_now":{str(created_now).lower()}}}}}\n\n'
+            )
             yield 'data: [DONE]\n\n'
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        resp = StreamingResponse(gen(), media_type="text/event-stream")
+        if created_now and active_cid is not None:
+            resp.set_cookie(
+                "sb_chat_cid", str(active_cid),
+                httponly=True, samesite="strict", path="/",
+            )
+        return resp
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):
@@ -1983,6 +2228,35 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 "score": round(r.score, 4),
             })
         return _JSON({"results": out, "query": q}, headers=cors)
+
+    @app.post("/api/click")
+    async def api_click(request: Request):
+        """Lightweight click beacon. The dashboard front-end POSTs here
+        whenever the user opens a search/chat/palette result. We log the
+        path so subsequent searches lift it via the click-recency boost.
+        """
+        from .db import log_click
+
+        try:
+            body = await request.json()
+        except Exception:
+            try:
+                form = await request.form()
+                body = dict(form)
+            except Exception:
+                return {"ok": False, "error": "could not parse body"}
+        path = (body.get("path") or "").strip()
+        if not path:
+            return {"ok": False, "error": "missing path"}
+        source = (body.get("source") or "unknown").strip()[:32]
+        chunk_id_raw = body.get("chunk_id")
+        try:
+            chunk_id = int(chunk_id_raw) if chunk_id_raw is not None else None
+        except (TypeError, ValueError):
+            chunk_id = None
+        _, conn, _, _ = get_state()
+        log_click(conn, path, source, chunk_id=chunk_id)
+        return {"ok": True}
 
     @app.get("/api/palette")
     def api_palette(q: str = ""):
