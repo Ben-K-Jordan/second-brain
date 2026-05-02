@@ -213,6 +213,13 @@ def _date_range(window_days: int) -> tuple[str, str]:
     return start.isoformat(), today.isoformat()
 
 
+# How recent a successful sync needs to be before the daemon skips
+# its scheduled run. 12h is a good fit — the user's overnight Oura
+# data lands by morning, so we sync once after wake-up; an ad-hoc
+# `secondbrain sync oura` mid-day still works (it bypasses this gate).
+_DAEMON_SYNC_COOLDOWN_SECONDS = 12 * 3600
+
+
 # ---- Connector --------------------------------------------------------
 
 class OuraConnector:
@@ -517,3 +524,107 @@ def fetch_summaries(
     finally:
         s.close()
     return [summaries[d] for d in sorted(summaries.keys())]
+
+
+# ---- Daemon hook ------------------------------------------------------
+
+def run_oura_sync_if_due(cfg: Config, conn, embedder) -> bool:
+    """Daemon entrypoint — sync Oura at most once per local-time day.
+
+    The trigger is simple: if the last successful sync is older than
+    ``_DAEMON_SYNC_COOLDOWN_SECONDS``, run the connector + ingest the
+    health metrics. Returns True iff a sync ran.
+
+    Why a separate cooldown rather than reusing the daemon's general
+    poll cadence: Oura updates today's data throughout the day but
+    the deltas matter most after wake-up. One sync per day on the
+    rough morning hour is enough; more frequent polling burns API
+    quota for negligible value.
+    """
+    if not _resolve_token(cfg):
+        return False
+    last_ts = _last_sync_at(conn)
+    if last_ts is not None and (time.time() - last_ts) < _DAEMON_SYNC_COOLDOWN_SECONDS:
+        return False
+    try:
+        from ..health import ingest_summaries
+        from ..indexer import index_text
+    except ImportError:
+        return False
+    log.info("oura: daemon scheduled sync starting")
+    try:
+        # Connector path → docs into the index.
+        c = OuraConnector()
+        n_docs = 0
+        for doc in c.fetch(cfg):
+            try:
+                index_text(
+                    conn, embedder, cfg,
+                    virtual_path=doc.virtual_path,
+                    title=doc.title,
+                    content=doc.content,
+                    mtime=doc.mtime,
+                    kind=doc.kind,
+                    source=doc.source,
+                )
+                n_docs += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("oura: indexing %s failed: %s", doc.virtual_path, e)
+        # Health metrics path — separate API roundtrip but we're already
+        # inside the cooldown window so it's fine.
+        try:
+            n_metrics = ingest_summaries(conn, fetch_summaries(cfg))
+        except Exception as e:  # noqa: BLE001
+            log.warning("oura: health metric ingest failed: %s", e)
+            n_metrics = 0
+        _record_sync_run(conn, success=True, n_docs=n_docs,
+                         n_metrics=n_metrics, error=None)
+        log.info("oura: synced %d docs / %d metrics", n_docs, n_metrics)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("oura: daemon sync crashed: %s", e)
+        _record_sync_run(conn, success=False, n_docs=0,
+                         n_metrics=0, error=str(e)[:500])
+        return True  # we *did* attempt a run
+
+
+def _ensure_oura_runs_table(conn) -> None:
+    """Lazy-migrated runs log. Same shape as digest_runs / brief_runs:
+    one row per sync attempt with success / counts / error."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oura_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ran_at REAL NOT NULL,
+            success INTEGER NOT NULL,
+            n_docs INTEGER NOT NULL DEFAULT 0,
+            n_metrics INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oura_runs_ran_at "
+        "ON oura_runs(ran_at DESC)",
+    )
+    conn.commit()
+
+
+def _last_sync_at(conn) -> float | None:
+    _ensure_oura_runs_table(conn)
+    row = conn.execute(
+        "SELECT ran_at FROM oura_runs WHERE success = 1 "
+        "ORDER BY ran_at DESC LIMIT 1",
+    ).fetchone()
+    return row["ran_at"] if row else None
+
+
+def _record_sync_run(
+    conn, *, success: bool, n_docs: int, n_metrics: int,
+    error: str | None,
+) -> None:
+    _ensure_oura_runs_table(conn)
+    conn.execute(
+        "INSERT INTO oura_runs(ran_at, success, n_docs, n_metrics, error) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (time.time(), 1 if success else 0, n_docs, n_metrics, error),
+    )
+    conn.commit()

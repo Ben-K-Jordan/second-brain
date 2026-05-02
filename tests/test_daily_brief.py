@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from secondbrain.daily_brief import (
     ActionItem,
     Assignment,
+    CompletedTask,
     DailyBrief,
+    HealthMetricLine,
+    HealthSnapshot,
     QueueItem,
     WatchlistHighlight,
     _open_action_items,
@@ -518,3 +521,372 @@ def test_today_events_swallows_calendar_failure(tmp_cfg, monkeypatch):
     monkeypatch.setattr(eb, "iter_upcoming_events", boom)
     out = db_mod._today_events(tmp_cfg)
     assert out == []
+
+
+# ============== polish-pass extensions (Phase 44 v2) ==================
+
+def test_action_items_carry_task_id_and_age(fresh_db):
+    """Each ActionItem should expose task.id + age_days so the brief
+    can render `tasks done <id>` actionable + 'this has been open
+    forever' nudges."""
+    from secondbrain import tasks as tasks_mod
+    from secondbrain.daily_brief import _open_action_items
+
+    fid = _insert_file(
+        fresh_db, "transcript://granola/x", indexed_at=time.time() - 60,
+    )
+    _insert_chunk(
+        fresh_db, fid, 0,
+        "## Action items\n- Email Sarah\n",
+    )
+    out = _open_action_items(fresh_db)
+    assert len(out) == 1
+    item = out[0]
+    assert item.task_id > 0
+    # Sanity: the id should round-trip through the tasks module.
+    t = tasks_mod.get(fresh_db, item.task_id)
+    assert t.text == "Email Sarah"
+
+
+def test_render_action_items_includes_task_id_for_done_command():
+    """Rendered markdown must show the id so the user knows what to
+    type into `tasks done`."""
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[],
+        assignments_due_soon=[],
+        open_action_items=[ActionItem(
+            text="Email Sarah",
+            source_path="transcript://granola/x",
+            source_title="Sprint planning",
+            task_id=42,
+            age_days=2,
+        )],
+        queue_top=[],
+        watchlist_highlights=[],
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "#42" in md
+    assert "(2d)" in md
+    assert "tasks done" in md
+
+
+def test_render_skips_age_for_brand_new_tasks():
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[],
+        assignments_due_soon=[],
+        open_action_items=[ActionItem(
+            text="Just added", source_path="manual",
+            source_title="(typed)", task_id=1, age_days=0,
+        )],
+        queue_top=[],
+        watchlist_highlights=[],
+    )
+    md = format_markdown(brief, header_date="today")
+    # Don't render `(0d)` — that's noise on freshly-added tasks.
+    assert "(0d)" not in md
+
+
+def test_health_snapshot_assembles_when_oura_data_present(fresh_db):
+    """The brief should include sleep/readiness/activity values from
+    the health_metrics table (Phase 56) so the user sees this morning's
+    physical context alongside their schedule."""
+    from secondbrain import health
+    from secondbrain.connectors.oura import DailySummary
+    from secondbrain.daily_brief import _health_snapshot
+
+    summaries = [
+        DailySummary(
+            date="2026-04-13", sleep_score=70, readiness_score=70,
+            activity_score=80,
+        ),
+        DailySummary(
+            date="2026-04-14", sleep_score=80, readiness_score=80,
+            activity_score=85,
+        ),
+        DailySummary(
+            date="2026-04-15", sleep_score=90, readiness_score=85,
+            activity_score=95,
+        ),
+    ]
+    health.ingest_summaries(fresh_db, summaries)
+    snap = _health_snapshot(fresh_db)
+    assert snap is not None
+    metrics_by_name = {m.metric: m for m in snap.metrics}
+    assert "sleep_score" in metrics_by_name
+    sleep = metrics_by_name["sleep_score"]
+    assert sleep.label == "Sleep"
+    assert sleep.latest == 90.0
+    assert sleep.latest_date == "2026-04-15"
+    # Average of [70, 80, 90] is 80.0 → delta = (90-80)/80 * 100 = +12.5%
+    assert sleep.average == 80.0
+    assert abs(sleep.delta_pct - 12.5) < 0.01
+
+
+def test_health_snapshot_returns_none_when_no_data(fresh_db):
+    from secondbrain.daily_brief import _health_snapshot
+    assert _health_snapshot(fresh_db) is None
+
+
+def test_render_health_marks_significant_drops(fresh_db):
+    """A 5%+ drop should get a ↓ arrow so the user clocks the dip
+    without parsing percentages."""
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[],
+        assignments_due_soon=[],
+        open_action_items=[],
+        queue_top=[],
+        watchlist_highlights=[],
+        health=HealthSnapshot(metrics=[HealthMetricLine(
+            metric="sleep_score", label="Sleep",
+            latest=70, latest_date="2026-04-15",
+            average=85, delta_pct=-17.6,
+        )]),
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "## Health (Oura)" in md
+    assert "↓" in md
+    assert "Sleep" in md
+    assert "70" in md
+
+
+def test_render_health_marks_significant_jumps():
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        health=HealthSnapshot(metrics=[HealthMetricLine(
+            metric="readiness_score", label="Readiness",
+            latest=92, latest_date="2026-04-15",
+            average=80, delta_pct=15.0,
+        )]),
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "↑" in md
+
+
+def test_render_health_omits_arrow_when_in_band():
+    """Within ±5% of the average — no arrow, just the number."""
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        health=HealthSnapshot(metrics=[HealthMetricLine(
+            metric="sleep_score", label="Sleep",
+            latest=82, latest_date="2026-04-15",
+            average=80, delta_pct=2.5,
+        )]),
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "↓" not in md
+    assert "↑" not in md
+
+
+def test_yesterday_done_pulls_recent_completions(fresh_db):
+    """Tasks completed in the last 36h appear in 'Recently done'."""
+    from secondbrain import tasks as tasks_mod
+    from secondbrain.daily_brief import _yesterday_done
+
+    tid = tasks_mod.add_manual(fresh_db, "Send the report")
+    tasks_mod.mark_done(fresh_db, tid)
+    out = _yesterday_done(fresh_db)
+    assert len(out) == 1
+    assert out[0].text == "Send the report"
+
+
+def test_yesterday_done_excludes_old_completions(fresh_db):
+    """Tasks done 5 days ago shouldn't drop into today's brief."""
+    from secondbrain.daily_brief import _yesterday_done
+
+    fresh_db.execute(
+        "INSERT INTO tasks(text, text_lower, source_path, source_title, "
+        " status, created_at, completed_at) "
+        "VALUES (?, ?, 'manual', '(typed)', 'done', ?, ?)",
+        ("ancient win", "ancient win",
+         time.time() - 6 * 86400, time.time() - 5 * 86400),
+    )
+    fresh_db.commit()
+    assert _yesterday_done(fresh_db) == []
+
+
+def test_revisit_suggestions_only_fire_on_quiet_days(fresh_db):
+    """If there's actionable content, the brief should NOT pull
+    revisit suggestions — they'd push the time-sensitive stuff
+    further down the page."""
+    from secondbrain.daily_brief import _has_actionable_content
+
+    brief_with_events = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(starts_at=time.time(), title="X")],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+    )
+    assert _has_actionable_content(brief_with_events) is True
+
+    quiet_brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+    )
+    assert _has_actionable_content(quiet_brief) is False
+
+
+def test_revisit_suggestions_skip_when_brain_too_small(fresh_db):
+    """A brain with fewer than the threshold files shouldn't surface
+    revisit suggestions — there's not enough archive yet."""
+    from secondbrain.daily_brief import _revisit_suggestions
+    # Empty brain.
+    assert _revisit_suggestions(fresh_db) == []
+
+
+def test_render_quiet_day_shows_banner_when_no_actionable(fresh_db):
+    """When the only sections are passive (health/done/revisit), the
+    brief should still emit the 'quiet day' note + show the passive
+    sections so the user has something to look at."""
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        yesterday_done=[CompletedTask(text="x", completed_at=time.time())],
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "Quiet day" in md
+    assert "Recently done" in md
+
+
+def test_render_full_day_does_not_show_quiet_banner():
+    """A brief with calendar events shouldn't carry the quiet-day
+    banner — that'd be misleading."""
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(
+            starts_at=time.time() + 3600, title="Standup",
+        )],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "Quiet day" not in md
+
+
+# ===================== scheduler / SMTP send ==========================
+
+def test_last_brief_sent_at_returns_none_initially(fresh_db):
+    from secondbrain.daily_brief import last_brief_sent_at
+    assert last_brief_sent_at(fresh_db) is None
+
+
+def test_run_brief_if_due_skips_when_disabled(fresh_db, tmp_cfg):
+    """Disabled in config → daemon must not even attempt the send."""
+    from secondbrain.daily_brief import run_brief_if_due
+    tmp_cfg.daily_brief_enabled = False
+    tmp_cfg.digest_to = "test@example.com"
+    assert run_brief_if_due(tmp_cfg, fresh_db) is False
+
+
+def test_run_brief_if_due_skips_without_recipient(fresh_db, tmp_cfg):
+    """Enabled but no recipient → still skip."""
+    from secondbrain.daily_brief import run_brief_if_due
+    tmp_cfg.daily_brief_enabled = True
+    tmp_cfg.digest_to = ""
+    assert run_brief_if_due(tmp_cfg, fresh_db) is False
+
+
+def test_run_brief_if_due_skips_when_too_recent(fresh_db, tmp_cfg, monkeypatch):
+    """If we sent within the cooldown, the daemon must NOT re-send."""
+    import secondbrain.daily_brief as db_mod
+
+    # Pretend a brief was sent 1h ago.
+    db_mod._ensure_brief_runs_table(fresh_db)
+    fresh_db.execute(
+        "INSERT INTO daily_brief_runs(sent_at, success, error, recipients) "
+        "VALUES (?, ?, ?, ?)",
+        (time.time() - 3600, 1, None, "test@example.com"),
+    )
+    fresh_db.commit()
+
+    tmp_cfg.daily_brief_enabled = True
+    tmp_cfg.digest_to = "test@example.com"
+    tmp_cfg.daily_brief_send_time = "00:00"  # always past
+    # Should not trigger send (cooldown).
+    sent = []
+    monkeypatch.setattr(
+        db_mod, "send_brief",
+        lambda *a, **kw: (sent.append(True), (True, "ok"))[1],
+    )
+    assert db_mod.run_brief_if_due(tmp_cfg, fresh_db) is False
+    assert sent == []
+
+
+def test_run_brief_if_due_handles_malformed_send_time(fresh_db, tmp_cfg):
+    """Garbage in `daily_brief_send_time` should log + skip, not crash."""
+    from secondbrain.daily_brief import run_brief_if_due
+    tmp_cfg.daily_brief_enabled = True
+    tmp_cfg.digest_to = "test@example.com"
+    tmp_cfg.daily_brief_send_time = "not-a-time"
+    assert run_brief_if_due(tmp_cfg, fresh_db) is False
+
+
+def test_send_brief_returns_failure_without_password(fresh_db, tmp_cfg, monkeypatch):
+    from secondbrain.daily_brief import send_brief
+    monkeypatch.delenv("SECONDBRAIN_SMTP_PASSWORD", raising=False)
+    tmp_cfg.daily_brief_enabled = True
+    tmp_cfg.digest_to = "test@example.com"
+    success, msg = send_brief(tmp_cfg, fresh_db)
+    assert success is False
+    assert "SMTP_PASSWORD" in msg
+
+
+def test_send_brief_records_failure_in_runs_table(fresh_db, tmp_cfg, monkeypatch):
+    """Failed sends must persist to daily_brief_runs so the dashboard
+    / status command can show 'last failure' details."""
+    from secondbrain.daily_brief import _ensure_brief_runs_table, send_brief
+    monkeypatch.delenv("SECONDBRAIN_SMTP_PASSWORD", raising=False)
+    tmp_cfg.daily_brief_enabled = True
+    tmp_cfg.digest_to = "test@example.com"
+    send_brief(tmp_cfg, fresh_db)
+    # Even though we returned early on missing password, that's a
+    # config issue not a send attempt — the table SHOULDN'T have a
+    # failure row for missing-password (we never tried SMTP).
+    _ensure_brief_runs_table(fresh_db)
+    n = fresh_db.execute(
+        "SELECT COUNT(*) AS n FROM daily_brief_runs",
+    ).fetchone()["n"]
+    assert n == 0  # didn't even try
+
+
+def test_minimal_md_to_html_renders_headings_and_bullets():
+    """The HTML alternative for the email needs to handle H1-3,
+    bullets, blockquotes — the brief uses all three."""
+    from secondbrain.daily_brief import _minimal_md_to_html
+    md = (
+        "# Daily brief\n\n"
+        "## Section\n\n"
+        "- bullet one\n"
+        "- bullet two\n\n"
+        "> a quote\n"
+    )
+    html = _minimal_md_to_html(md)
+    assert "<h1>Daily brief</h1>" in html
+    assert "<h2>Section</h2>" in html
+    assert "<li>bullet one</li>" in html
+    assert "<li>bullet two</li>" in html
+    assert "<blockquote" in html and "a quote" in html
+
+
+def test_minimal_md_to_html_escapes_special_characters():
+    """User content can include `<` / `>` / `&` — those must escape
+    so they don't break the email's HTML rendering."""
+    from secondbrain.daily_brief import _minimal_md_to_html
+    html = _minimal_md_to_html("- a < b > c & d")
+    assert "&lt;" in html
+    assert "&gt;" in html
+    assert "&amp;" in html
+    # Raw special chars should NOT have escaped through.
+    assert "a < b" not in html

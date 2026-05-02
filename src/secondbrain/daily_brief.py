@@ -78,12 +78,6 @@ _QUEUE_MAX = 5
 _WATCHLIST_HIGHLIGHTS_MAX = 5
 _WATCHLIST_NEW_PATHS_PER_RUN = 2
 
-# Markdown checkbox pattern. Allowed leading bullets: -, *, plus optional
-# whitespace. Matches both `- [ ]` (open) — open ones are what we surface.
-# Closed ones (`- [x]`) are ignored as already done.
-_CHECKBOX_RE = re.compile(r"^\s*[-*]\s*\[\s\]\s+(.+?)\s*$", re.MULTILINE)
-
-
 # ---- Data shapes ------------------------------------------------------
 
 @dataclass
@@ -101,6 +95,8 @@ class ActionItem:
     text: str
     source_path: str      # transcript:// virtual path so user can click back
     source_title: str
+    task_id: int = 0      # Phase 47 task id — lets the user run `tasks done X`
+    age_days: int = 0     # how long it's been open (created → now)
 
 
 @dataclass
@@ -122,6 +118,31 @@ class WatchlistHighlight:
 
 
 @dataclass
+class HealthSnapshot:
+    """At-a-glance numerics from the Oura connector (Phase 56). Each
+    metric carries today's value plus the trailing-window average so
+    the brief can render `sleep 76 (-7% vs 14d avg)`."""
+    metrics: list[HealthMetricLine] = field(default_factory=list)
+
+
+@dataclass
+class HealthMetricLine:
+    metric: str           # 'sleep_score' | 'readiness_score' | 'activity_score' etc.
+    label: str            # human-readable: 'Sleep' / 'Readiness' / 'Activity'
+    latest: float         # last value
+    latest_date: str      # 'YYYY-MM-DD'
+    average: float        # rolling-window average
+    delta_pct: float      # (latest - avg) / avg * 100 — signed
+
+
+@dataclass
+class CompletedTask:
+    """A task ticked off in the recent past — fed to "Yesterday's wins"."""
+    text: str
+    completed_at: float
+
+
+@dataclass
 class DailyBrief:
     """The whole morning brief in one structured object."""
     generated_at: float
@@ -130,6 +151,19 @@ class DailyBrief:
     open_action_items: list[ActionItem]
     queue_top: list[QueueItem]
     watchlist_highlights: list[WatchlistHighlight]
+    # Phase-cross polish below — added in the second pass.
+    health: HealthSnapshot | None = None       # Phase 56 hookup
+    yesterday_done: list[CompletedTask] = field(default_factory=list)
+    revisit_suggestions: list[RevisitSuggestion] = field(default_factory=list)
+
+
+@dataclass
+class RevisitSuggestion:
+    """An older doc to surface on quiet days — picked from the brain's
+    indexed corpus weighted by recency × backlink-density."""
+    path: str
+    title: str
+    aged_days: int
 
 
 # ============================ assembly ================================
@@ -141,13 +175,30 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
     Canvas isn't configured, the affected section is empty rather than
     crashing the whole brief.
     """
-    return DailyBrief(
+    brief = DailyBrief(
         generated_at=time.time(),
         today_events=_today_events(cfg),
         assignments_due_soon=_assignments_due_soon(conn),
         open_action_items=_open_action_items(conn),
         queue_top=_queue_top(conn),
         watchlist_highlights=_watchlist_highlights(conn),
+        health=_health_snapshot(conn),
+        yesterday_done=_yesterday_done(conn),
+    )
+    # Revisit suggestions only fire on quiet days — otherwise we'd
+    # bury the time-sensitive content.
+    if not _has_actionable_content(brief):
+        brief.revisit_suggestions = _revisit_suggestions(conn)
+    return brief
+
+
+def _has_actionable_content(brief: DailyBrief) -> bool:
+    """A 'live' brief has at least one section with stuff to do today."""
+    return bool(
+        brief.today_events
+        or brief.assignments_due_soon
+        or brief.open_action_items
+        or brief.queue_top,
     )
 
 
@@ -243,6 +294,10 @@ def _open_action_items(conn: sqlite3.Connection) -> list[ActionItem]:
     transcripts on the fly so the brief always reflects the latest
     meeting — without re-extracting items the user has already ticked
     off (those stay ``done`` in the table).
+
+    Each item carries its task id + age in days so the rendered brief
+    lets the user run ``tasks done <id>`` directly, and surfaces the
+    "this has been open for 3 weeks" signal that nudges follow-through.
     """
     from . import tasks as tasks_mod
 
@@ -257,14 +312,144 @@ def _open_action_items(conn: sqlite3.Connection) -> list[ActionItem]:
         # take down the whole brief.
         log.warning("daily brief: task materialisation failed: %s", e)
     rows = tasks_mod.list_open(conn, limit=_ACTION_ITEM_MAX)
-    return [
-        ActionItem(
+    now = time.time()
+    out: list[ActionItem] = []
+    for t in rows:
+        age_days = max(0, int((now - t.created_at) // 86400))
+        out.append(ActionItem(
             text=t.text,
             source_path=t.source_path,
             source_title=t.source_title,
+            task_id=t.id,
+            age_days=age_days,
+        ))
+    return out
+
+
+# ---- section: health snapshot (Phase 56 cross-link) ------------------
+
+# Metrics surfaced in the brief, in display order. Subset of what
+# Oura emits — we don't want to drown the brief in temperature
+# deviations and step counts; just the three Oura headline scores.
+_BRIEF_HEALTH_METRICS: tuple[tuple[str, str], ...] = (
+    ("sleep_score", "Sleep"),
+    ("readiness_score", "Readiness"),
+    ("activity_score", "Activity"),
+)
+# Window for the rolling average. 14 days = ~2 weeks, long enough to
+# smooth weekend / weekday variation without rolling in seasonal drift.
+_HEALTH_AVG_WINDOW_DAYS = 14
+
+
+def _health_snapshot(conn: sqlite3.Connection) -> HealthSnapshot | None:
+    """Pull today's-or-latest Oura values + 14d averages. Returns None
+    if there's literally no health data — saves a section header in
+    the rendered brief."""
+    try:
+        from . import health as health_mod
+    except ImportError:
+        return None
+    lines: list[HealthMetricLine] = []
+    for metric, label in _BRIEF_HEALTH_METRICS:
+        summary = health_mod.summarise(
+            conn, metric, days=_HEALTH_AVG_WINDOW_DAYS,
         )
-        for t in rows
+        if summary.n == 0 or summary.latest is None or summary.average is None:
+            continue
+        delta = (
+            (summary.latest.value - summary.average) / summary.average * 100.0
+            if summary.average != 0 else 0.0
+        )
+        lines.append(HealthMetricLine(
+            metric=metric,
+            label=label,
+            latest=summary.latest.value,
+            latest_date=summary.latest.date,
+            average=summary.average,
+            delta_pct=delta,
+        ))
+    if not lines:
+        return None
+    return HealthSnapshot(metrics=lines)
+
+
+# ---- section: yesterday's wins (completed tasks) ---------------------
+
+# Window for "yesterday's wins". 36h covers same-day morning briefs
+# (since you completed at-most-yesterday tasks) without mixing in
+# stuff finished a week ago.
+_YESTERDAY_WINDOW_SECONDS = 36 * 3600
+_YESTERDAY_DONE_MAX = 5
+
+
+def _yesterday_done(conn: sqlite3.Connection) -> list[CompletedTask]:
+    """Pull tasks completed in the last 36h. The micro-feedback loop
+    of "here's what you got done" matters as much as "here's what's
+    next" — and on quiet days, it's nice to see your week's progress
+    even without an explicit weekly review."""
+    cutoff = time.time() - _YESTERDAY_WINDOW_SECONDS
+    rows = conn.execute(
+        "SELECT text, completed_at FROM tasks "
+        "WHERE status = 'done' AND completed_at IS NOT NULL "
+        "  AND completed_at >= ? "
+        "ORDER BY completed_at DESC LIMIT ?",
+        (cutoff, _YESTERDAY_DONE_MAX),
+    ).fetchall()
+    return [
+        CompletedTask(text=r["text"], completed_at=r["completed_at"])
+        for r in rows
     ]
+
+
+# ---- section: revisit suggestions (quiet-day fallback) ---------------
+
+# Cap on revisit suggestions — three is enough to feel exploratory
+# without dominating an empty brief.
+_REVISIT_MAX = 3
+# Don't surface anything younger than this; the point is to revisit
+# stuff you've forgotten, not stuff you indexed yesterday.
+_REVISIT_MIN_AGE_DAYS = 30
+# Skip docs younger than the brain itself — surfacing your *only* doc
+# isn't useful. Pre-flight: count files first.
+_REVISIT_MIN_BRAIN_FILES = 50
+
+
+def _revisit_suggestions(conn: sqlite3.Connection) -> list[RevisitSuggestion]:
+    """Pick a few older docs to surface on quiet days. Heuristic: at
+    least 30d old, prefers docs with backlinks (signals semantic
+    density), randomised so morning briefs don't keep showing the
+    same five docs.
+
+    If the brain is too small (< 50 files) this returns empty — there's
+    no point recommending stuff when the user has only indexed the
+    setup notes. Quiet day stays quiet.
+    """
+    n_files = conn.execute(
+        "SELECT COUNT(*) AS n FROM files",
+    ).fetchone()["n"]
+    if (n_files or 0) < _REVISIT_MIN_BRAIN_FILES:
+        return []
+    cutoff = time.time() - _REVISIT_MIN_AGE_DAYS * 86400
+    rows = conn.execute(
+        "SELECT f.id, f.path, f.indexed_at, "
+        "  COALESCE(("
+        "    SELECT COUNT(*) FROM backlinks b WHERE b.src_file_id = f.id"
+        "  ), 0) AS link_density "
+        "FROM files f "
+        "WHERE f.indexed_at <= ? "
+        "ORDER BY link_density DESC, RANDOM() "
+        "LIMIT ?",
+        (cutoff, _REVISIT_MAX),
+    ).fetchall()
+    now = time.time()
+    out: list[RevisitSuggestion] = []
+    for r in rows:
+        title = _read_doc_title(conn, r["id"], r["path"])
+        aged = max(0, int((now - (r["indexed_at"] or now)) // 86400))
+        out.append(RevisitSuggestion(
+            path=r["path"], title=title, aged_days=aged,
+        ))
+    return out
 
 
 def _read_doc_title(
@@ -364,6 +549,13 @@ def format_markdown(brief: DailyBrief, *, header_date: str | None = None) -> str
                      "no open action items. Quiet day. ☕")
         return "\n".join(lines).rstrip() + "\n"
 
+    # If the only sections present are passive ones (health / done /
+    # revisit), prepend a one-line "quiet day" banner so the user
+    # immediately knows there's no action expected of them.
+    if not _has_actionable_content(brief):
+        lines.append("_Quiet day — no events, deadlines, or open items._")
+        lines.append("")
+
     for block in sections:
         lines.append(block.rstrip())
         lines.append("")
@@ -372,17 +564,30 @@ def format_markdown(brief: DailyBrief, *, header_date: str | None = None) -> str
 
 
 def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
-    """Yield the markdown for each non-empty section, in display order."""
+    """Yield the markdown for each non-empty section, in display order.
+
+    Order is intentional: time-sensitive content (calendar, due
+    assignments) front-loads, then action items the user can knock
+    off, then health context (Oura) since it modulates the rest of
+    the day, then the slower-burn surfaces (queue, watchlists), then
+    yesterday's wins as a closing flourish, then quiet-day fallbacks.
+    """
     if brief.today_events:
         yield _render_events(brief.today_events)
     if brief.assignments_due_soon:
         yield _render_assignments(brief.assignments_due_soon)
     if brief.open_action_items:
         yield _render_action_items(brief.open_action_items)
+    if brief.health is not None and brief.health.metrics:
+        yield _render_health(brief.health)
     if brief.queue_top:
         yield _render_queue(brief.queue_top)
     if brief.watchlist_highlights:
         yield _render_watchlist(brief.watchlist_highlights)
+    if brief.yesterday_done:
+        yield _render_yesterday_done(brief.yesterday_done)
+    if brief.revisit_suggestions:
+        yield _render_revisit(brief.revisit_suggestions)
 
 
 def _render_events(events: list) -> str:
@@ -411,11 +616,69 @@ def _render_assignments(items: list[Assignment]) -> str:
 
 
 def _render_action_items(items: list[ActionItem]) -> str:
+    """Render open tasks with their id (so user can `tasks done <id>`)
+    and age in days when meaningful (≥ 1)."""
     out = ["## Open action items", ""]
     for it in items:
         # Re-render as an unticked checkbox so users can copy-paste
         # straight into Obsidian / a notes app and tick them off.
-        out.append(f"- [ ] {it.text}  _(from: {it.source_title})_")
+        prefix = f"`#{it.task_id}`" if it.task_id else ""
+        age = ""
+        if it.age_days >= 1:
+            age = f" _({it.age_days}d)_"
+        suffix = f"  _(from: {it.source_title})_" if it.source_title else ""
+        bits = ["- [ ]"]
+        if prefix:
+            bits.append(prefix)
+        bits.append(it.text)
+        line = " ".join(bits) + age + suffix
+        out.append(line)
+    out.append("")
+    out.append("_Run `secondbrain tasks done <id>` to close._")
+    return "\n".join(out)
+
+
+def _render_health(snap: HealthSnapshot) -> str:
+    """Render the Oura at-a-glance block. Each line: latest + delta-vs-avg.
+
+    A negative delta past the threshold gets a `↓` emoji; positive
+    `↑`; in-band stays plain. Visual nudge on out-of-norm days
+    without forcing the user to read percentages."""
+    out = ["## Health (Oura)", ""]
+    for m in snap.metrics:
+        arrow = ""
+        if abs(m.delta_pct) >= 5:
+            arrow = " ↓" if m.delta_pct < 0 else " ↑"
+        latest_str = (
+            f"{int(m.latest)}" if abs(m.latest - int(m.latest)) < 1e-6
+            else f"{m.latest:.1f}"
+        )
+        avg_str = (
+            f"{int(m.average)}" if abs(m.average - int(m.average)) < 1e-6
+            else f"{m.average:.1f}"
+        )
+        out.append(
+            f"- **{m.label}**: {latest_str} "
+            f"_(avg {avg_str}, {m.delta_pct:+.0f}%{arrow})_  "
+            f"[{m.latest_date}]"
+        )
+    return "\n".join(out)
+
+
+def _render_yesterday_done(items: list[CompletedTask]) -> str:
+    out = ["## Recently done", ""]
+    for t in items:
+        when = time.strftime("%a %H:%M", time.localtime(t.completed_at))
+        out.append(f"- ✓ {t.text}  _({when})_")
+    return "\n".join(out)
+
+
+def _render_revisit(items: list[RevisitSuggestion]) -> str:
+    """Quiet-day fallback: 'remember this?' suggestions from the index."""
+    out = ["## Worth revisiting", "", "_Quiet day — picked from your archive:_", ""]
+    for r in items:
+        out.append(f"- **{r.title}** _({r.aged_days}d ago)_  ")
+        out.append(f"  `{r.path}`")
     return "\n".join(out)
 
 
@@ -460,3 +723,202 @@ def _supports_dash_d() -> bool:
 def generate_brief_markdown(cfg: Config, conn: sqlite3.Connection) -> str:
     """One-shot helper: assemble + render. The CLI + daemon both call this."""
     return format_markdown(assemble_brief(cfg, conn))
+
+
+# ============================ scheduler ===============================
+
+# How long after a successful send before we'd send again. 12h means
+# you can rerun on the same day if you flip enabled off + back on, but
+# the auto-fire path won't re-send within the same day.
+_BRIEF_RESEND_COOLDOWN_SECONDS = 12 * 3600
+
+
+def _ensure_brief_runs_table(conn: sqlite3.Connection) -> None:
+    """One-row-per-send log so the daemon can answer 'when did we last
+    send the brief?'. Cheap to migrate in lazily."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_brief_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at REAL NOT NULL,
+            success INTEGER NOT NULL,
+            error TEXT,
+            recipients TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_brief_runs_sent_at "
+        "ON daily_brief_runs(sent_at DESC)"
+    )
+    conn.commit()
+
+
+def last_brief_sent_at(conn: sqlite3.Connection) -> float | None:
+    """Most-recent successful send timestamp; None if never sent."""
+    _ensure_brief_runs_table(conn)
+    row = conn.execute(
+        "SELECT sent_at FROM daily_brief_runs WHERE success = 1 "
+        "ORDER BY sent_at DESC LIMIT 1",
+    ).fetchone()
+    return row["sent_at"] if row else None
+
+
+def _record_brief_run(
+    conn: sqlite3.Connection, *, success: bool, error: str | None,
+    recipients: str | None,
+) -> None:
+    _ensure_brief_runs_table(conn)
+    conn.execute(
+        "INSERT INTO daily_brief_runs(sent_at, success, error, recipients) "
+        "VALUES (?, ?, ?, ?)",
+        (time.time(), 1 if success else 0, error, recipients),
+    )
+    conn.commit()
+
+
+def send_brief(cfg: Config, conn: sqlite3.Connection) -> tuple[bool, str]:
+    """Build today's brief and email it via the digest SMTP config.
+
+    Reuses the digest's SMTP plumbing — same host/user/password.
+    Returns ``(success, message)``. Failures log + persist; success
+    persists too so the daemon can suppress re-sends.
+    """
+    import os
+    import smtplib
+    from email.message import EmailMessage
+
+    if not getattr(cfg, "daily_brief_enabled", False):
+        return False, "daily_brief_enabled is false in config"
+    to = (cfg.digest_to or "").strip()
+    if not to:
+        return False, "digest_to is empty (the brief reuses digest SMTP config)"
+    password = os.environ.get("SECONDBRAIN_SMTP_PASSWORD", "")
+    if not password:
+        return False, "SECONDBRAIN_SMTP_PASSWORD env var not set"
+
+    md = generate_brief_markdown(cfg, conn)
+    msg = EmailMessage()
+    msg["From"] = cfg.digest_smtp_from or cfg.digest_smtp_user
+    msg["To"] = to
+    msg["Subject"] = "second-brain daily brief"
+    msg.set_content(md)
+    # HTML rendering: a minimal Markdown-to-HTML pass so the email
+    # client renders headings + bullets nicely. We keep this naive
+    # rather than dragging in a full Markdown lib for one path —
+    # users can read either part.
+    msg.add_alternative(_minimal_md_to_html(md), subtype="html")
+
+    try:
+        with smtplib.SMTP(
+            cfg.digest_smtp_host, cfg.digest_smtp_port, timeout=30,
+        ) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(cfg.digest_smtp_user, password)
+            s.send_message(msg)
+    except (smtplib.SMTPException, OSError) as e:
+        err = f"{type(e).__name__}: {e}"
+        log.warning("daily brief send failed: %s", err)
+        _record_brief_run(conn, success=False, error=err, recipients=to)
+        return False, err
+    log.info("daily brief sent to %s", to)
+    _record_brief_run(conn, success=True, error=None, recipients=to)
+    return True, f"sent to {to}"
+
+
+def run_brief_if_due(cfg: Config, conn: sqlite3.Connection) -> bool:
+    """Daemon hook — send the brief once per local-time day, after
+    the configured ``daily_brief_send_time``.
+
+    Mirrors ``digest.run_digest_if_due``: passes a 12h cooldown after
+    successful sends so a daemon restart doesn't double-fire."""
+    if not getattr(cfg, "daily_brief_enabled", False):
+        return False
+    if not (cfg.digest_to or "").strip():
+        return False
+    raw = getattr(cfg, "daily_brief_send_time", "07:00")
+    try:
+        hh, mm = raw.split(":")
+        target_h, target_m = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        log.warning(
+            "daily_brief_send_time %r isn't HH:MM; skipping", raw,
+        )
+        return False
+    now = datetime.now()
+    target = now.replace(
+        hour=target_h, minute=target_m, second=0, microsecond=0,
+    )
+    if now < target:
+        return False
+    last = last_brief_sent_at(conn)
+    if last is not None and (time.time() - last) < _BRIEF_RESEND_COOLDOWN_SECONDS:
+        return False
+    success, info = send_brief(cfg, conn)
+    log.info("daily brief auto-fire: success=%s msg=%s", success, info)
+    return True
+
+
+_HEADING_RE = re.compile(r"^(#{1,3})\s+(.*)$")
+_BULLET_RE = re.compile(r"^(\s*)[-*]\s+(.*)$")
+_BLOCKQUOTE_RE = re.compile(r"^(\s*)>\s*(.*)$")
+
+
+def _minimal_md_to_html(md: str) -> str:
+    """Tiny Markdown subset → HTML for the email body. Handles H1-3,
+    bullets (incl. checkboxes), blockquotes, blank lines. Anything
+    fancier (links, code, tables) renders as plain text in HTML —
+    the text/plain alternative covers high-fidelity reading."""
+    out = ["<html><body style='font-family:system-ui;max-width:680px;margin:auto;'>"]
+    in_list = False
+    for raw_line in md.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append("<br/>")
+            continue
+        h = _HEADING_RE.match(line)
+        if h:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            level = len(h.group(1))
+            out.append(f"<h{level}>{_html_escape(h.group(2))}</h{level}>")
+            continue
+        b = _BULLET_RE.match(line)
+        if b:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{_html_escape(b.group(2))}</li>")
+            continue
+        q = _BLOCKQUOTE_RE.match(line)
+        if q:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(
+                "<blockquote style='color:#555;border-left:3px solid #ccc;"
+                f"padding-left:8px;margin:2px 0;'>{_html_escape(q.group(2))}"
+                "</blockquote>",
+            )
+            continue
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        out.append(f"<p>{_html_escape(line)}</p>")
+    if in_list:
+        out.append("</ul>")
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+def _html_escape(s: str) -> str:
+    """Just enough to keep `<` / `>` / `&` from breaking the email."""
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )

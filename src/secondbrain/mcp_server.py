@@ -653,6 +653,186 @@ def entity_neighbors(entity: str, top_n: int = 20, fuzzy: bool = True) -> str:
     return "\n".join(lines)
 
 
+# =============================================================
+# Phase 44 / 47 / 52 / 56 — chat-agent-facing tools.
+#
+# These let an AI assistant interact with the tasks / health / links
+# / brief surfaces without shelling out to the CLI. Each tool returns
+# a concise plaintext payload the model can quote back to the user.
+# =============================================================
+
+@mcp.tool()
+def morning_brief() -> str:
+    """Generate today's daily brief — calendar + assignments due
+    soon + open action items + reading queue + watchlist hits +
+    Oura health snapshot. Pure aggregation; no LLM call to assemble.
+
+    Use this when the user asks 'what's on my plate?' / 'how's my
+    day looking?' / 'morning brief'."""
+    from .daily_brief import generate_brief_markdown
+
+    cfg, conn, _, _ = _get_state()
+    return generate_brief_markdown(cfg, conn)
+
+
+@mcp.tool()
+def list_open_tasks(limit: int = 20) -> str:
+    """List the user's currently-open action items. Each line includes
+    the task id (so you can complete them via ``complete_task``), age
+    in days, and the source doc when extracted from a transcript.
+
+    Materialises new items from recent transcripts before returning,
+    so the list is always fresh."""
+    from . import tasks as tasks_mod
+
+    cfg, conn, _, _ = _get_state()
+    try:
+        tasks_mod.materialize_from_transcripts(conn)
+    except Exception:  # noqa: BLE001
+        pass
+    rows = tasks_mod.list_open(conn, limit=limit)
+    if not rows:
+        return "No open tasks. Inbox zero."
+    now = time.time()
+    lines = [f"Open tasks ({len(rows)}):"]
+    for t in rows:
+        age = max(0, int((now - t.created_at) // 86400))
+        suffix = (
+            f"  (from: {t.source_title})"
+            if t.source_path != "manual" else ""
+        )
+        age_label = f" [{age}d]" if age > 0 else ""
+        lines.append(f"  #{t.id}{age_label}  {t.text}{suffix}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_task(text: str) -> str:
+    """Add a manual task to the user's task list. Returns the new id
+    so subsequent calls can reference it.
+
+    Use this when the user says 'remind me to ...' / 'add a task ...'
+    in conversation."""
+    from . import tasks as tasks_mod
+
+    cfg, conn, _, _ = _get_state()
+    tid = tasks_mod.add_manual(conn, text)
+    if tid is None:
+        return "(empty task text — nothing added)"
+    return f"Added task #{tid}: {text}"
+
+
+@mcp.tool()
+def complete_task(task_id: int) -> str:
+    """Mark one task complete by id. Returns confirmation, or 'not
+    found' / 'already done' when the call was a no-op.
+
+    Use this when the user says 'I did X' / 'mark X done' — find the
+    matching id via ``list_open_tasks`` first if you don't know it."""
+    from . import tasks as tasks_mod
+
+    cfg, conn, _, _ = _get_state()
+    t = tasks_mod.get(conn, task_id)
+    if t is None:
+        return f"Task #{task_id} not found."
+    if not tasks_mod.mark_done(conn, task_id):
+        return f"Task #{task_id} was already done."
+    return f"✓ #{task_id}: {t.text}"
+
+
+@mcp.tool()
+def search_tasks(query: str, include_done: bool = False) -> str:
+    """Find tasks by substring match (case-insensitive). When
+    ``include_done`` is true, also searches completed/cancelled
+    history."""
+    from . import tasks as tasks_mod
+
+    cfg, conn, _, _ = _get_state()
+    rows = tasks_mod.search(conn, query, include_done=include_done)
+    if not rows:
+        return f"No tasks match {query!r}."
+    lines = [f"Tasks matching {query!r} ({len(rows)}):"]
+    for t in rows:
+        marker = (
+            "✓" if t.status == "done" else
+            "✗" if t.status == "cancelled" else " "
+        )
+        lines.append(f"  {marker} #{t.id}  {t.text}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_related(path: str, limit: int = 5) -> str:
+    """Find docs semantically similar to the given path (Phase 52
+    backlinks). Returns the top related docs with similarity scores.
+
+    Use this for 'what else have I written about X?' / 'find related
+    notes' / 'see also' style questions. ``path`` can be a virtual
+    path (transcript://, voice://, canvas://, oura://, etc.) or a
+    filesystem path; substring match is used when not exact."""
+    from .backlinks import get_backlinks_for_path
+
+    cfg, conn, _, _ = _get_state()
+    rows = get_backlinks_for_path(conn, path, limit=limit)
+    if not rows:
+        # Substring lookup — paths are long.
+        candidate = conn.execute(
+            "SELECT path FROM files WHERE path LIKE ? "
+            "ORDER BY indexed_at DESC LIMIT 1",
+            (f"%{path}%",),
+        ).fetchone()
+        if candidate is not None:
+            rows = get_backlinks_for_path(
+                conn, candidate["path"], limit=limit,
+            )
+    if not rows:
+        return f"No backlinks found for {path!r}. Run `secondbrain links rebuild` if this is a fresh brain."
+    lines = [f"Related to {path!r}:"]
+    for r in rows:
+        lines.append(f"  [{r.percent}%] {r.title}  ({r.path})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def health_summary(days: int = 14) -> str:
+    """Trailing summary of every health metric the brain has data for
+    (Phase 56 — Oura ring). Rolling N-day average with min/max + the
+    latest value.
+
+    Use this for 'how's my sleep been?' / 'health check' / 'am I
+    sleeping enough this week?' style questions."""
+    from . import health as health_mod
+
+    cfg, conn, _, _ = _get_state()
+    metrics = health_mod.list_metrics(conn)
+    if not metrics:
+        return "No Oura data yet. Run `secondbrain sync oura` first."
+    lines = [f"Health summary — last {days} days:"]
+    for m in metrics:
+        s = health_mod.summarise(conn, m, days=days)
+        if s.n == 0:
+            continue
+        lines.append("  " + health_mod.format_summary_line(s))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def health_metric(metric: str, days: int = 14) -> str:
+    """Day-by-day values for a single metric (sleep_score, activity_score,
+    readiness_score, steps, avg_hrv, etc.). Useful when the user asks
+    about a specific trend or wants raw numbers."""
+    from . import health as health_mod
+
+    cfg, conn, _, _ = _get_state()
+    points = health_mod.recent(conn, metric, days=days)
+    if not points:
+        return f"No data for {metric!r} in the last {days} days."
+    lines = [f"{metric} — last {len(points)} day(s):"]
+    for p in points:
+        lines.append(f"  {p.date}: {p.value:g}")
+    return "\n".join(lines)
+
+
 def run() -> None:
     """Run the MCP server over stdio. Used by `secondbrain serve`."""
     _get_state()  # warm caches before we start serving

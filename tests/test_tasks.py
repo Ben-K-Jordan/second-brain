@@ -353,3 +353,173 @@ def test_format_task_line_marks_cancelled():
         status="cancelled", created_at=0.0, completed_at=1.0, due_at=None,
     )
     assert "✗" in tasks_mod.format_task_line(t)
+
+
+# ===================== Phase 47 polish (v2) ===========================
+
+def test_voice_pattern_remind_me_to(fresh_db):
+    """Voice notes don't have Markdown formatting — natural-language
+    'remind me to ...' phrases should still surface as tasks."""
+    text = "Hey self, remind me to email Sarah about the API contract."
+    out = list(tasks_mod.extract_candidates_from_text(
+        text, include_voice_patterns=True,
+    ))
+    assert any("email sarah" in c.lower() for c in out)
+
+
+def test_voice_pattern_i_need_to(fresh_db):
+    text = "I need to update the resume before Friday."
+    out = list(tasks_mod.extract_candidates_from_text(
+        text, include_voice_patterns=True,
+    ))
+    assert any("update the resume" in c.lower() for c in out)
+
+
+def test_voice_pattern_todo_keyword():
+    text = "Random thoughts here. TODO: book the flight to NY."
+    out = list(tasks_mod.extract_candidates_from_text(
+        text, include_voice_patterns=True,
+    ))
+    assert any("book the flight" in c.lower() for c in out)
+
+
+def test_voice_pattern_off_by_default():
+    """In ordinary prose 'I need to' / 'I should' phrases are noise.
+    They must NOT extract unless the caller opts in."""
+    text = "I need to mention that the migration is risky."
+    out = list(tasks_mod.extract_candidates_from_text(text))
+    # Without the voice flag, no extraction.
+    assert out == []
+
+
+def test_voice_pattern_truncates_runaway_match():
+    """The voice regex stops at sentence punctuation, but if punctuation
+    is missing the match could lasso a long ramble. Cap kicks in."""
+    text = (
+        "Remind me to think about this very long thing without proper "
+        "punctuation that just keeps going and going and going past "
+        "the maximum sensible length we'd want to keep as a task and "
+        "even further than that to make absolutely sure we hit the cap"
+    )
+    out = list(tasks_mod.extract_candidates_from_text(
+        text, include_voice_patterns=True,
+    ))
+    assert len(out) == 1
+    assert out[0].endswith("…")  # truncation marker
+
+
+def test_materialize_picks_up_voice_paths(fresh_db):
+    """Voice-source docs go through extraction with voice patterns ON."""
+    cur = fresh_db.execute(
+        "INSERT INTO files(path, mtime, size, kind, indexed_at, content_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("voice://2026-04-15-100000", time.time(), 1, "url",
+         time.time(), None),
+    )
+    fid = cur.lastrowid
+    fresh_db.execute(
+        "INSERT INTO chunks(file_id, chunk_index, text) VALUES (?, 0, ?)",
+        (fid, "Quick thought — remind me to call mom tonight."),
+    )
+    fresh_db.commit()
+    n = tasks_mod.materialize_from_transcripts(fresh_db)
+    assert n == 1
+    [t] = tasks_mod.list_open(fresh_db)
+    assert "call mom" in t.text.lower()
+
+
+def test_materialize_voice_does_not_pollute_transcripts(fresh_db):
+    """Transcripts (Markdown-formatted, structured) should NOT run the
+    voice patterns — running them would surface speaker prose
+    fragments as tasks."""
+    cur = fresh_db.execute(
+        "INSERT INTO files(path, mtime, size, kind, indexed_at, content_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("transcript://granola/x", time.time(), 1, "url",
+         time.time(), None),
+    )
+    fid = cur.lastrowid
+    fresh_db.execute(
+        "INSERT INTO chunks(file_id, chunk_index, text) VALUES (?, 0, ?)",
+        (fid, "Alice: I need to mention the new design system. "
+              "Bob: I should follow up on that."),
+    )
+    fresh_db.commit()
+    n = tasks_mod.materialize_from_transcripts(fresh_db)
+    # Transcripts only run patterns A + B; speaker prose isn't in
+    # an `## Action items` section so nothing extracts.
+    assert n == 0
+
+
+def test_is_voice_path_recognizer():
+    from secondbrain.tasks import is_voice_path
+    assert is_voice_path("voice://2026-04-15-100000")
+    assert not is_voice_path("transcript://granola/abc")
+    assert not is_voice_path("C:\\notes\\todo.md")
+
+
+# ===================== search + bulk ops =============================
+
+def test_search_finds_open_tasks_by_substring(fresh_db):
+    tasks_mod.add_manual(fresh_db, "Reply to recruiter")
+    tasks_mod.add_manual(fresh_db, "Reply to mom")
+    tasks_mod.add_manual(fresh_db, "Update LinkedIn")
+    rows = tasks_mod.search(fresh_db, "reply")
+    texts = {r.text for r in rows}
+    assert "Reply to recruiter" in texts
+    assert "Reply to mom" in texts
+    assert "Update LinkedIn" not in texts
+
+
+def test_search_is_case_insensitive(fresh_db):
+    tasks_mod.add_manual(fresh_db, "Email SARAH")
+    rows = tasks_mod.search(fresh_db, "sarah")
+    assert len(rows) == 1
+
+
+def test_search_excludes_done_by_default(fresh_db):
+    tid = tasks_mod.add_manual(fresh_db, "Reply to recruiter")
+    tasks_mod.mark_done(fresh_db, tid)
+    rows = tasks_mod.search(fresh_db, "reply")
+    assert rows == []
+
+
+def test_search_includes_done_with_flag(fresh_db):
+    tid = tasks_mod.add_manual(fresh_db, "Reply to recruiter")
+    tasks_mod.mark_done(fresh_db, tid)
+    rows = tasks_mod.search(fresh_db, "reply", include_done=True)
+    assert len(rows) == 1
+    assert rows[0].status == "done"
+
+
+def test_search_empty_query_returns_empty(fresh_db):
+    tasks_mod.add_manual(fresh_db, "x")
+    assert tasks_mod.search(fresh_db, "") == []
+    assert tasks_mod.search(fresh_db, "   ") == []
+
+
+def test_mark_many_done_completes_multiple(fresh_db):
+    t1 = tasks_mod.add_manual(fresh_db, "a")
+    t2 = tasks_mod.add_manual(fresh_db, "b")
+    t3 = tasks_mod.add_manual(fresh_db, "c")
+    changed, missing = tasks_mod.mark_many_done(fresh_db, [t1, t2, t3])
+    assert changed == 3
+    assert missing == []
+    assert tasks_mod.list_open(fresh_db) == []
+
+
+def test_mark_many_done_reports_missing_ids(fresh_db):
+    t1 = tasks_mod.add_manual(fresh_db, "real")
+    changed, missing = tasks_mod.mark_many_done(fresh_db, [t1, 999])
+    assert changed == 1
+    assert missing == [999]
+
+
+def test_mark_many_done_skips_already_done(fresh_db):
+    """Already-done ids are silently ignored — same shape as
+    single-task `mark_done`. Keeps the bulk path forgiving."""
+    t1 = tasks_mod.add_manual(fresh_db, "x")
+    tasks_mod.mark_done(fresh_db, t1)
+    changed, missing = tasks_mod.mark_many_done(fresh_db, [t1])
+    assert changed == 0
+    assert missing == []

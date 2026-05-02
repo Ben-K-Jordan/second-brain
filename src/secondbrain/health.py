@@ -133,6 +133,47 @@ def recent(
             for r in reversed(rows)]
 
 
+def range_query(
+    conn: sqlite3.Connection,
+    metric: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source: str = "oura",
+) -> list[MetricPoint]:
+    """Pull values for an explicit ``[start_date, end_date]`` window
+    (inclusive). Both bounds are YYYY-MM-DD strings — ISO sorts
+    correctly so a plain string compare works.
+
+    Used by the dashboard / `health show --from --to` for arbitrary
+    historic queries instead of the rolling-window default."""
+    rows = conn.execute(
+        "SELECT date, value FROM health_metrics "
+        "WHERE metric = ? AND source = ? "
+        "  AND date >= ? AND date <= ? "
+        "ORDER BY date ASC",
+        (metric, source, start_date, end_date),
+    ).fetchall()
+    return [MetricPoint(date=r["date"], value=r["value"]) for r in rows]
+
+
+def latest(
+    conn: sqlite3.Connection, metric: str, *, source: str = "oura",
+) -> MetricPoint | None:
+    """Just the single most-recent value. Used by callers that don't
+    care about trend — e.g. the brief snapshot picks the latest value
+    independent of window."""
+    row = conn.execute(
+        "SELECT date, value FROM health_metrics "
+        "WHERE metric = ? AND source = ? "
+        "ORDER BY date DESC LIMIT 1",
+        (metric, source),
+    ).fetchone()
+    if row is None:
+        return None
+    return MetricPoint(date=row["date"], value=row["value"])
+
+
 def summarise(
     conn: sqlite3.Connection,
     metric: str,

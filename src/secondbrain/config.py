@@ -250,6 +250,13 @@ class Config:
     read_queue_summarise_per_run: int = 5  # per-tick cap
     read_queue_notify_threshold: int = 5   # tray ping when unread >= this
 
+    # Daily brief (Phase 44) — morning aggregator delivered by email.
+    # Reuses the SMTP config from the digest. When daily_brief_enabled
+    # is true, the daemon checks once a minute and sends at the
+    # configured local time. Pure aggregation, $0 cost.
+    daily_brief_enabled: bool = False
+    daily_brief_send_time: str = "07:00"  # local HH:MM, 24-hour
+
     # Voice capture (`secondbrain capture`). Auto-VAD stop after the
     # configured silence duration. Save the .wav for keepsake too.
     voice_sample_rate: int = 16000
@@ -595,6 +602,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.read_queue_summarise_per_run = int(data["read_queue_summarise_per_run"])
         if "read_queue_notify_threshold" in data:
             cfg.read_queue_notify_threshold = int(data["read_queue_notify_threshold"])
+        if "daily_brief_enabled" in data:
+            cfg.daily_brief_enabled = bool(data["daily_brief_enabled"])
+        if "daily_brief_send_time" in data:
+            cfg.daily_brief_send_time = str(data["daily_brief_send_time"])
         if "voice_sample_rate" in data:
             cfg.voice_sample_rate = int(data["voice_sample_rate"])
         if "voice_silence_rms" in data:

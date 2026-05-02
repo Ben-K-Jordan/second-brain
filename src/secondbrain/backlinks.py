@@ -69,6 +69,12 @@ _PER_CHUNK_FETCH = 50
 # chunk to find its neighbours; the first ~30 give plenty of signal and
 # bound the cost.
 _MAX_CHUNKS_PER_SOURCE = 30
+# Skip backlinks for docs with fewer than this many chunks. Tiny docs
+# (a one-line note, a "see this URL" stub) don't have enough signal to
+# meaningfully match other docs — and they tend to produce spammy
+# matches based on whatever stopwords happen to align. Keeping the
+# graph clean by skipping them at the source.
+_MIN_CHUNKS_FOR_LINKING = 2
 
 
 @dataclass
@@ -102,6 +108,7 @@ def link_doc(
     *,
     k: int = _DEFAULT_K,
     max_distance: float = _DEFAULT_MAX_DISTANCE,
+    min_chunks: int = _MIN_CHUNKS_FOR_LINKING,
 ) -> int:
     """Compute neighbours for ``file_id`` and persist both directions.
 
@@ -109,9 +116,20 @@ def link_doc(
     overwritten with the new score. Returns the count of pair-rows
     written (so for K neighbours, expect 2K).
 
+    Skips docs with fewer than ``min_chunks`` chunks — tiny stubs
+    produce noisy matches and clutter the graph. Set ``min_chunks=1``
+    in tests where the doc has been hand-built with a single chunk.
+
     Failures are caught and logged so a backlink computation issue
     can never take down an ingest.
     """
+    # Cheap pre-flight — avoid even the vec query for content-less docs.
+    n_chunks = conn.execute(
+        "SELECT COUNT(*) AS n FROM chunks WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()["n"]
+    if (n_chunks or 0) < min_chunks:
+        return 0
     try:
         neighbours = compute_neighbors(
             conn, file_id, k=k, max_distance=max_distance,
@@ -329,6 +347,7 @@ def rebuild_all(
     *,
     k: int = _DEFAULT_K,
     max_distance: float = _DEFAULT_MAX_DISTANCE,
+    min_chunks: int = _MIN_CHUNKS_FOR_LINKING,
     on_progress=None,
 ) -> int:
     """Recompute every file's neighbours from scratch. Drops existing
@@ -347,7 +366,8 @@ def rebuild_all(
     written = 0
     for i, r in enumerate(rows, 1):
         written += link_doc(
-            conn, int(r["id"]), k=k, max_distance=max_distance,
+            conn, int(r["id"]),
+            k=k, max_distance=max_distance, min_chunks=min_chunks,
         )
         if on_progress is not None:
             try:

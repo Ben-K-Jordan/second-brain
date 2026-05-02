@@ -1378,8 +1378,9 @@ def brief_today(
 
     Pulls together today's calendar, Canvas assignments due in the next
     72h, open action items from recent meeting transcripts, the top of
-    your reading queue, and watchlist hits from the last day. Pure
-    aggregation — no LLM call, no network beyond the calendar fetch.
+    your reading queue, watchlist hits from the last day, and an Oura
+    health snapshot when configured. Pure aggregation — no LLM call,
+    no network beyond the calendar fetch.
     """
     from .daily_brief import generate_brief_markdown
 
@@ -1393,6 +1394,49 @@ def brief_today(
     else:
         from rich.markdown import Markdown
         console.print(Markdown(md))
+    conn.close()
+
+
+@brief_app.command("send")
+def brief_send(
+    force: bool = typer.Option(
+        False, "--force",
+        help="Send even if a brief was sent within the cooldown.",
+    ),
+) -> None:
+    """Send today's brief by email (uses the digest SMTP config).
+
+    Requires `daily_brief_enabled = true` and `digest_to` in config,
+    plus SECONDBRAIN_SMTP_PASSWORD in the environment. The daemon
+    auto-fires this once a day at `daily_brief_send_time`; this
+    command lets you trigger it ad-hoc.
+    """
+    from .daily_brief import last_brief_sent_at, send_brief
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if not force:
+        last = last_brief_sent_at(conn)
+        if last is not None and (time.time() - last) < 12 * 3600:
+            from datetime import datetime
+            ago_h = (time.time() - last) / 3600
+            console.print(
+                f"[yellow]Skipping[/]: a brief was sent {ago_h:.1f}h ago. "
+                f"Use [cyan]--force[/] to override.",
+            )
+            console.print(
+                f"  last successful: "
+                f"{datetime.fromtimestamp(last).strftime('%Y-%m-%d %H:%M')}",
+            )
+            conn.close()
+            return
+    success, info = send_brief(cfg, conn)
+    if success:
+        console.print(f"[green]✓[/] {info}")
+    else:
+        console.print(f"[red]send failed:[/] {info}")
+        conn.close()
+        raise typer.Exit(code=1)
     conn.close()
 
 
@@ -1509,8 +1553,22 @@ def health_show(
     ),
     days: int = typer.Option(14, "--days", "-d"),
     source: str = typer.Option("oura", "--source", "-s"),
+    from_date: str = typer.Option(
+        None, "--from",
+        help="Start date (YYYY-MM-DD). Overrides --days.",
+    ),
+    to_date: str = typer.Option(
+        None, "--to",
+        help="End date (YYYY-MM-DD). Defaults to today when --from is set.",
+    ),
 ) -> None:
-    """Show recent values for a metric (or list available metrics)."""
+    """Show recent values for a metric (or list available metrics).
+
+    Two query modes:
+
+      `--days N` (default): rolling window, last N days.
+      `--from / --to`: explicit date range. End date defaults to today.
+    """
     from . import health as health_mod
 
     cfg = load_config()
@@ -1530,19 +1588,53 @@ def health_show(
         conn.close()
         return
 
-    summary = health_mod.summarise(
-        conn, metric, days=days, source=source,
-    )
-    console.print(health_mod.format_summary_line(summary))
-    points = health_mod.recent(conn, metric, days=days, source=source)
+    if from_date:
+        end = to_date or _today_iso()
+        points = health_mod.range_query(
+            conn, metric, start_date=from_date, end_date=end, source=source,
+        )
+        header = f"{metric}: {from_date} → {end}"
+        if points:
+            vals = [p.value for p in points]
+            avg = sum(vals) / len(vals)
+            console.print(
+                f"{header} — {len(points)} day(s), avg "
+                f"{_fmt_num(avg)}, range "
+                f"{_fmt_num(min(vals))}–{_fmt_num(max(vals))}",
+            )
+        else:
+            console.print(f"{header} — no data")
+    else:
+        summary = health_mod.summarise(
+            conn, metric, days=days, source=source,
+        )
+        console.print(health_mod.format_summary_line(summary))
+        points = health_mod.recent(
+            conn, metric, days=days, source=source,
+        )
+
     if points:
         # Tiny ASCII sparkline so trends are visible without a plot lib.
         spark = _ascii_sparkline([p.value for p in points])
         console.print(f"  [dim]{spark}[/]")
         console.print(
-            f"  [dim]({points[0].date} → {points[-1].date})[/]"
+            f"  [dim]({points[0].date} → {points[-1].date})[/]",
         )
     conn.close()
+
+
+def _today_iso() -> str:
+    """Local-time today as YYYY-MM-DD. Used by `health show --from`
+    when no `--to` is given."""
+    from datetime import date
+    return date.today().isoformat()
+
+
+def _fmt_num(v: float) -> str:
+    """Cosmetic: integer-format whole numbers, one-decimal otherwise."""
+    if abs(v - int(v)) < 1e-6:
+        return str(int(v))
+    return f"{v:.1f}"
 
 
 def _ascii_sparkline(values: list[float]) -> str:
@@ -1653,10 +1745,18 @@ def tasks_list(
         table = Table(show_header=True, box=None, title="Open tasks")
         table.add_column("id", style="dim", width=4)
         table.add_column("text")
+        table.add_column("age", style="dim", width=4, justify="right")
         table.add_column("source", style="dim")
+        now = time.time()
         for t in open_rows:
+            age_days = max(0, int((now - t.created_at) // 86400))
+            # Highlight stale tasks (> 7d) so the user clocks them.
+            age_label = (
+                f"[yellow]{age_days}d[/]" if age_days >= 7
+                else (f"{age_days}d" if age_days > 0 else "—")
+            )
             src = "" if t.source_path == "manual" else t.source_title
-            table.add_row(str(t.id), t.text, src[:40])
+            table.add_row(str(t.id), t.text, age_label, src[:40])
         console.print(table)
         console.print(f"[dim]{len(open_rows)} open task(s)[/]")
     if show_done:
@@ -1676,6 +1776,48 @@ def tasks_list(
                 )
                 table.add_row(str(t.id), t.text, when)
             console.print(table)
+    conn.close()
+
+
+@tasks_app.command("search")
+def tasks_search(
+    query: str = typer.Argument(..., help="Substring to match (case-insensitive)."),
+    show_done: bool = typer.Option(
+        False, "--done/--no-done",
+        help="Search across done tasks too (default: open only).",
+    ),
+) -> None:
+    """Find tasks by text. Useful when you remember the gist but not
+    the id — `tasks search recruiter` surfaces every recruiter-related
+    task you've got."""
+    from . import tasks as tasks_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = tasks_mod.search(conn, query, include_done=show_done)
+    if not rows:
+        console.print(f"[yellow]No matches for[/] {query!r}.")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None,
+                  title=f"Tasks matching {query!r}")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("text")
+    table.add_column("status", style="dim")
+    table.add_column("source", style="dim")
+    for t in rows:
+        src = "" if t.source_path == "manual" else t.source_title
+        status_color = (
+            "cyan" if t.status == "open"
+            else "dim" if t.status == "cancelled"
+            else "green"
+        )
+        table.add_row(
+            str(t.id), t.text,
+            f"[{status_color}]{t.status}[/]",
+            src[:40],
+        )
+    console.print(table)
     conn.close()
 
 
@@ -1700,22 +1842,41 @@ def tasks_add(
 
 @tasks_app.command("done")
 def tasks_done(
-    task_id: int = typer.Argument(..., help="Task id (from `tasks list`)."),
+    task_ids: list[int] = typer.Argument(
+        ..., help="One or more task ids. e.g. `tasks done 3 5 8`",
+    ),
 ) -> None:
-    """Mark a task complete. It stops showing up in the daily brief."""
+    """Mark one or more tasks complete. They stop showing up in the
+    daily brief. Bulk-completing is the common case after a focused
+    work session that knocked out several action items."""
     from . import tasks as tasks_mod
 
     cfg = load_config()
     conn, _ = _open_state(cfg)
-    t = tasks_mod.get(conn, task_id)
-    if t is None:
-        console.print(f"[red]Task #{task_id} not found.[/]")
+    if len(task_ids) == 1:
+        # Same single-task flow + clear feedback as before.
+        task_id = task_ids[0]
+        t = tasks_mod.get(conn, task_id)
+        if t is None:
+            console.print(f"[red]Task #{task_id} not found.[/]")
+            conn.close()
+            raise typer.Exit(code=1)
+        if not tasks_mod.mark_done(conn, task_id):
+            console.print(f"[yellow]Task #{task_id} was already done.[/]")
+        else:
+            console.print(f"[green]✓[/] #{task_id}: {t.text}")
         conn.close()
-        raise typer.Exit(code=1)
-    if not tasks_mod.mark_done(conn, task_id):
-        console.print(f"[yellow]Task #{task_id} was already done.[/]")
-    else:
-        console.print(f"[green]✓[/] #{task_id}: {t.text}")
+        return
+    # Bulk path.
+    changed, missing = tasks_mod.mark_many_done(conn, task_ids)
+    if changed:
+        console.print(f"[green]✓[/] Marked {changed} task(s) done.")
+    if missing:
+        console.print(
+            f"[red]Not found:[/] {', '.join(f'#{i}' for i in missing)}",
+        )
+    if not changed and not missing:
+        console.print("[yellow]All listed tasks were already done.[/]")
     conn.close()
 
 

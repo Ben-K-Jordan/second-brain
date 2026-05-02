@@ -179,7 +179,7 @@ def test_link_doc_stores_both_directions(fresh_db):
         fresh_db, path="B",
         chunk_texts=["y"], chunk_embeddings=[_vec([0.99, 0.01])],
     )
-    written = backlinks.link_doc(fresh_db, fid_a, max_distance=10.0)
+    written = backlinks.link_doc(fresh_db, fid_a, max_distance=10.0, min_chunks=1)
     assert written == 2  # one neighbour × bidirectional rows
     # Both directions queryable.
     assert backlinks.get_backlinks(fresh_db, fid_a)[0].file_id == fid_b
@@ -197,11 +197,11 @@ def test_link_doc_idempotent_score_refreshes(fresh_db):
         fresh_db, path="B",
         chunk_texts=["y"], chunk_embeddings=[_vec([0.99, 0.01])],
     )
-    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0, min_chunks=1)
     n_after_first = fresh_db.execute(
         "SELECT COUNT(*) AS n FROM backlinks",
     ).fetchone()["n"]
-    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0, min_chunks=1)
     n_after_second = fresh_db.execute(
         "SELECT COUNT(*) AS n FROM backlinks",
     ).fetchone()["n"]
@@ -221,7 +221,7 @@ def test_get_backlinks_orders_by_score_ascending(fresh_db):
         fresh_db, path="mid",
         chunk_texts=["y"], chunk_embeddings=[_vec([0.5, 0.5])],
     )
-    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0, min_chunks=1)
     rows = backlinks.get_backlinks(fresh_db, fid_src)
     file_ids = [r.file_id for r in rows]
     assert file_ids.index(fid_close) < file_ids.index(fid_mid)
@@ -237,7 +237,7 @@ def test_backlinks_view_includes_path_and_title(fresh_db):
         chunk_texts=["# Sprint planning\n\nNotes here."],
         chunk_embeddings=[_vec([0.99, 0.01])],
     )
-    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0, min_chunks=1)
     [view] = backlinks.get_backlinks(fresh_db, fid_src)
     assert view.file_id == fid_dst
     assert view.path == "transcript://granola/abc"
@@ -255,7 +255,7 @@ def test_get_backlinks_for_path(fresh_db):
         fresh_db, path="dst",
         chunk_texts=["x"], chunk_embeddings=[_vec([0.99, 0.01])],
     )
-    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_src, max_distance=10.0, min_chunks=1)
     by_path = backlinks.get_backlinks_for_path(fresh_db, "src")
     by_id = backlinks.get_backlinks(fresh_db, fid_src)
     assert [v.file_id for v in by_path] == [v.file_id for v in by_id]
@@ -274,7 +274,7 @@ def test_clear_backlinks_for_removes_both_directions(fresh_db):
         fresh_db, path="B",
         chunk_texts=["y"], chunk_embeddings=[_vec([0.99, 0.01])],
     )
-    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0)
+    backlinks.link_doc(fresh_db, fid_a, max_distance=10.0, min_chunks=1)
     n = backlinks.clear_backlinks_for(fresh_db, fid_a)
     assert n == 2
     assert backlinks.get_backlinks(fresh_db, fid_a) == []
@@ -307,7 +307,7 @@ def test_rebuild_all_drops_then_recomputes(fresh_db):
     )
     fresh_db.commit()
 
-    written = backlinks.rebuild_all(fresh_db, max_distance=10.0)
+    written = backlinks.rebuild_all(fresh_db, max_distance=10.0, min_chunks=1)
     assert written > 0
     # The (a, b) pair should now have the real (small) score.
     score = fresh_db.execute(
@@ -328,7 +328,7 @@ def test_rebuild_all_progress_callback_fires(fresh_db):
     )
     seen: list[tuple[int, int]] = []
     backlinks.rebuild_all(
-        fresh_db, max_distance=10.0,
+        fresh_db, max_distance=10.0, min_chunks=1,
         on_progress=lambda done, total: seen.append((done, total)),
     )
     assert seen == [(1, 2), (2, 2)]
@@ -348,7 +348,7 @@ def test_rebuild_all_progress_callback_failure_doesnt_break_rebuild(fresh_db):
     def boom(done, total):
         raise RuntimeError("ui crashed")
     n = backlinks.rebuild_all(
-        fresh_db, max_distance=10.0, on_progress=boom,
+        fresh_db, max_distance=10.0, min_chunks=1, on_progress=boom,
     )
     assert n > 0
 
@@ -357,16 +357,23 @@ def test_rebuild_all_progress_callback_failure_doesnt_break_rebuild(fresh_db):
 
 def test_indexer_hook_links_after_replace_chunks(fresh_db):
     """When the indexer's _link_after_index helper runs against a
-    populated db, downstream get_backlinks reflects the link."""
+    populated db, downstream get_backlinks reflects the link.
+
+    Note: we seed 2-chunk docs because the production hook respects
+    the ``_MIN_CHUNKS_FOR_LINKING = 2`` threshold to avoid spammy
+    matches off tiny stub docs. Tests that want to exercise the
+    threshold separately use ``min_chunks=1``."""
     from secondbrain.indexer import _link_after_index
 
     fid_a = _seed_file_with_embeddings(
         fresh_db, path="A",
-        chunk_texts=["x"], chunk_embeddings=[_vec([1.0, 0.0])],
+        chunk_texts=["alpha first", "alpha second"],
+        chunk_embeddings=[_vec([1.0, 0.0]), _vec([0.99, 0.05])],
     )
     _seed_file_with_embeddings(
         fresh_db, path="B",
-        chunk_texts=["y"], chunk_embeddings=[_vec([0.99, 0.01])],
+        chunk_texts=["beta first", "beta second"],
+        chunk_embeddings=[_vec([0.99, 0.01]), _vec([0.98, 0.05])],
     )
     _link_after_index(fresh_db, fid_a)
     assert backlinks.get_backlinks(fresh_db, fid_a)
@@ -383,3 +390,53 @@ def test_indexer_hook_swallows_failures(fresh_db, monkeypatch):
     monkeypatch.setattr(bl_mod, "link_doc", boom)
     # Should not raise.
     idx_mod._link_after_index(fresh_db, 12345)
+
+
+# ===================== min_chunks threshold ===========================
+
+def test_link_doc_skips_single_chunk_docs_by_default(fresh_db):
+    """Production behaviour: tiny stub docs (1 chunk) shouldn't enter
+    the backlink graph — they make noisy matches based on stopword
+    overlap rather than real semantic kinship."""
+    fid_stub = _seed_file_with_embeddings(
+        fresh_db, path="stub",
+        chunk_texts=["one liner"],
+        chunk_embeddings=[_vec([1.0, 0.0])],
+    )
+    _seed_file_with_embeddings(
+        fresh_db, path="real",
+        chunk_texts=["alpha", "beta"],
+        chunk_embeddings=[_vec([0.99, 0.01]), _vec([0.95, 0.05])],
+    )
+    written = backlinks.link_doc(fresh_db, fid_stub, max_distance=10.0)
+    assert written == 0  # default min_chunks=2 skipped it
+    assert backlinks.get_backlinks(fresh_db, fid_stub) == []
+
+
+def test_link_doc_min_chunks_override_lets_tests_exercise_logic(fresh_db):
+    """Passing min_chunks=1 brings 1-chunk docs back into the graph
+    — needed for the existing single-chunk fixture tests."""
+    fid_a = _seed_file_with_embeddings(
+        fresh_db, path="A",
+        chunk_texts=["x"], chunk_embeddings=[_vec([1.0, 0.0])],
+    )
+    _seed_file_with_embeddings(
+        fresh_db, path="B",
+        chunk_texts=["y"], chunk_embeddings=[_vec([0.99, 0.01])],
+    )
+    written = backlinks.link_doc(
+        fresh_db, fid_a, max_distance=10.0, min_chunks=1,
+    )
+    assert written > 0
+
+
+def test_link_doc_skips_chunkless_files(fresh_db):
+    """A file row with zero chunks (e.g. an image without OCR) must
+    not crash the linker."""
+    from secondbrain.db import upsert_file
+    fid = upsert_file(
+        fresh_db, path="empty.png", mtime=0.0, size=0,
+        kind="image", content_hash=None,
+    )
+    fresh_db.commit()
+    assert backlinks.link_doc(fresh_db, fid, max_distance=10.0) == 0

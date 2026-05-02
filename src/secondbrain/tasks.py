@@ -81,6 +81,26 @@ _OPEN_CHECKBOX_RE = re.compile(
     re.MULTILINE,
 )
 
+# Pattern (C): natural-language imperative phrases in voice notes.
+# When you say "remind me to email Sarah" / "I need to update the doc"
+# into a `secondbrain capture`, the resulting transcript should
+# surface that as a task without you having to format it as a bullet.
+#
+# Patterns are conservative — false positives are worse than false
+# negatives here, since users can always `tasks add` manually for
+# tasks the regex didn't catch.
+_VOICE_TASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bremind\s+me\s+to\s+(.+?)(?:[.!?]|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bI\s+need\s+to\s+(.+?)(?:[.!?]|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bI\s+have\s+to\s+(.+?)(?:[.!?]|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bI\s+should\s+(.+?)(?:[.!?]|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bTODO[:\s]+(.+?)(?:[.!?]|$)", re.IGNORECASE | re.DOTALL),
+)
+# Cap individual extracted tasks at this many chars — the trailing
+# "." regex can occasionally lasso multi-sentence ramble. 200 chars
+# keeps it sane.
+_MAX_TASK_TEXT_LEN = 200
+
 
 # ---- Data shape -------------------------------------------------------
 
@@ -104,17 +124,37 @@ class Task:
 # ============================ extraction ==============================
 
 def extract_candidates_from_text(
-    text: str,
+    text: str, *, include_voice_patterns: bool = False,
 ) -> Iterator[str]:
     """Yield candidate task strings from one chunk of doc text.
 
     Tries pattern A (Action items section) first; falls back to
     pattern B (bare open checkboxes) for everything that didn't get
-    captured. Yields each candidate text exactly once per chunk —
-    de-duplication across chunks happens at insert time via the UNIQUE
-    constraint.
+    captured. When ``include_voice_patterns`` is true, also runs
+    pattern C — natural-language "remind me to ..." / "I need to ..."
+    phrases — which is appropriate for voice transcripts but too
+    noisy for ordinary prose docs.
+
+    Yields each candidate exactly once per chunk — dedup happens
+    by lowercase comparison; the UNIQUE constraint at insert time
+    handles cross-chunk dedup.
     """
     seen: set[str] = set()
+
+    def _try_yield(raw: str) -> Iterator[str]:
+        t = (raw or "").strip()
+        if not t:
+            return
+        # Trim very long matches — voice patterns can occasionally
+        # lasso a whole sentence + the next one when punctuation
+        # is absent.
+        if len(t) > _MAX_TASK_TEXT_LEN:
+            t = t[:_MAX_TASK_TEXT_LEN].rstrip() + "…"
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        yield t
 
     # Pattern A: `## Action items` blocks. Iterate every match in the
     # text — long meetings sometimes have both a "Decisions" heading
@@ -126,26 +166,27 @@ def extract_candidates_from_text(
             # Closed checkboxes ('x' / 'X') are already done — skip.
             if mark and mark.lower() == "x":
                 continue
-            t = (line_m.group("text") or "").strip()
-            if not t:
-                continue
-            key = t.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            yield t
+            yield from _try_yield(line_m.group("text") or "")
 
-    # Pattern B: bare `- [ ] text` outside a section. Don't re-yield
+    # Pattern B: bare `- [ ] text` outside a section. Dedup against
     # anything already captured by pattern A.
     for chk_m in _OPEN_CHECKBOX_RE.finditer(text):
-        t = (chk_m.group(1) or "").strip()
-        if not t:
-            continue
-        key = t.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        yield t
+        yield from _try_yield(chk_m.group(1) or "")
+
+    # Pattern C: natural-language imperatives. Off by default
+    # because in normal prose ("I should mention that...") this
+    # produces noise. The voice-note materializer turns it on.
+    if include_voice_patterns:
+        for pattern in _VOICE_TASK_PATTERNS:
+            for m in pattern.finditer(text):
+                yield from _try_yield(m.group(1) or "")
+
+
+def is_voice_path(path: str) -> bool:
+    """True for source paths whose content was produced by a voice
+    capture (Phase 41) — those benefit from natural-language pattern
+    extraction since they don't carry Markdown formatting."""
+    return path.startswith("voice://")
 
 
 # ============================ persistence =============================
@@ -269,6 +310,60 @@ def get(conn: sqlite3.Connection, task_id: int) -> Task | None:
     return _row_to_task(row) if row else None
 
 
+def search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    include_done: bool = False,
+    limit: int = 50,
+) -> list[Task]:
+    """Substring search across task text (case-insensitive). Useful
+    when you remember a task's gist but not its id, e.g. ``tasks
+    search recruiter`` finds 'Reply to recruiter'.
+
+    By default only open tasks; pass ``include_done=True`` for full
+    history. Bare ``LIKE`` is fine here — the table won't grow large
+    enough for FTS5 to matter (single-user tool, O(thousands) tasks
+    over a year).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q.lower()}%"
+    if include_done:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE text_lower LIKE ? "
+            "ORDER BY status, created_at DESC, id DESC LIMIT ?",
+            (like, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status = 'open' AND text_lower LIKE ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (like, limit),
+        ).fetchall()
+    return [_row_to_task(r) for r in rows]
+
+
+def mark_many_done(
+    conn: sqlite3.Connection, task_ids: list[int],
+) -> tuple[int, list[int]]:
+    """Bulk-complete several tasks in one go. Returns ``(count_changed,
+    missing_ids)``. ``missing_ids`` is the subset that didn't exist
+    (so the CLI can warn the user); already-done ids are silently
+    skipped (consistent with single-task ``mark_done``)."""
+    changed = 0
+    missing: list[int] = []
+    for tid in task_ids:
+        existing = get(conn, tid)
+        if existing is None:
+            missing.append(tid)
+            continue
+        if mark_done(conn, tid):
+            changed += 1
+    return changed, missing
+
+
 def _row_to_task(row: sqlite3.Row) -> Task:
     return Task(
         id=int(row["id"]),
@@ -289,18 +384,25 @@ def materialize_from_transcripts(
     *,
     lookback_days: int = _DEFAULT_LOOKBACK_DAYS,
 ) -> int:
-    """Scan recent transcript-shaped docs and insert any open action
-    items into ``tasks``. Returns the count newly inserted.
+    """Scan recent transcript- and voice-shaped docs and insert any
+    open action items into ``tasks``. Returns the count newly inserted.
 
     Idempotent — re-running over the same window is a no-op once
     everything's been captured. Cheap enough that the daily brief
     calls it on every render.
+
+    Sources scanned:
+      - ``transcript://*`` — Granola / Plaud / generic transcripts
+        with structured ``## Action items`` sections (Phase 43).
+      - ``voice://*`` — voice captures (Phase 41). For these we also
+        run the natural-language patterns ("remind me to ...", "TODO:
+        ...") since voice transcripts don't carry Markdown formatting.
     """
     cutoff = time.time() - lookback_days * 86400
     rows = conn.execute(
         "SELECT f.id AS fid, f.path AS path, c.text AS text "
         "FROM chunks c JOIN files f ON f.id = c.file_id "
-        "WHERE f.path LIKE 'transcript://%' "
+        "WHERE (f.path LIKE 'transcript://%' OR f.path LIKE 'voice://%') "
         "  AND f.indexed_at >= ? "
         "ORDER BY f.indexed_at DESC, f.id DESC, c.chunk_index ASC",
         (cutoff,),
@@ -312,7 +414,13 @@ def materialize_from_transcripts(
         if fid not in title_cache:
             title_cache[fid] = _doc_title(conn, fid, r["path"])
         title = title_cache[fid]
-        for cand in extract_candidates_from_text(r["text"] or ""):
+        # Voice notes get the natural-language patterns. Transcripts
+        # already produce structured Markdown so we stick to A + B
+        # patterns there to keep the noise floor low.
+        voice = is_voice_path(r["path"])
+        for cand in extract_candidates_from_text(
+            r["text"] or "", include_voice_patterns=voice,
+        ):
             tid = insert_extracted(
                 conn,
                 text=cand,

@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 from .config import Config
+from .connectors.oura import run_oura_sync_if_due
+from .daily_brief import run_brief_if_due
 from .db import checkpoint_wal, connect, init_schema
 from .digest import run_digest_if_due
 from .embedder import make_embedder
@@ -216,6 +218,21 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
                     run_digest_if_due(cfg, conn)
                 except Exception as e:  # noqa: BLE001
                     log.warning("digest scheduler crashed: %s", e)
+                # Daily brief (Phase 44) — same cadence, separate
+                # send time + cooldown so the morning brief and the
+                # daily digest can fire at different hours.
+                try:
+                    if run_brief_if_due(cfg, conn):
+                        log.info("daily brief: auto-fired")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("daily brief scheduler crashed: %s", e)
+                # Oura ring auto-sync (Phase 56) — once per ~12h to
+                # land overnight data without burning the API quota.
+                try:
+                    if run_oura_sync_if_due(cfg, conn, embedder):
+                        log.info("oura: daemon sync ran")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("oura scheduler crashed: %s", e)
                 # Pre-event briefings — checks calendars for events
                 # starting soon and generates briefings on demand.
                 try:

@@ -924,7 +924,10 @@ PALETTE_JS = r"""
 def _layout(title: str, body: str, active: str = "") -> str:
     nav_items = [
         ("Overview", "/"),
+        ("Brief", "/brief"),
         ("Chat", "/chat"),
+        ("Tasks", "/tasks"),
+        ("Health", "/health"),
         ("Briefings", "/briefings"),
         ("Queue", "/queue"),
         ("Search", "/search"),
@@ -1002,6 +1005,178 @@ def _result_block(r, source_label: str = "search") -> str:
     <div class="meta">chunk {r.chunk_index} · {sources}{age} · score {r.score:.4f}</div>
     <div class="snippet">{snippet}</div>
 </article>"""
+
+
+def _markdown_to_html_block(md: str) -> str:
+    """Tiny markdown subset → HTML for the dashboard's brief view.
+    Mirrors the email rendering in ``daily_brief._minimal_md_to_html``
+    but kept module-local so the dashboard doesn't import that
+    helper (would create a daily_brief → dashboard import loop in
+    some refactors)."""
+    out: list[str] = []
+    in_list = False
+    for raw_line in md.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append("")
+            continue
+        # Heading?
+        if line.startswith("# "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h2>{escape(line[2:])}</h2>")
+            continue
+        if line.startswith("## "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h3>{escape(line[3:])}</h3>")
+            continue
+        if line.startswith("### "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<h4>{escape(line[4:])}</h4>")
+            continue
+        # Bullet?
+        stripped = line.lstrip()
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{escape(stripped[2:])}</li>")
+            continue
+        # Blockquote?
+        if stripped.startswith("> "):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append(f"<blockquote>{escape(stripped[2:])}</blockquote>")
+            continue
+        # Plain paragraph.
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        out.append(f"<p>{escape(line)}</p>")
+    if in_list:
+        out.append("</ul>")
+    return "\n".join(out)
+
+
+def _render_health_card(metric: str, summary, points) -> str:
+    """One card per Oura headline metric — score, 14d avg, sparkline."""
+    label_map = {
+        "sleep_score": "Sleep",
+        "readiness_score": "Readiness",
+        "activity_score": "Activity",
+    }
+    label = label_map.get(metric, metric.replace("_", " ").title())
+    latest_v = (
+        f"{int(summary.latest.value)}"
+        if summary.latest and abs(
+            summary.latest.value - int(summary.latest.value)
+        ) < 1e-6
+        else (f"{summary.latest.value:.1f}" if summary.latest else "—")
+    )
+    avg_v = (
+        f"{summary.average:.0f}" if summary.average is not None else "—"
+    )
+    delta_html = ""
+    if summary.latest and summary.average:
+        delta_pct = (summary.latest.value - summary.average) / summary.average * 100.0
+        arrow = "↑" if delta_pct >= 5 else "↓" if delta_pct <= -5 else ""
+        klass = (
+            "good" if delta_pct >= 5 else "warn" if delta_pct <= -5 else ""
+        )
+        delta_html = (
+            f'<span class="{klass}">{arrow} {delta_pct:+.0f}%</span>'
+        )
+    # Inline SVG sparkline for the trend.
+    spark_html = _svg_sparkline([p.value for p in points], width=200, height=40)
+    return f"""
+<div class="card">
+  <h2>{escape(label)}</h2>
+  <div class="stat" style="font-size:32px;font-weight:600;">
+    <span>{latest_v}</span>
+    <span class="v" style="font-size:14px;">{delta_html}</span>
+  </div>
+  <div class="stat"><span class="muted">14-day avg</span>
+    <span class="v">{avg_v}</span></div>
+  <div class="stat"><span class="muted">days with data</span>
+    <span class="v">{summary.n}</span></div>
+  <div style="margin-top:12px;">{spark_html}</div>
+</div>"""
+
+
+def _render_backlinks_block(conn, path: str) -> str:
+    """Render the 'See also' panel for a file view. Pulls from
+    Phase 52's backlinks table — empty when the doc has no neighbours
+    yet (e.g. just-ingested or under the min_chunks threshold)."""
+    try:
+        from .backlinks import get_backlinks_for_path
+    except ImportError:
+        return ""
+    try:
+        rows = get_backlinks_for_path(conn, path, limit=8)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rows:
+        return ""
+    items: list[str] = []
+    for r in rows:
+        items.append(
+            f'<div class="stat">'
+            f'<span><a href="/file?path={urllib.parse.quote_plus(r.path)}">'
+            f'{escape(r.title)}</a> '
+            f'<span class="muted">{escape(r.path)}</span></span>'
+            f'<span class="v">{r.percent}%</span>'
+            f'</div>',
+        )
+    return (
+        '<div class="card" style="margin-top:24px;">'
+        '<h2>See also</h2>'
+        + "".join(items)
+        + '</div>'
+    )
+
+
+def _svg_sparkline(values: list[float], *, width: int, height: int) -> str:
+    """Inline SVG line chart. No external deps — keeps the dashboard
+    self-contained. Renders a flat line at the middle for constant
+    series."""
+    if not values:
+        return ""
+    if len(values) == 1:
+        # Single point — just a dot.
+        return (
+            f'<svg viewBox="0 0 {width} {height}" '
+            f'style="width:100%;height:{height}px;">'
+            f'<circle cx="{width / 2}" cy="{height / 2}" r="3" '
+            f'fill="currentColor"/></svg>'
+        )
+    lo, hi = min(values), max(values)
+    span = hi - lo or 1.0
+    pad = 4
+    inner_h = height - 2 * pad
+    inner_w = width - 2 * pad
+    pts = []
+    for i, v in enumerate(values):
+        x = pad + (i / (len(values) - 1)) * inner_w
+        # Y axis flipped: SVG y grows downward, so subtract.
+        y = pad + (1 - (v - lo) / span) * inner_h
+        pts.append(f"{x:.1f},{y:.1f}")
+    points_str = " ".join(pts)
+    return (
+        f'<svg viewBox="0 0 {width} {height}" '
+        f'style="width:100%;height:{height}px;">'
+        f'<polyline points="{points_str}" fill="none" '
+        f'stroke="currentColor" stroke-width="2" '
+        f'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
 
 
 def _entity_link(text: str, label: str = "") -> str:
@@ -1585,11 +1760,17 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         age = (time.time() - row["mtime"]) / 86400
         is_url = path.startswith("http://") or path.startswith("https://")
         open_link = f'<a href="{escape(path)}" target="_blank">Open ↗</a>' if is_url else ""
+
+        # Phase 52: surface "see also" backlinks at the bottom so the
+        # file view becomes a wayfinding hub, not just a content dump.
+        backlinks_html = _render_backlinks_block(conn, path)
+
         body = f"""
 <h1>File <span class="muted">[{kind}]</span></h1>
 <p class="path">{escape(path)} {open_link}</p>
 <p class="muted">{len(chunks)} chunks · {row["size"] / 1024:.1f} KB · {age:.1f}d ago</p>
-{body_chunks}"""
+{body_chunks}
+{backlinks_html}"""
         return HTMLResponse(_layout(Path(path).name or path, body))
 
     # --- Chat with your brain ----------------------------------------
@@ -3208,9 +3389,196 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 </div>"""
         return HTMLResponse(_layout("Ingest result", body, "ingest"))
 
-    @app.get("/health")
-    def health():
+    @app.get("/healthz")
+    def healthz():
+        """Liveness probe — `{ok: true}` if the FastAPI process is up.
+        Renamed from `/health` so the user-facing health page (Phase 56)
+        can own that route."""
         return {"ok": True}
+
+    # --- Phase 44: morning brief view ---------------------------------
+
+    @app.get("/brief", response_class=HTMLResponse)
+    def brief_page():
+        """Render today's morning brief from the live aggregator.
+        Re-renders on every load — cheap (pure SQL aggregation), so
+        the page always reflects fresh data."""
+        from .daily_brief import generate_brief_markdown
+
+        cfg, conn, _, _ = get_state()
+        md = generate_brief_markdown(cfg, conn)
+        body = (
+            "<h1>Daily brief</h1>"
+            "<div class='brief-md'>"
+            + _markdown_to_html_block(md)
+            + "</div>"
+            "<p class='muted' style='margin-top:24px;'>"
+            "Reloads on each visit. Run "
+            "<code>secondbrain brief send</code> to email it now."
+            "</p>"
+        )
+        return HTMLResponse(_layout("Daily brief", body, "brief"))
+
+    # --- Phase 47: tasks view -----------------------------------------
+
+    @app.get("/tasks", response_class=HTMLResponse)
+    def tasks_page():
+        """Open + recently-done tasks. The list re-materialises from
+        recent transcripts on every load (idempotent — safe)."""
+        from . import tasks as tasks_mod
+
+        cfg, conn, _, _ = get_state()
+        try:
+            tasks_mod.materialize_from_transcripts(conn)
+        except Exception:  # noqa: BLE001
+            pass
+        open_rows = tasks_mod.list_open(conn, limit=200)
+        done_rows = tasks_mod.list_recent_done(conn, limit=20)
+        now = time.time()
+
+        def _row(t, *, mark_done: bool) -> str:
+            age_d = max(0, int((now - t.created_at) // 86400))
+            age_html = (
+                f'<span class="muted">{age_d}d</span>' if age_d else ""
+            )
+            src = (
+                f'<span class="muted"> · from '
+                f'<a href="/file?path={urllib.parse.quote_plus(t.source_path)}">'
+                f'{escape(t.source_title)}</a></span>'
+                if t.source_path != "manual" else ""
+            )
+            done_btn = (
+                f'<form method="post" action="/tasks/{t.id}/done" '
+                f'style="display:inline">'
+                f'<button class="link-btn" type="submit">✓ done</button>'
+                f'</form>'
+                if mark_done else ""
+            )
+            return (
+                f'<div class="stat">'
+                f'<span><code>#{t.id}</code> {escape(t.text)}{src}</span>'
+                f'<span class="v">{age_html} {done_btn}</span>'
+                f'</div>'
+            )
+
+        open_html = (
+            "".join(_row(t, mark_done=True) for t in open_rows)
+            or '<div class="muted">Inbox zero. Nothing to do.</div>'
+        )
+        done_html = (
+            "".join(
+                f'<div class="stat">'
+                f'<span><code>#{t.id}</code> {escape(t.text)}</span>'
+                f'<span class="v muted">'
+                f'{time.strftime("%a %H:%M", time.localtime(t.completed_at))}</span>'
+                f'</div>'
+                for t in done_rows
+            )
+            or '<div class="muted">(no completed tasks yet)</div>'
+        )
+
+        body = f"""
+<h1>Tasks</h1>
+<div class="grid">
+  <div class="card">
+    <h2>Open ({len(open_rows)})</h2>
+    {open_html}
+    <form method="post" action="/tasks/add"
+          style="margin-top:16px;display:flex;gap:8px;">
+      <input type="text" name="text" placeholder="Add a task…"
+             style="flex:1;" required>
+      <button type="submit">Add</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Recently done</h2>
+    {done_html}
+  </div>
+</div>"""
+        return HTMLResponse(_layout("Tasks", body, "tasks"))
+
+    @app.post("/tasks/add")
+    def tasks_add(text: str = Form(...)):
+        from fastapi.responses import RedirectResponse
+
+        from . import tasks as tasks_mod
+        cfg, conn, _, _ = get_state()
+        tasks_mod.add_manual(conn, text)
+        return RedirectResponse(url="/tasks", status_code=303)
+
+    @app.post("/tasks/{task_id:int}/done")
+    def tasks_mark_done(task_id: int):
+        from fastapi.responses import RedirectResponse
+
+        from . import tasks as tasks_mod
+        cfg, conn, _, _ = get_state()
+        tasks_mod.mark_done(conn, task_id)
+        return RedirectResponse(url="/tasks", status_code=303)
+
+    # --- Phase 56: health view ----------------------------------------
+
+    @app.get("/health", response_class=HTMLResponse)
+    def health_view():
+        """Oura ring vitals + per-metric trend cards."""
+        from . import health as health_mod
+
+        cfg, conn, _, _ = get_state()
+        metrics = health_mod.list_metrics(conn)
+        if not metrics:
+            body = (
+                "<h1>Health</h1>"
+                "<div class='card'><p class='muted'>"
+                "No Oura data yet. Run "
+                "<code>secondbrain auth oura</code> then "
+                "<code>secondbrain sync oura</code> to backfill."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Health", body, "health"))
+
+        # Headline cards: the three big scores get prominent display.
+        headline_metrics = ("sleep_score", "readiness_score", "activity_score")
+        cards: list[str] = []
+        for m in headline_metrics:
+            s = health_mod.summarise(conn, m, days=14)
+            if s.n == 0:
+                continue
+            points = health_mod.recent(conn, m, days=14)
+            cards.append(_render_health_card(m, s, points))
+
+        # Secondary metrics — render as a compact table.
+        rest = [m for m in metrics if m not in headline_metrics]
+        rest_html = ""
+        if rest:
+            rows_html = []
+            for m in rest:
+                s = health_mod.summarise(conn, m, days=14)
+                if s.n == 0:
+                    continue
+                latest_v = (
+                    f"{s.latest.value:g}" if s.latest else "—"
+                )
+                avg_v = (
+                    f"{s.average:.1f}" if s.average is not None else "—"
+                )
+                rows_html.append(
+                    f"<tr><td>{escape(m)}</td><td>{latest_v}</td>"
+                    f"<td>{avg_v}</td>"
+                    f"<td class='muted'>{s.n}d</td></tr>"
+                )
+            if rows_html:
+                rest_html = (
+                    "<div class='card'><h2>Other metrics</h2>"
+                    "<table><thead><tr><th>metric</th><th>latest</th>"
+                    "<th>14d avg</th><th>n</th></tr></thead>"
+                    "<tbody>" + "".join(rows_html) + "</tbody></table></div>"
+                )
+
+        body = (
+            "<h1>Health</h1>"
+            "<div class='grid'>" + "".join(cards) + "</div>"
+            + rest_html
+        )
+        return HTMLResponse(_layout("Health", body, "health"))
 
     # --- Browser extension API ----------------------------------------
     # These endpoints are consumed by the multi-AI bridge browser

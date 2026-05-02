@@ -19,7 +19,10 @@ Coverage:
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
+
+import pytest
 
 from secondbrain import health
 from secondbrain.connectors import oura
@@ -484,3 +487,100 @@ def test_sparkline_orders_low_to_high():
 def test_sparkline_empty_returns_empty():
     from secondbrain.cli import _ascii_sparkline
     assert _ascii_sparkline([]) == ""
+
+
+# ===================== Phase 56 polish (v2) ===========================
+
+def test_range_query_filters_by_explicit_dates(fresh_db):
+    """Explicit [from, to] date range should return only matching rows."""
+    summaries = [
+        oura.DailySummary(date="2026-04-13", sleep_score=70),
+        oura.DailySummary(date="2026-04-14", sleep_score=80),
+        oura.DailySummary(date="2026-04-15", sleep_score=90),
+        oura.DailySummary(date="2026-04-16", sleep_score=60),
+    ]
+    health.ingest_summaries(fresh_db, summaries)
+    out = health.range_query(
+        fresh_db, "sleep_score",
+        start_date="2026-04-14", end_date="2026-04-15",
+    )
+    assert [p.date for p in out] == ["2026-04-14", "2026-04-15"]
+    assert [p.value for p in out] == [80.0, 90.0]
+
+
+def test_range_query_returns_empty_when_no_match(fresh_db):
+    health.ingest_summaries(
+        fresh_db, [oura.DailySummary(date="2026-04-15", sleep_score=80)],
+    )
+    assert health.range_query(
+        fresh_db, "sleep_score",
+        start_date="2027-01-01", end_date="2027-01-31",
+    ) == []
+
+
+def test_latest_returns_most_recent_value(fresh_db):
+    """Just the single most-recent value, by date desc."""
+    health.ingest_summaries(fresh_db, [
+        oura.DailySummary(date="2026-04-13", sleep_score=70),
+        oura.DailySummary(date="2026-04-15", sleep_score=87),
+        oura.DailySummary(date="2026-04-14", sleep_score=80),
+    ])
+    p = health.latest(fresh_db, "sleep_score")
+    assert p is not None
+    assert p.date == "2026-04-15"
+    assert p.value == 87.0
+
+
+def test_latest_returns_none_when_no_data(fresh_db):
+    assert health.latest(fresh_db, "sleep_score") is None
+
+
+# ===================== daemon scheduler ==============================
+
+def test_oura_daemon_skips_when_no_token(tmp_cfg, fresh_db, monkeypatch):
+    monkeypatch.delenv("OURA_TOKEN", raising=False)
+    # Pass None for embedder — we shouldn't reach the embedding path.
+    assert oura.run_oura_sync_if_due(tmp_cfg, fresh_db, None) is False
+
+
+def test_oura_daemon_skips_when_recently_synced(
+    tmp_cfg, fresh_db, monkeypatch,
+):
+    """Cooldown protects against repeat syncs from a daemon that
+    polls every minute."""
+    oura.save_oura_credentials(tmp_cfg, "x")
+    oura._ensure_oura_runs_table(fresh_db)
+    fresh_db.execute(
+        "INSERT INTO oura_runs(ran_at, success, n_docs, n_metrics, error) "
+        "VALUES (?, 1, 0, 0, NULL)",
+        (time.time() - 3600,),  # 1h ago
+    )
+    fresh_db.commit()
+    # Stub fetch so we crash if it's called — proves the cooldown
+    # short-circuits before the network path.
+    monkeypatch.setattr(oura, "fetch_summaries", lambda *a, **kw: pytest.fail(
+        "should not run within cooldown",
+    ))
+    assert oura.run_oura_sync_if_due(tmp_cfg, fresh_db, None) is False
+
+
+def test_oura_daemon_records_failed_runs(tmp_cfg, fresh_db, monkeypatch):
+    """Sync failures should persist a row so the dashboard can show
+    'last error: <…>'."""
+    oura.save_oura_credentials(tmp_cfg, "x")
+
+    class _Boomy:
+        def fetch(self, cfg):
+            raise RuntimeError("network exploded")
+
+    monkeypatch.setattr(oura, "OuraConnector", lambda: _Boomy())
+    ran = oura.run_oura_sync_if_due(tmp_cfg, fresh_db, None)
+    assert ran is True  # we *attempted* — that counts
+    rows = fresh_db.execute(
+        "SELECT success, error FROM oura_runs",
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["success"] == 0
+    assert "network exploded" in (rows[0]["error"] or "")
+
+
