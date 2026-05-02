@@ -1849,6 +1849,98 @@ def health_summary(
     conn.close()
 
 
+@app.command()
+def review(
+    markdown: bool = typer.Option(
+        False, "--markdown/--no-markdown",
+        help="Print raw Markdown instead of Rich-rendering it.",
+    ),
+    save: bool = typer.Option(
+        False, "--save",
+        help="Also index the review as a doc (review://YYYY-MM-DD).",
+    ),
+) -> None:
+    """Phase 72: weekly review — what happened this week, lingering
+    items, top topics, health, insights."""
+    from .synthesis import (
+        assemble_weekly_review,
+        format_weekly_review_md,
+        index_weekly_review,
+    )
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    if save:
+        vp = index_weekly_review(conn, embedder, cfg)
+        if vp:
+            console.print(f"[green]✓[/] Indexed {vp}")
+        else:
+            console.print("[red]Failed to index review.[/]")
+            conn.close()
+            raise typer.Exit(code=1)
+    review_obj = assemble_weekly_review(conn)
+    md = format_weekly_review_md(review_obj)
+    if markdown:
+        print(md)
+    else:
+        from rich.markdown import Markdown
+        console.print(Markdown(md))
+    conn.close()
+
+
+@app.command()
+def insights() -> None:
+    """Phase 75: 'I noticed X' — pattern detection across recent docs
+    + health metrics. Surfaces topic spikes and out-of-norm health.
+
+    Insights are deduped — once surfaced, an insight won't re-fire
+    for 7 days unless cleared."""
+    from .synthesis import detect_insights
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = detect_insights(conn)
+    if not rows:
+        console.print("[dim]No insights — quiet week.[/]")
+        conn.close()
+        return
+    for ins in rows:
+        console.print(f"[bold]{ins.headline}[/]")
+        console.print(f"  [dim]{ins.detail}[/]")
+        console.print()
+    conn.close()
+
+
+@app.command()
+def projects() -> None:
+    """Phase 73: smart projects — auto-detect clusters of recent docs
+    that hover around a single theme using the backlinks graph."""
+    from .synthesis import detect_project_clusters
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    clusters = detect_project_clusters(conn)
+    if not clusters:
+        console.print(
+            "[dim]No project clusters detected — your recent docs "
+            "don't form a tight enough graph yet.[/]",
+        )
+        conn.close()
+        return
+    for c in clusters:
+        console.print(
+            f"[bold]{c.suggested_name}[/] "
+            f"[dim](score {c.score:.2f}, {len(c.member_paths)} docs)[/]",
+        )
+        console.print(f"  seed: {c.seed_title}")
+        for t in c.member_titles[:5]:
+            console.print(f"  · {t}")
+        if len(c.member_titles) > 5:
+            console.print(f"  · _... +{len(c.member_titles) - 5} more_")
+        console.print()
+    conn.close()
+
+
 study_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 67 study mode. Flashcards generated from class "

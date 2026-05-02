@@ -353,6 +353,30 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: materialize_due_cards(conn, cfg),
     ))
 
+    # Phase 74: auto-summary materialiser. Picks long unsummarised
+    # docs from the backlog at a slow cadence so a weekend ingest
+    # push doesn't blow the budget all at once.
+    from .synthesis import (
+        materialize_summaries_due,
+        run_weekly_review_if_due,
+    )
+    sched.register(Job(
+        name="auto_summariser",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda cfg, conn: materialize_summaries_due(
+            conn, cfg, max_per_run=3,
+        ),
+    ))
+
+    # Phase 72: weekly review — Sundays only, at most once per week.
+    sched.register(Job(
+        name="weekly_review",
+        schedule=IntervalSchedule(seconds=60 * 60),  # check hourly
+        fn=lambda cfg, conn, embedder: run_weekly_review_if_due(
+            cfg, conn, embedder,
+        ),
+    ))
+
     return sched
 
 
