@@ -133,8 +133,29 @@ class _Stats:
 
 
 def _resolve_folders(cfg: Config) -> list[Path]:
-    folders = [Path(p).expanduser() for p in cfg.watched_folders]
-    return [f for f in folders if f.exists()]
+    """Combine watched_folders + photo_capture_folder (Phase 71) into
+    one watch list. The photo folder gets the same treatment as any
+    other watched dir — OCR + multimodal embed pipeline already runs
+    on images via the existing indexer."""
+    raw_paths: list[str] = list(cfg.watched_folders)
+    if getattr(cfg, "photo_capture_folder", ""):
+        raw_paths.append(cfg.photo_capture_folder)
+    folders = [Path(p).expanduser() for p in raw_paths]
+    # Dedupe while preserving order (resolve absolute path) so a user
+    # who lists the same folder twice doesn't get double-indexing.
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for f in folders:
+        try:
+            resolved = f.resolve()
+        except OSError:
+            resolved = f
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            out.append(resolved)
+    return out
 
 
 def _bootstrap(cfg: Config, conn, embedder, transcriber, ocr_engine, entity_extractor, image_embedder, folders, stats: _Stats):

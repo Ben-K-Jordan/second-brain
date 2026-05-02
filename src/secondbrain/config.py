@@ -220,6 +220,23 @@ class Config:
     imap_window_days: int = 14
     imap_max_per_folder: int = 1000
 
+    # Phase 70 — capture-via-email. IMAP folders / labels listed here
+    # get treated as capture inboxes: each message becomes a doc tagged
+    # with kind=capture and a `[capture]` title prefix so retrieval
+    # can scope to "saved from my phone" content.
+    #
+    # Setup: in Gmail, create a label "ToBrain", forward stuff to it
+    # via filter or share-sheet. Add 'ToBrain' to this list AND to
+    # imap_folders so the connector scans it.
+    capture_imap_folders: tuple[str, ...] = ()
+
+    # Phase 71 — photo capture folder. Path to a folder that gets
+    # auto-OCR + multimodal-embedding treatment as photos land in it
+    # (Camera Roll exports, screenshot syncs). Functionally a watched
+    # folder filtered to images, but kept separate so users can move
+    # their phone-photo dump in/out without touching watched_folders.
+    photo_capture_folder: str = ""
+
     # Canvas LMS — assignments + announcements + syllabi. Set
     # CANVAS_BASE_URL + CANVAS_TOKEN env vars to enable. Window controls
     # how far back/forward (in days) we ingest assignments + announcements.
@@ -594,6 +611,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.canvas_window_days = int(data["canvas_window_days"])
         if "oura_window_days" in data:
             cfg.oura_window_days = int(data["oura_window_days"])
+        if "capture_imap_folders" in data:
+            cfg.capture_imap_folders = tuple(data["capture_imap_folders"])
+        if "photo_capture_folder" in data:
+            cfg.photo_capture_folder = str(data["photo_capture_folder"])
         # Resume can be either a top-level `resume_paths = [...]` or a
         # nested `[resume] paths = [...]` block - support both.
         if "resume_paths" in data:

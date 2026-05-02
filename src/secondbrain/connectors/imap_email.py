@@ -54,6 +54,28 @@ _DEFAULT_WINDOW_DAYS = 14
 _DEFAULT_MAX_PER_FOLDER = 1000
 
 
+def _is_capture_email(cfg, folder: str, subject: str) -> bool:
+    """Phase 70: detect emails the user explicitly forwarded to the
+    brain. Two signals:
+
+      1. ``cfg.capture_imap_folders`` lists folder/label names that
+         are dedicated capture inboxes (e.g. ['ToBrain']).
+      2. Subject starts with a capture marker (``[capture]``,
+         ``[brain]``, or starts with ``fwd:`` / ``fw:`` followed by a
+         hint).
+
+    Either match → the email becomes a capture-shaped doc.
+    """
+    capture_folders = {
+        f.lower().strip()
+        for f in (getattr(cfg, "capture_imap_folders", []) or [])
+    }
+    if folder and folder.lower().strip() in capture_folders:
+        return True
+    s = (subject or "").lower().strip()
+    return s.startswith(("[capture]", "[brain]"))
+
+
 def _strip_html(html: str) -> str:
     if not html:
         return ""
@@ -252,7 +274,15 @@ class ImapEmailConnector:
         if transcript_doc is not None:
             return transcript_doc
 
-        lines = [f"# {subject}", ""]
+        # Phase 70: capture-via-email. When the IMAP folder name
+        # matches a configured capture folder (e.g. 'ToBrain'), or the
+        # subject prefix matches (e.g. '[capture]', 'fwd:'), tag the
+        # doc as a capture so the user's "saved this from my phone"
+        # surfaces distinctly from regular email.
+        is_capture = _is_capture_email(cfg, folder, subject)
+
+        title_prefix = "[capture] " if is_capture else ""
+        lines = [f"# {title_prefix}{subject}", ""]
         if from_:    lines.append(f"From: {from_}")
         if to_:      lines.append(f"To: {to_}")
         if date_hdr: lines.append(f"Date: {date_hdr}")
@@ -261,18 +291,30 @@ class ImapEmailConnector:
         lines.append(body)
 
         # virtual_path uses Message-ID when present (globally stable),
-        # falls back to imap://folder/uid.
+        # falls back to imap://folder/uid. Captures get a different
+        # scheme so retrieval can scope to them ('capture://email/...').
+        if is_capture:
+            scheme = "capture://email"
+            doc_kind = "capture"
+        else:
+            scheme = "imap"
+            doc_kind = "url"
         if msg_id:
-            vp = f"imap://msgid/{msg_id}"
+            vp = f"{scheme}/msgid/{msg_id}" if is_capture \
+                 else f"imap://msgid/{msg_id}"
         else:
             uid_s = uid.decode("ascii", errors="replace")
-            vp = f"imap://{folder}/{uid_s}"
+            vp = (
+                f"{scheme}/{folder}/{uid_s}" if is_capture
+                else f"imap://{folder}/{uid_s}"
+            )
         return ConnectorDocument(
-            source="imap",
+            source="capture:email" if is_capture else "imap",
             virtual_path=vp,
-            title=subject,
+            title=f"{title_prefix}{subject}",
             content="\n".join(lines),
             mtime=mtime,
+            kind=doc_kind,
             metadata={
                 "from": from_,
                 "to": to_,

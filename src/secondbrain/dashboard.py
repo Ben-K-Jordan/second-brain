@@ -27,6 +27,15 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
+# Module-level FastAPI Request import — needed because dashboard routes
+# are defined inside create_app() (a closure), and `from __future__
+# import annotations` makes type hints strings. FastAPI resolves those
+# via typing.get_type_hints() with the function's module __globals__,
+# NOT the closure scope, so a `request: Request` annotation can't see
+# a Request imported only inside create_app(). Lifting it here fixes
+# that without restructuring the closure.
+from fastapi import Request  # noqa: F401  (resolved as forward-ref)
+
 from .briefing import generate_briefing
 from .budget import spend_summary
 from .chat import stream_chat
@@ -1190,7 +1199,7 @@ def _entity_link(text: str, label: str = "") -> str:
 def create_app():
     """Build the FastAPI app. Heavy imports happen here so importing dashboard
     is cheap when the user isn't using the dashboard."""
-    from fastapi import FastAPI, Form, Query, Request
+    from fastapi import FastAPI, Form, Query
     from fastapi.responses import HTMLResponse, RedirectResponse
 
     app = FastAPI(title="second-brain", docs_url=None, redoc_url=None)
@@ -3719,6 +3728,107 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 "score": round(r.score, 4),
             })
         return _JSON({"results": out, "query": q}, headers=cors)
+
+    @app.post("/api/capture")
+    async def api_capture(request: Request):
+        """Phase 69: capture endpoint for iOS Shortcuts / browser
+        bookmarklets / curl one-liners. Auth via the same bearer token
+        as ``/api/extension/*``.
+
+        Request body (JSON):
+            {
+              "title":   "headline of what's being saved",
+              "content": "main text — selection / note / URL",
+              "url":     "optional canonical URL",
+              "source":  "ios" | "shortcut" | "bookmarklet" | "curl"
+            }
+
+        The doc lands at ``capture://<source>/<timestamp>`` and gets
+        indexed inline so it shows up in search immediately. Idempotent
+        only insofar as duplicate URLs land in the alias table — same
+        text content gets re-indexed.
+
+        Returns ``{ok, virtual_path, chunks}`` on success.
+        """
+        from fastapi.responses import JSONResponse as _JSON
+
+        cors = _extension_cors(request.headers.get("origin"))
+        if not _extension_authorized(request):
+            return _JSON(
+                {"error": "unauthorized"}, status_code=401, headers=cors,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return _JSON(
+                {"error": "JSON body required"},
+                status_code=400, headers=cors,
+            )
+        title = (body.get("title") or "").strip()
+        content = (body.get("content") or "").strip()
+        url = (body.get("url") or "").strip()
+        source = (body.get("source") or "manual").strip()[:40]
+        if not content and not url:
+            return _JSON(
+                {"error": "need content or url"},
+                status_code=400, headers=cors,
+            )
+
+        cfg, conn, embedder, _ = get_state()
+        # If only a URL was provided, route through the URL ingestion
+        # path (fetches + parses) rather than indexing the URL string.
+        if url and not content:
+            from .indexer import index_url
+            try:
+                result = index_url(
+                    conn, embedder, cfg, url=url,
+                    entity_extractor=None,
+                )
+            except Exception as e:  # noqa: BLE001
+                return _JSON(
+                    {"error": f"ingest failed: {e}"},
+                    status_code=500, headers=cors,
+                )
+            return _JSON(
+                {
+                    "ok": True, "virtual_path": url,
+                    "status": result.status,
+                    "chunks": result.chunks or 0,
+                }, headers=cors,
+            )
+
+        # Plain-text capture.
+        from .indexer import index_text
+        ts = int(time.time())
+        virtual_path = f"capture://{source}/{ts}"
+        # Header for the rendered content gives the title + URL
+        # context if present.
+        rendered = f"# {title or '(captured note)'}"
+        if url:
+            rendered += f"\n\nSource: {url}"
+        rendered += f"\n\n{content}"
+        try:
+            result = index_text(
+                conn, embedder, cfg,
+                virtual_path=virtual_path,
+                title=title or content[:60],
+                content=rendered,
+                mtime=time.time(),
+                kind="capture",
+                source=source,
+            )
+        except Exception as e:  # noqa: BLE001
+            return _JSON(
+                {"error": f"index failed: {e}"},
+                status_code=500, headers=cors,
+            )
+        return _JSON(
+            {
+                "ok": True, "virtual_path": virtual_path,
+                "status": result.status,
+                "chunks": result.chunks or 0,
+            }, headers=cors,
+        )
 
     @app.post("/api/click")
     async def api_click(request: Request):
