@@ -21,6 +21,7 @@ from .db import checkpoint_wal, connect, init_schema
 from .digest import run_digest_if_due
 from .embedder import make_embedder
 from .entities import make_entity_extractor
+from .event_briefing import run_briefings_if_due
 from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder
@@ -214,6 +215,17 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
                     run_digest_if_due(cfg, conn)
                 except Exception as e:  # noqa: BLE001
                     log.warning("digest scheduler crashed: %s", e)
+                # Pre-event briefings — checks calendars for events
+                # starting soon and generates briefings on demand.
+                try:
+                    n_brief = run_briefings_if_due(cfg, conn, embedder, reranker)
+                    if n_brief:
+                        log.info(
+                            "event briefing scheduler: generated %d briefing(s)",
+                            n_brief,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("event briefing scheduler crashed: %s", e)
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:

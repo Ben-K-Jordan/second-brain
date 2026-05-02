@@ -289,6 +289,29 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_wlruns_wl_started
             ON watchlist_runs(watchlist_id, started_at DESC);
 
+        -- Pre-event briefings: one row per event we've ever briefed for.
+        -- Triggered by the daemon when an event is starting within the
+        -- configured lookahead window. UNIQUE on (event_id, event_source)
+        -- so we don't re-generate for the same event unless the user
+        -- explicitly asks (the dashboard has a regenerate button).
+        CREATE TABLE IF NOT EXISTS event_briefings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            event_source TEXT NOT NULL,    -- 'google_calendar' | 'ics' | 'manual'
+            event_starts_at REAL NOT NULL,
+            event_title TEXT,
+            event_url TEXT,                -- click-through to the actual calendar event
+            event_payload_json TEXT,       -- raw event for re-rendering / debugging
+            generated_at REAL NOT NULL,
+            briefing_text TEXT,
+            citations_json TEXT,
+            error TEXT,
+            cents_spent REAL,
+            UNIQUE(event_id, event_source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_briefings_starts
+            ON event_briefings(event_starts_at);
+
         -- Application tracker: jobs you've actually applied to. Lets the
         -- chat agent answer "have I already applied to X?" and the
         -- watchlist agent skip duplicates. role_url is the canonical
@@ -856,6 +879,88 @@ def watchlist_latest_run(
         "ORDER BY started_at DESC, id DESC LIMIT 1",
         (watchlist_id,),
     ).fetchone()
+
+
+# --- Pre-event briefings ----------------------------------------------
+
+def event_briefing_get(
+    conn: sqlite3.Connection, event_id: str, event_source: str,
+) -> sqlite3.Row | None:
+    """Look up a previously-generated briefing for an event."""
+    return conn.execute(
+        "SELECT * FROM event_briefings WHERE event_id = ? AND event_source = ?",
+        (event_id, event_source),
+    ).fetchone()
+
+
+def event_briefing_save(
+    conn: sqlite3.Connection,
+    event_id: str,
+    event_source: str,
+    event_starts_at: float,
+    event_title: str,
+    event_url: str | None,
+    event_payload_json: str | None,
+    briefing_text: str | None,
+    citations_json: str | None = None,
+    error: str | None = None,
+    cents_spent: float | None = None,
+) -> int:
+    """Insert (or replace via UNIQUE conflict) a briefing row.
+
+    Returns the id of the resulting row. Replacing is intentional: when
+    the user clicks "regenerate" we want to overwrite the old briefing,
+    not accumulate stale ones.
+    """
+    cur = conn.execute(
+        "INSERT INTO event_briefings"
+        "(event_id, event_source, event_starts_at, event_title, event_url, "
+        " event_payload_json, generated_at, briefing_text, citations_json, "
+        " error, cents_spent) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(event_id, event_source) DO UPDATE SET "
+        "  event_starts_at = excluded.event_starts_at, "
+        "  event_title = excluded.event_title, "
+        "  event_url = excluded.event_url, "
+        "  event_payload_json = excluded.event_payload_json, "
+        "  generated_at = excluded.generated_at, "
+        "  briefing_text = excluded.briefing_text, "
+        "  citations_json = excluded.citations_json, "
+        "  error = excluded.error, "
+        "  cents_spent = excluded.cents_spent "
+        "RETURNING id",
+        (
+            event_id, event_source, event_starts_at, event_title,
+            event_url, event_payload_json, time.time(),
+            briefing_text, citations_json, error, cents_spent,
+        ),
+    )
+    bid = cur.fetchone()["id"]
+    conn.commit()
+    return bid
+
+
+def event_briefings_list(
+    conn: sqlite3.Connection, limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Most-recent briefings first (by generated_at). For the dashboard."""
+    return conn.execute(
+        "SELECT * FROM event_briefings "
+        "ORDER BY event_starts_at DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def event_briefings_upcoming(
+    conn: sqlite3.Connection, since: float | None = None,
+) -> list[sqlite3.Row]:
+    """Briefings for events starting in the future (or recent past)."""
+    cutoff = since if since is not None else time.time() - 3600
+    return conn.execute(
+        "SELECT * FROM event_briefings WHERE event_starts_at >= ? "
+        "ORDER BY event_starts_at ASC",
+        (cutoff,),
+    ).fetchall()
 
 
 # --- Application tracker ----------------------------------------------

@@ -793,6 +793,174 @@ def serve() -> None:
     run()
 
 
+brief_app = typer.Typer(
+    no_args_is_help=True,
+    help="Pre-event briefings. The daemon auto-generates these for events "
+         "starting soon; these subcommands let you inspect / regenerate / "
+         "trigger ad-hoc briefings.",
+)
+app.add_typer(brief_app, name="brief")
+
+
+@brief_app.command("upcoming")
+def brief_upcoming(
+    minutes: int = typer.Option(
+        120, "--minutes", "-m",
+        help="Look-ahead window in minutes.",
+    ),
+) -> None:
+    """List upcoming events from your calendars and whether they have
+    a briefing yet."""
+    from .db import event_briefing_get
+    from .event_briefing import iter_upcoming_events
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    events = sorted(
+        iter_upcoming_events(cfg, minutes * 60),
+        key=lambda e: e.starts_at,
+    )
+    if not events:
+        console.print(f"[yellow]No events in the next {minutes} minutes.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None,
+                  title=f"Upcoming events (next {minutes}m)")
+    table.add_column("when", style="dim")
+    table.add_column("title")
+    table.add_column("source", style="dim", width=10)
+    table.add_column("brief", justify="center")
+    for ev in events:
+        when = time.strftime("%a %H:%M", time.localtime(ev.starts_at))
+        existing = event_briefing_get(conn, ev.event_id, ev.source)
+        if existing is None:
+            mark = "[dim]—[/]"
+        elif existing["error"]:
+            mark = "[red]✗[/]"
+        else:
+            mark = "[green]✓[/]"
+        table.add_row(when, ev.title[:60], ev.source, mark)
+    console.print(table)
+    conn.close()
+
+
+@brief_app.command("next")
+def brief_next() -> None:
+    """Show the briefing for the next upcoming event (generating one
+    if needed)."""
+    from .db import event_briefing_get
+    from .event_briefing import generate_for_event, iter_upcoming_events
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = make_reranker(cfg)
+    # Look 6 hours out so "next" works even on a quiet day.
+    events = sorted(
+        iter_upcoming_events(cfg, 6 * 3600),
+        key=lambda e: e.starts_at,
+    )
+    if not events:
+        console.print("[yellow]No upcoming events in the next 6 hours.[/]")
+        conn.close()
+        return
+    ev = events[0]
+    existing = event_briefing_get(conn, ev.event_id, ev.source)
+    if existing is None or existing["error"]:
+        console.print(
+            f"[cyan]Generating briefing for[/] [bold]{ev.title}[/]..."
+        )
+        result = generate_for_event(cfg, conn, embedder, reranker, ev)
+        if not result.get("ok"):
+            console.print(f"[red]failed:[/] {result.get('error', '?')}")
+            conn.close()
+            raise typer.Exit(code=1)
+        text = result["text"]
+    else:
+        text = existing["briefing_text"] or "(no text)"
+    console.print()
+    console.print(f"[bold]{ev.title}[/]  [dim]({time.strftime('%a %H:%M', time.localtime(ev.starts_at))})[/]")
+    console.print()
+    console.print(text)
+    conn.close()
+
+
+@brief_app.command("now")
+def brief_now(
+    title: str = typer.Argument(..., help="Title of the ad-hoc event."),
+    starts_at: str = typer.Option(
+        ..., "--at",
+        help="ISO-8601 start time, e.g. '2026-04-15T14:00:00' or '2026-04-15T14:00:00-05:00'.",
+    ),
+    attendees: list[str] = typer.Option(
+        None, "--attendee", "-a",
+        help="Repeatable: emails or names of attendees.",
+    ),
+    description: str = typer.Option("", "--description", "-d"),
+    location: str = typer.Option("", "--location", "-l"),
+) -> None:
+    """Generate an ad-hoc briefing for an event that isn't on a calendar
+    yet (e.g. a phone screen scheduled by email)."""
+    from .event_briefing import generate_for_event, manual_event
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = make_reranker(cfg)
+    try:
+        ev = manual_event(
+            title=title, starts_at_iso=starts_at,
+            description=description,
+            attendees=list(attendees or []),
+            location=location,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        conn.close()
+        raise typer.Exit(code=1) from None
+    console.print(f"[cyan]Generating ad-hoc briefing for[/] [bold]{ev.title}[/]...")
+    result = generate_for_event(cfg, conn, embedder, reranker, ev)
+    if not result.get("ok"):
+        console.print(f"[red]failed:[/] {result.get('error', '?')}")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print()
+    console.print(result["text"])
+    conn.close()
+
+
+@brief_app.command("regenerate")
+def brief_regenerate(
+    event_id: str = typer.Argument(..., help="event_id from `brief upcoming`."),
+    source: str = typer.Option(
+        "google_calendar", "--source",
+        help="Event source. One of: google_calendar / ics / manual.",
+    ),
+) -> None:
+    """Force-regenerate a briefing (e.g. after the meeting agenda changed)."""
+    from .event_briefing import generate_for_event, iter_upcoming_events
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = make_reranker(cfg)
+    # Find the matching event in the next 24h.
+    matched = None
+    for ev in iter_upcoming_events(cfg, 24 * 3600):
+        if ev.event_id == event_id and ev.source == source:
+            matched = ev
+            break
+    if matched is None:
+        console.print(f"[red]Event not found in upcoming calendar.[/] "
+                      f"id={event_id} source={source}")
+        conn.close()
+        raise typer.Exit(code=1)
+    result = generate_for_event(cfg, conn, embedder, reranker, matched)
+    if not result.get("ok"):
+        console.print(f"[red]failed:[/] {result.get('error', '?')}")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print(f"[green]✓[/] Regenerated briefing for {matched.title!r}")
+    conn.close()
+
+
 apply_app = typer.Typer(
     no_args_is_help=True,
     help="Track jobs you've applied to. The watchlist agent skips "

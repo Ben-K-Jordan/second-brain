@@ -231,6 +231,13 @@ class Config:
     # next to citations on the dashboard.
     resume_paths: tuple[str, ...] = ()
 
+    # Pre-event briefings. Daemon polls calendars and generates a
+    # synthesised "what you should know" brief before each event.
+    # Cost: ~$0.05-0.15/briefing depending on web-search fan-out.
+    event_briefing_enabled: bool = True
+    briefing_lookahead_minutes: int = 30  # how far ahead to brief
+    briefing_max_per_run: int = 5         # cost guard per minute
+
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
     # tool-use loops at a third the price. Drop to Haiku 4.5 for speed.
@@ -555,6 +562,12 @@ def load_config(path: Path | None = None) -> Config:
             cfg.resume_paths = tuple(data["resume_paths"])
         if isinstance(data.get("resume"), dict) and "paths" in data["resume"]:
             cfg.resume_paths = tuple(data["resume"]["paths"])
+        if "event_briefing_enabled" in data:
+            cfg.event_briefing_enabled = bool(data["event_briefing_enabled"])
+        if "briefing_lookahead_minutes" in data:
+            cfg.briefing_lookahead_minutes = int(data["briefing_lookahead_minutes"])
+        if "briefing_max_per_run" in data:
+            cfg.briefing_max_per_run = int(data["briefing_max_per_run"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

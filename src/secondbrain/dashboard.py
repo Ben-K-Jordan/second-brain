@@ -925,13 +925,14 @@ def _layout(title: str, body: str, active: str = "") -> str:
     nav_items = [
         ("Overview", "/"),
         ("Chat", "/chat"),
+        ("Briefings", "/briefings"),
         ("Search", "/search"),
         ("Watch", "/watch"),
         ("Apps", "/applications"),
         ("Graph", "/graph"),
         ("Entities", "/entities"),
         ("Folders", "/folders"),
-        ("Briefing", "/briefing"),
+        ("Daily", "/briefing"),
         ("Queries", "/queries"),
         ("Ingest", "/ingest"),
     ]
@@ -2611,6 +2612,231 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return HTMLResponse("Forbidden", status_code=403)
         application_delete(conn, aid)
         return RedirectResponse(url="/applications", status_code=303)
+
+    # --- Pre-event briefings ---------------------------------------
+
+    @app.get("/briefings", response_class=HTMLResponse)
+    def briefings_page():
+        from .db import event_briefing_get
+        from .event_briefing import iter_upcoming_events
+
+        cfg, conn, _, _ = get_state()
+        # Look 12h out so the page shows the rest of today's meetings.
+        upcoming = sorted(
+            iter_upcoming_events(cfg, 12 * 3600),
+            key=lambda e: e.starts_at,
+        )
+
+        upcoming_html: list[str] = []
+        for ev in upcoming:
+            existing = event_briefing_get(conn, ev.event_id, ev.source)
+            when = time.strftime(
+                "%a %H:%M", time.localtime(ev.starts_at),
+            )
+            mins_until = max(0, int((ev.starts_at - time.time()) // 60))
+            mins_str = (
+                f"in {mins_until} min" if mins_until < 60
+                else f"in {mins_until // 60}h {mins_until % 60}m"
+            )
+            attendees_str = ", ".join(ev.attendees[:5]) + (
+                f" + {len(ev.attendees) - 5} more"
+                if len(ev.attendees) > 5 else ""
+            )
+            if existing is None:
+                status = (
+                    '<span class="brief-status brief-pending">briefing pending…</span>'
+                )
+                briefing_block = ""
+            elif existing["error"]:
+                status = (
+                    f'<span class="brief-status brief-error">'
+                    f'errored: {escape(existing["error"][:80])}</span>'
+                )
+                briefing_block = ""
+            else:
+                status = (
+                    '<span class="brief-status brief-ready">briefing ready</span>'
+                )
+                briefing_block = (
+                    '<div class="brief-text">'
+                    + escape(existing["briefing_text"] or "").replace("\n", "<br>")
+                    + '</div>'
+                )
+
+            cal_link = (
+                f' <a href="{escape(ev.url)}" target="_blank" '
+                f'rel="noopener noreferrer" class="brief-cal-link">'
+                f'open in calendar ↗</a>'
+                if ev.url else ""
+            )
+            regen_form = (
+                f'<form method="post" action="/briefings/regenerate" '
+                f'class="brief-regen-form">'
+                f'<input type="hidden" name="event_id" value="{escape(ev.event_id)}">'
+                f'<input type="hidden" name="event_source" value="{escape(ev.source)}">'
+                f'<button type="submit">'
+                + ("regenerate" if existing else "generate now")
+                + '</button></form>'
+            )
+            upcoming_html.append(f"""
+<article class="brief-card">
+  <header class="brief-head">
+    <span class="brief-when">{when} <span class="brief-rel">({mins_str})</span></span>
+    <span class="brief-title">{escape(ev.title)}{cal_link}</span>
+  </header>
+  <div class="brief-meta">
+    {f'<span>📍 {escape(ev.location)}</span>' if ev.location else ''}
+    {f'<span>👥 {escape(attendees_str)}</span>' if attendees_str else ''}
+    {f'<span class="brief-cal">{escape(ev.calendar_name)}</span>' if ev.calendar_name else ''}
+  </div>
+  <div class="brief-row">
+    {status}
+    {regen_form}
+  </div>
+  {briefing_block}
+</article>""")
+
+        upcoming_block = (
+            "".join(upcoming_html)
+            or '<div class="empty">No events in the next 12 hours.</div>'
+        )
+
+        body = f"""
+<h1>Pre-event briefings</h1>
+<p class="muted" style="margin-top:-8px;">
+    Before each event on your calendar(s), the daemon generates a "what
+    you should know" brief — pulling from your indexed brain plus
+    targeted web search for unfamiliar attendees / companies. Lookahead:
+    <code>{cfg.briefing_lookahead_minutes} min</code>.
+    {"<strong style='color:#ff5c5c;'>Web search is OFF</strong>; "
+     "set <code>web_search_enabled = true</code> in config.toml so "
+     "briefings can research attendees."
+     if not cfg.web_search_enabled else ""}
+</p>
+
+<h2>Upcoming · next 12h</h2>
+{upcoming_block}
+
+<details class="brief-adhoc">
+  <summary>+ ad-hoc briefing (event not on a calendar yet)</summary>
+  <form method="post" action="/briefings/adhoc" class="brief-adhoc-form">
+    <input type="text" name="title" placeholder="Event title" required>
+    <input type="text" name="starts_at"
+        placeholder="Start time, ISO-8601 (e.g. 2026-04-20T14:00)" required>
+    <input type="text" name="location" placeholder="Location (optional)">
+    <input type="text" name="attendees"
+        placeholder="Attendees, comma-separated (optional)">
+    <textarea name="description" rows="3" placeholder="Description (optional)"></textarea>
+    <button type="submit">generate ad-hoc briefing</button>
+  </form>
+</details>
+
+<style>
+.brief-card {{
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--green-dim);
+    padding: 14px 16px; margin: 12px 0;
+}}
+.brief-head {{ display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }}
+.brief-when {{ color: var(--green); font-family: var(--mono); font-weight: 600; }}
+.brief-rel {{ color: #888; font-weight: 400; font-size: 11.5px; }}
+.brief-title {{ flex: 1; }}
+.brief-cal-link {{ font-size: 11.5px; color: #5af0ff; margin-left: 6px; font-family: var(--mono); }}
+.brief-meta {{ display: flex; gap: 14px; margin: 6px 0; color: #888; font-size: 12px; flex-wrap: wrap; }}
+.brief-cal {{ font-family: var(--mono); }}
+.brief-row {{ display: flex; align-items: center; gap: 12px; margin: 8px 0; }}
+.brief-status {{ font-size: 11.5px; font-family: var(--mono); letter-spacing: 0.04em; }}
+.brief-pending {{ color: #888; }}
+.brief-ready {{ color: var(--green); }}
+.brief-error {{ color: #ff5c5c; }}
+.brief-regen-form button {{
+    font-size: 11px; padding: 4px 10px;
+    background: transparent; color: #888; border: 1px solid var(--border);
+    cursor: pointer; font-family: var(--mono);
+}}
+.brief-regen-form button:hover {{ color: var(--green); border-color: var(--green-dim); }}
+.brief-text {{
+    margin-top: 12px; padding: 12px 14px;
+    background: #0a0a0a; border-left: 2px solid var(--border);
+    line-height: 1.55; font-size: 13.5px;
+}}
+.brief-adhoc {{ margin-top: 24px; }}
+.brief-adhoc summary {{
+    cursor: pointer; padding: 8px 12px; background: #0e0e0e;
+    border: 1px solid var(--border); border-radius: 2px; color: #888;
+    font-size: 12.5px; font-family: var(--mono);
+}}
+.brief-adhoc summary:hover {{ color: var(--green); }}
+.brief-adhoc-form {{
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 14px; margin-top: 8px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+}}
+.brief-adhoc-form input, .brief-adhoc-form textarea {{
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 8px 10px; font: 13px var(--mono);
+}}
+</style>"""
+        return HTMLResponse(_layout("Briefings", body, "briefings"))
+
+    @app.post("/briefings/regenerate")
+    async def briefings_regenerate(request: Request):
+        from .event_briefing import generate_for_event, iter_upcoming_events
+
+        cfg, conn, embedder, reranker = get_state()
+        # CSRF guard.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        eid = (form.get("event_id") or "").strip()
+        src = (form.get("event_source") or "").strip()
+        # Find the event in the upcoming window so we have current details.
+        for ev in iter_upcoming_events(cfg, 24 * 3600):
+            if ev.event_id == eid and ev.source == src:
+                generate_for_event(cfg, conn, embedder, reranker, ev)
+                break
+        return RedirectResponse(url="/briefings", status_code=303)
+
+    @app.post("/briefings/adhoc")
+    async def briefings_adhoc(request: Request):
+        from .event_briefing import generate_for_event, manual_event
+
+        cfg, conn, embedder, reranker = get_state()
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        title = (form.get("title") or "").strip()
+        starts_at = (form.get("starts_at") or "").strip()
+        if not title or not starts_at:
+            return RedirectResponse(url="/briefings", status_code=303)
+        attendees_raw = (form.get("attendees") or "").strip()
+        attendees = [
+            a.strip() for a in attendees_raw.split(",") if a.strip()
+        ]
+        try:
+            ev = manual_event(
+                title=title, starts_at_iso=starts_at,
+                description=(form.get("description") or "").strip(),
+                attendees=attendees,
+                location=(form.get("location") or "").strip(),
+            )
+        except ValueError:
+            return RedirectResponse(url="/briefings", status_code=303)
+        generate_for_event(cfg, conn, embedder, reranker, ev)
+        return RedirectResponse(url="/briefings", status_code=303)
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):
