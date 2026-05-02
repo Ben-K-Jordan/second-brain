@@ -188,6 +188,20 @@ class Config:
     # Obsidian: vault root directories. Both this and OBSIDIAN_VAULTS work;
     # the connector parses frontmatter + resolves [[wikilinks]] for retrieval.
     obsidian_vaults: tuple[str, ...] = ()
+    # Jobs connector: companies to watch on each ATS provider. The slug is
+    # whatever appears in the public board URL - e.g. anthropic.com's
+    # Greenhouse board is at boards.greenhouse.io/anthropic, so the slug
+    # is "anthropic".
+    jobs_greenhouse: tuple[str, ...] = ()
+    jobs_lever: tuple[str, ...] = ()
+    jobs_ashby: tuple[str, ...] = ()
+
+    # News connector (NewsAPI.org). Free tier = 100 req/day. Set
+    # NEWSAPI_KEY env var, then pick topics + (optionally) sources to
+    # narrow the firehose.
+    news_topics: tuple[str, ...] = ()
+    news_sources: tuple[str, ...] = ()  # NewsAPI source ids, e.g. "techcrunch"
+    news_window_days: int = 1
 
     # Chat-with-your-brain: conversational interface over the index.
     # Sonnet 4.6 is the sweet spot - same instruction-following as Opus for
@@ -438,6 +452,18 @@ def load_config(path: Path | None = None) -> Config:
             cfg.substack_feeds = tuple(data["substack_feeds"])
         if "obsidian_vaults" in data:
             cfg.obsidian_vaults = tuple(data["obsidian_vaults"])
+        if "jobs_greenhouse" in data:
+            cfg.jobs_greenhouse = tuple(data["jobs_greenhouse"])
+        if "jobs_lever" in data:
+            cfg.jobs_lever = tuple(data["jobs_lever"])
+        if "jobs_ashby" in data:
+            cfg.jobs_ashby = tuple(data["jobs_ashby"])
+        if "news_topics" in data:
+            cfg.news_topics = tuple(data["news_topics"])
+        if "news_sources" in data:
+            cfg.news_sources = tuple(data["news_sources"])
+        if "news_window_days" in data:
+            cfg.news_window_days = int(data["news_window_days"])
         if "daily_budget_cents_voyage" in data:
             cfg.daily_budget_cents_voyage = int(data["daily_budget_cents_voyage"])
         if "daily_budget_cents_anthropic" in data:

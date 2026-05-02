@@ -206,6 +206,11 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
     if chat_cols and "system_prompt" not in chat_cols:
         conn.execute("ALTER TABLE chat_conversations ADD COLUMN system_prompt TEXT")
 
+    # Migration: watchlists.allowed_domains_json was added in Phase 27.
+    wl_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watchlists)")}
+    if wl_cols and "allowed_domains_json" not in wl_cols:
+        conn.execute("ALTER TABLE watchlists ADD COLUMN allowed_domains_json TEXT")
+
     # Chat conversations: each conversation has many turns, each turn has a
     # role (user / assistant) and a content blob. Citations are stored per
     # assistant turn so we can re-render past chats with their sources.
@@ -248,7 +253,10 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             schedule_minutes INTEGER NOT NULL DEFAULT 1440,  -- daily
             last_run_at REAL,
             enabled INTEGER NOT NULL DEFAULT 1,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            -- JSON list of host strings; when set, this watchlist's web_search
+            -- is restricted to those domains. Overrides cfg.web_search_allowed_domains.
+            allowed_domains_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_watchlists_enabled ON watchlists(enabled);
 
@@ -633,17 +641,56 @@ def chat_get_system_prompt(
 
 def watchlist_create(
     conn: sqlite3.Connection, name: str, query: str, schedule_minutes: int = 1440,
+    allowed_domains: list[str] | None = None,
 ) -> int:
     """Create a recurring saved query. ``schedule_minutes`` defaults to 1440
-    (once a day). Returns the new id."""
+    (once a day). When ``allowed_domains`` is non-empty, the watchlist's
+    web search is restricted to those hosts (overrides
+    cfg.web_search_allowed_domains). Returns the new id."""
+    import json as _json
+
+    domains_json = _json.dumps(allowed_domains) if allowed_domains else None
     cur = conn.execute(
-        "INSERT INTO watchlists(name, query, schedule_minutes, enabled, created_at) "
-        "VALUES (?, ?, ?, 1, ?) RETURNING id",
-        (name, query, max(5, int(schedule_minutes)), time.time()),
+        "INSERT INTO watchlists"
+        "(name, query, schedule_minutes, enabled, created_at, allowed_domains_json) "
+        "VALUES (?, ?, ?, 1, ?, ?) RETURNING id",
+        (name, query, max(5, int(schedule_minutes)), time.time(), domains_json),
     )
     wid = cur.fetchone()["id"]
     conn.commit()
     return wid
+
+
+def watchlist_set_domains(
+    conn: sqlite3.Connection, watchlist_id: int, allowed_domains: list[str] | None,
+) -> None:
+    """Replace the watchlist's allowed_domains list. Pass ``None`` or an
+    empty list to fall back to cfg.web_search_allowed_domains."""
+    import json as _json
+
+    payload = _json.dumps(allowed_domains) if allowed_domains else None
+    conn.execute(
+        "UPDATE watchlists SET allowed_domains_json = ? WHERE id = ?",
+        (payload, watchlist_id),
+    )
+    conn.commit()
+
+
+def watchlist_get_domains(
+    conn: sqlite3.Connection, watchlist_id: int,
+) -> list[str] | None:
+    import json as _json
+
+    row = conn.execute(
+        "SELECT allowed_domains_json FROM watchlists WHERE id = ?",
+        (watchlist_id,),
+    ).fetchone()
+    if not row or not row["allowed_domains_json"]:
+        return None
+    try:
+        return list(_json.loads(row["allowed_domains_json"]))
+    except (_json.JSONDecodeError, TypeError):
+        return None
 
 
 def watchlist_list(conn: sqlite3.Connection) -> list[sqlite3.Row]:

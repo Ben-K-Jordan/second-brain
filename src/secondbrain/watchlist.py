@@ -33,6 +33,7 @@ from .db import (
     connect,
     init_schema,
     watchlist_due,
+    watchlist_get_domains,
     watchlist_latest_run,
     watchlist_run_record_finish,
     watchlist_run_record_start,
@@ -73,8 +74,16 @@ def run_watchlist(
         pass
 
     prompt = _build_prompt(query, last_run_at)
+    # Per-watchlist domain scoping overrides cfg.web_search_allowed_domains
+    # for this run only. Lets one user have a "jobs" watchlist scoped to
+    # LinkedIn/Indeed and a "news" watchlist scoped to news outlets without
+    # touching global config.
+    domains = watchlist_get_domains(conn, watchlist_id)
     try:
-        response = ask_brain(cfg, conn, embedder, reranker, prompt)
+        response = ask_brain(
+            cfg, conn, embedder, reranker, prompt,
+            web_search_allowed_domains=domains,
+        )
     except BudgetExceededError as e:
         watchlist_run_record_finish(
             conn, run_id, error=f"Anthropic budget exceeded: {e}",

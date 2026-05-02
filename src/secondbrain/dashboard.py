@@ -2052,7 +2052,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/watch", response_class=HTMLResponse)
     def watch_page():
-        from .db import watchlist_list
+        from .db import watchlist_get_domains, watchlist_list
+        from .presets import PRESETS
+        from .presets import names as preset_names
         from .watchlist import latest_summary
 
         cfg, conn, _, _ = get_state()
@@ -2069,6 +2071,25 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             last = "(never)" if not r["last_run_at"] else time.strftime(
                 "%Y-%m-%d %H:%M", time.localtime(r["last_run_at"])
             )
+            domains = watchlist_get_domains(conn, r["id"])
+            scope_chip = ""
+            if domains:
+                # Try to label as a preset name when the saved set matches.
+                matched_preset = None
+                domain_set = set(domains)
+                for pn, plist in PRESETS.items():
+                    if domain_set == set(plist):
+                        matched_preset = pn
+                        break
+                if matched_preset:
+                    label = f"preset: {matched_preset}"
+                else:
+                    label = f"{len(domains)} domain{'s' if len(domains) != 1 else ''}"
+                tip = ", ".join(domains)
+                scope_chip = (
+                    f' <span class="watch-scope" title="{escape(tip)}">'
+                    f'⛓ {escape(label)}</span>'
+                )
             s = latest_summary(conn, r["id"])
             answer_html = ""
             cite_html = ""
@@ -2114,7 +2135,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             items_html.append(f"""
 <article class="watch-card">
     <header class="watch-head">
-        <span class="watch-name">{escape(r['name'])}</span>
+        <span class="watch-name">{escape(r['name'])}{scope_chip}</span>
         <span class="watch-sched">every {every} · last: {last}</span>
     </header>
     <div class="watch-q">"{escape(r['query'])}"</div>
@@ -2130,6 +2151,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
         items = "".join(items_html) or (
             '<div class="empty">No watchlists yet. Add one below.</div>'
+        )
+        preset_options = '<option value="">(none — generic web search)</option>' + "".join(
+            f'<option value="{escape(p)}">{escape(p)} '
+            f'({len(PRESETS[p])} hosts)</option>'
+            for p in preset_names()
         )
         body = f"""
 <h1>Watchlists</h1>
@@ -2156,13 +2182,18 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             <option value="3d">every 3 days</option>
             <option value="7d">every week</option>
         </select>
+        <select name="preset" title="Scope web search to a curated domain list.">
+            {preset_options}
+        </select>
     </div>
     <textarea name="query" rows="2" required
         placeholder="What product manager internships came out today at top tech companies?"></textarea>
+    <input type="text" name="extra_domains" class="watch-extra"
+        placeholder="extra domains, comma-separated (e.g. anthropic.com, openai.com)">
     <div class="watch-form-row">
         <button type="submit">+ create watchlist</button>
         <span class="muted" style="font-size:11px;">
-            ~$0.02-0.10 per run depending on web-search use.
+            ~$0.02-0.10 per run · pick a preset to keep results focused.
         </span>
     </div>
 </form>
@@ -2200,8 +2231,17 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 .watch-new {{
     margin-top: 12px; display: flex; flex-direction: column; gap: 8px;
 }}
-.watch-new-row {{ display: flex; gap: 8px; }}
-.watch-new-row input {{ flex: 1; }}
+.watch-new-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.watch-new-row input {{ flex: 1 1 200px; min-width: 200px; }}
+.watch-new-row select {{ flex: 0 0 auto; }}
+.watch-extra {{ width: 100%; }}
+.watch-scope {{
+    display: inline-block; margin-left: 8px;
+    padding: 1px 6px; font-size: 10.5px;
+    background: #0f1c1f; color: #5af0ff;
+    border: 1px solid #1d3a44; border-radius: 2px;
+    letter-spacing: 0.04em;
+}}
 .watch-new textarea, .watch-new input, .watch-new select {{
     background: #0e0e0e; color: var(--fg);
     border: 1px solid var(--border); border-radius: 2px;
@@ -2214,6 +2254,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.post("/watch/new")
     async def watch_new(request: Request):
         from .db import watchlist_create
+        from .presets import resolve as resolve_preset
 
         _, conn, _, _ = get_state()
         # Same-origin guard mirroring /ingest.
@@ -2229,6 +2270,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         name = (form.get("name") or "").strip()
         query = (form.get("query") or "").strip()
         every = (form.get("every") or "1d").strip()
+        preset = (form.get("preset") or "").strip() or None
+        extras_raw = (form.get("extra_domains") or "").strip()
+        extras = [e.strip() for e in extras_raw.split(",") if e.strip()]
         if not name or not query:
             return RedirectResponse(url="/watch", status_code=303)
         # Reuse the CLI's parser so we accept the same notation.
@@ -2237,7 +2281,15 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             minutes = _parse_every(every)
         except Exception:  # noqa: BLE001
             minutes = 1440
-        watchlist_create(conn, name, query, schedule_minutes=minutes)
+        try:
+            allowed = resolve_preset(preset, extras)
+        except ValueError:
+            # Invalid preset name; fall back to no scoping rather than 500.
+            allowed = None
+        watchlist_create(
+            conn, name, query, schedule_minutes=minutes,
+            allowed_domains=allowed,
+        )
         return RedirectResponse(url="/watch", status_code=303)
 
     @app.post("/watch/{watchlist_id:int}/action")

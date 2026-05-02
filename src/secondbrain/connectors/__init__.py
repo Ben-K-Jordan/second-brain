@@ -108,8 +108,10 @@ def all_connectors() -> list[type[Connector]]:
     from .google_calendar import GoogleCalendarConnector
     from .google_drive import GoogleDriveConnector
     from .hacker_news import HackerNewsConnector
+    from .jobs import JobsConnector
     from .linear import LinearConnector
     from .mastodon import MastodonConnector
+    from .news import NewsConnector
     from .notion import NotionConnector
     from .obsidian import ObsidianConnector
     from .pocket import PocketConnector
@@ -124,7 +126,9 @@ def all_connectors() -> list[type[Connector]]:
         BrowserHistoryConnector,
         ObsidianConnector,
         XArchiveConnector,
-        # Network-bound APIs
+        # Network-bound APIs (small/cheap first)
+        JobsConnector,            # public ATS APIs - quick
+        NewsConnector,            # NewsAPI.org - quick
         GitHubConnector,
         LinearConnector,
         NotionConnector,

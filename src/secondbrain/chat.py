@@ -236,6 +236,7 @@ def stream_chat(
     user_message: str,
     history: list[dict] | None = None,
     system_prompt: str | None = None,
+    web_search_allowed_domains: list[str] | None = None,
 ) -> Iterator[ChatTurnEvent]:
     """Run one chat turn, streaming events to the caller.
 
@@ -250,6 +251,11 @@ def stream_chat(
     e.g. "You are my code reviewer" lets the user keep one conversation
     pinned to a different role without burning through chat history. None
     means "use the built-in default".
+
+    ``web_search_allowed_domains`` overrides ``cfg.web_search_allowed_domains``
+    for this single call. Watchlists set this from their per-watchlist
+    domain list so a "jobs" watchlist scopes web search to job sites and
+    a "news" watchlist hits news outlets.
     """
     if not user_message.strip():
         yield ChatTurnEvent("error", "empty user message")
@@ -286,8 +292,15 @@ def stream_chat(
             "name": "web_search",
             "max_uses": max(1, cfg.web_search_max_uses_per_turn),
         }
-        if cfg.web_search_allowed_domains:
-            web_tool["allowed_domains"] = list(cfg.web_search_allowed_domains)
+        # Per-call override (e.g. from a watchlist's preset) wins over the
+        # global config. ``[]`` and ``None`` both mean "no restriction".
+        effective_domains = (
+            list(web_search_allowed_domains)
+            if web_search_allowed_domains is not None
+            else list(cfg.web_search_allowed_domains)
+        )
+        if effective_domains:
+            web_tool["allowed_domains"] = effective_domains
         base_tools.append(web_tool)
 
     citations_by_id: dict[int, Citation] = {}
@@ -505,6 +518,7 @@ def ask_brain(
     question: str,
     history: list[dict] | None = None,
     system_prompt: str | None = None,
+    web_search_allowed_domains: list[str] | None = None,
 ) -> ChatResponse:
     """One-shot blocking version of ``stream_chat`` for MCP / scripts.
 
@@ -520,6 +534,7 @@ def ask_brain(
     for event in stream_chat(
         cfg, conn, embedder, reranker, question, history,
         system_prompt=system_prompt,
+        web_search_allowed_domains=web_search_allowed_domains,
     ):
         if event.kind == "text":
             text_parts.append(event.data)

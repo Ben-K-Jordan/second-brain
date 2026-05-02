@@ -854,25 +854,75 @@ def watch_add(
         "1d", "--every", "-e",
         help="How often to run (e.g. '15m', '2h', '1d'). Min 5 minutes.",
     ),
+    preset: str | None = typer.Option(
+        None, "--preset", "-p",
+        help="Named domain preset to scope web search. "
+             "One of: jobs, news, markets, research, ai, dev. "
+             "See `secondbrain watch presets`.",
+    ),
+    domains: list[str] = typer.Option(
+        None, "--domain", "-d",
+        help="Extra hostname to allow in web search (repeatable). "
+             "Combines with --preset.",
+    ),
 ) -> None:
     """Save a new recurring query.
 
-    Example: secondbrain watch add 'pm-internships' 'product manager
-    internship postings opened today at top tech companies' --every 1d
+    Examples:
+      # Generic watchlist (uses cfg.web_search_allowed_domains).
+      secondbrain watch add pm-internships \\
+        "PM internships posted today at top US tech" --every 1d
+
+      # Scoped to job sites only.
+      secondbrain watch add pm-internships \\
+        "PM internships posted today" --preset jobs --every 1d
+
+      # News on a specific topic, plus a custom domain.
+      secondbrain watch add ai-news \\
+        "What new AI launches happened today?" --preset news \\
+        --domain anthropic.com --domain openai.com --every 6h
     """
     from .db import watchlist_create
+    from .presets import resolve as resolve_preset
 
     minutes = _parse_every(every)
+    try:
+        allowed = resolve_preset(preset, list(domains or []))
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(code=1) from None
     cfg = load_config()
     conn, _ = _open_state(cfg)
-    wid = watchlist_create(conn, name, query, schedule_minutes=minutes)
+    wid = watchlist_create(
+        conn, name, query, schedule_minutes=minutes,
+        allowed_domains=allowed,
+    )
     console.print(
         f"[green]Created[/] watchlist #{wid} '[bold]{name}[/]' running every "
         f"{minutes} minute(s)."
     )
+    if allowed:
+        scope = (
+            f"preset={preset} ({len(allowed)} hosts)" if preset
+            else f"{len(allowed)} hosts"
+        )
+        console.print(f"  web search scoped to: [dim]{scope}[/]")
     console.print("It will run automatically once the daemon picks it up.")
     console.print("Run it now: [cyan]secondbrain watch run " + str(wid) + "[/]")
     conn.close()
+
+
+@watch_app.command("presets")
+def watch_presets() -> None:
+    """Print the available domain presets."""
+    from .presets import PRESETS
+
+    for name in sorted(PRESETS):
+        domains = PRESETS[name]
+        console.print(f"[bold]{name}[/] [dim]({len(domains)} hosts)[/]")
+        for d in domains:
+            console.print(f"  · {d}")
+        console.print()
 
 
 def _parse_every(s: str) -> int:
