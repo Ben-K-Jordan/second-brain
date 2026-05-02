@@ -1849,6 +1849,357 @@ def health_summary(
     conn.close()
 
 
+habits_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 79 habits + streaks. Recurring intentions with daily "
+         "or weekly cadence. Surfaces in the morning brief.",
+)
+app.add_typer(habits_app, name="habits")
+
+
+@habits_app.command("add")
+def habits_add(
+    name: str = typer.Argument(..., help="Habit name."),
+    cadence: str = typer.Option(
+        "daily", "--cadence",
+        help="daily | weekly | N_per_week",
+    ),
+    target: int = typer.Option(
+        None, "--target",
+        help="N for N_per_week (e.g. 4).",
+    ),
+) -> None:
+    """Add a habit."""
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    hid = personal.add_habit(
+        conn, name, cadence=cadence, target_per_week=target,
+    )
+    console.print(f"[green]✓[/] Habit #{hid}: {name}")
+    conn.close()
+
+
+@habits_app.command("checkin")
+def habits_checkin(
+    habit_id: int = typer.Argument(..., help="Habit id."),
+    note: str = typer.Option(None, "--note", "-n"),
+) -> None:
+    """Mark today done for a habit."""
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if personal.checkin(conn, habit_id, note=note):
+        status = personal.habit_status(conn, habit_id)
+        console.print(
+            f"[green]✓[/] Streak: {status.current_streak_days} day(s)",
+        )
+    else:
+        console.print("[yellow]Already checked in today.[/]")
+    conn.close()
+
+
+@habits_app.command("list")
+def habits_list() -> None:
+    """List habits with current streak + 30-day adherence."""
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    habits = personal.list_habits(conn)
+    if not habits:
+        console.print("[yellow]No habits yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Habits")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("name")
+    table.add_column("cadence", style="dim")
+    table.add_column("streak", justify="right")
+    table.add_column("30d", justify="right", style="dim")
+    for h in habits:
+        s = personal.habit_status(conn, h.id)
+        adh = (
+            f"{s.checkins_last_30d}/{s.expected_30d}"
+            if s.expected_30d else f"{s.checkins_last_30d}"
+        )
+        table.add_row(
+            str(h.id), h.name, h.cadence,
+            f"{s.current_streak_days}d", adh,
+        )
+    console.print(table)
+    conn.close()
+
+
+goals_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 79 goals. Aspirational targets with weekly numeric "
+         "bumps (e.g. 'apply to 5 jobs/week').",
+)
+app.add_typer(goals_app, name="goals")
+
+
+@goals_app.command("add")
+def goals_add(
+    name: str = typer.Argument(...),
+    target: int = typer.Option(
+        None, "--target", help="Numeric target per week.",
+    ),
+    description: str = typer.Option("", "--description", "-d"),
+) -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    gid = personal.add_goal(
+        conn, name, target_per_week=target, description=description,
+    )
+    console.print(f"[green]✓[/] Goal #{gid}: {name}")
+    conn.close()
+
+
+@goals_app.command("progress")
+def goals_progress(
+    goal_id: int = typer.Argument(...),
+    count: int = typer.Option(1, "--count", "-c"),
+    note: str = typer.Option(None, "--note", "-n"),
+) -> None:
+    """Record progress toward a goal."""
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    personal.record_goal_progress(conn, goal_id, count=count, note=note)
+    s = personal.goal_status(conn, goal_id)
+    console.print(
+        f"[green]✓[/] +{count} ({s.progress_this_week} this week"
+        + (f" / target {s.goal.target_per_week}"
+           if s.goal.target_per_week else "")
+        + ")",
+    )
+    conn.close()
+
+
+@goals_app.command("list")
+def goals_list() -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    goals = personal.list_goals(conn)
+    if not goals:
+        console.print("[yellow]No goals yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Goals")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("name")
+    table.add_column("target/wk", justify="right", style="dim")
+    table.add_column("this wk", justify="right")
+    table.add_column("track")
+    for g in goals:
+        s = personal.goal_status(conn, g.id)
+        track = (
+            "[green]✓[/]" if s.on_track or not g.target_per_week
+            else "[yellow]·[/]"
+        )
+        table.add_row(
+            str(g.id), g.name,
+            str(g.target_per_week or "—"),
+            str(s.progress_this_week), track,
+        )
+    console.print(table)
+    conn.close()
+
+
+journal_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 80 daily journal. 30-second mood + sentence; "
+         "correlates with Oura.",
+)
+app.add_typer(journal_app, name="journal")
+
+
+@journal_app.command("add")
+def journal_add(
+    text: str = typer.Argument(""),
+    mood: int = typer.Option(
+        None, "--mood", "-m", help="1 (worst) to 5 (best).",
+    ),
+) -> None:
+    """Add or update today's journal entry."""
+    from . import personal
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    eid = personal.upsert_journal(conn, mood=mood, text=text)
+    entry = personal.get_journal(conn)
+    if entry:
+        personal.index_journal_entry(cfg, conn, embedder, entry)
+    console.print(f"[green]✓[/] Journal #{eid}")
+    conn.close()
+
+
+@journal_app.command("show")
+def journal_show(
+    days: int = typer.Option(7, "--days", "-d"),
+) -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    entries = personal.recent_journal(conn, days=days)
+    if not entries:
+        console.print("[dim]No entries yet.[/]")
+        conn.close()
+        return
+    for e in entries:
+        mood_str = (
+            "·" * e.mood if e.mood else "—"
+        )
+        console.print(
+            f"[bold]{e.date}[/]  {mood_str} ({e.mood or '—'}/5)",
+        )
+        if e.text:
+            console.print(f"  {e.text}")
+        console.print()
+    conn.close()
+
+
+@journal_app.command("correlate")
+def journal_correlate(
+    metric: str = typer.Option("sleep_score", "--metric", "-m"),
+) -> None:
+    """Pearson correlation between mood and an Oura metric."""
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    out = personal.mood_correlation_with_metric(conn, metric)
+    if not out:
+        console.print(
+            "[yellow]Not enough data yet.[/] "
+            "Need 5+ days with both mood + metric values.",
+        )
+        conn.close()
+        return
+    direction = (
+        "positive" if out["pearson_r"] > 0.2
+        else "negative" if out["pearson_r"] < -0.2
+        else "weak"
+    )
+    console.print(
+        f"[bold]mood vs {metric}[/]: r={out['pearson_r']:+.2f} ({direction}); "
+        f"avg mood {out['mood_avg']:.1f}, avg {metric} {out['metric_avg']:.1f}; "
+        f"n={out['n']}",
+    )
+    conn.close()
+
+
+projects_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 81 explicit project tracker. Tag files, tasks, and "
+         "people to a project for 'what's open in <project>?' views.",
+)
+app.add_typer(projects_app, name="project")
+
+
+@projects_app.command("new")
+def project_new(
+    name: str = typer.Argument(...),
+    description: str = typer.Option("", "--description", "-d"),
+) -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    pid = personal.create_project(conn, name, description=description)
+    p = conn.execute("SELECT slug FROM projects WHERE id = ?", (pid,)).fetchone()
+    console.print(
+        f"[green]✓[/] Project #{pid}: [bold]{p['slug']}[/]",
+    )
+    conn.close()
+
+
+@projects_app.command("list")
+def project_list() -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    projects = personal.list_projects(conn)
+    if not projects:
+        console.print("[yellow]No projects yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Projects")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("slug")
+    table.add_column("name")
+    table.add_column("status", style="dim")
+    for p in projects:
+        table.add_row(str(p.id), p.slug, p.name, p.status)
+    console.print(table)
+    conn.close()
+
+
+@projects_app.command("add")
+def project_add_item(
+    slug: str = typer.Argument(..., help="Project slug."),
+    kind: str = typer.Argument(..., help="file | task | person"),
+    ref_id: int = typer.Argument(..., help="The item id."),
+    note: str = typer.Option(None, "--note", "-n"),
+) -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    p = personal.get_project_by_slug(conn, slug)
+    if p is None:
+        console.print(f"[red]No project[/] {slug!r}")
+        conn.close()
+        raise typer.Exit(code=1)
+    if personal.add_to_project(
+        conn, p.id, kind=kind, ref_id=ref_id, note=note,
+    ):
+        console.print(f"[green]✓[/] Tagged {kind}#{ref_id} → {slug}")
+    else:
+        console.print("[yellow]Already tagged.[/]")
+    conn.close()
+
+
+@projects_app.command("show")
+def project_show(slug: str = typer.Argument(...)) -> None:
+    from . import personal
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    p = personal.get_project_by_slug(conn, slug)
+    if p is None:
+        console.print(f"[red]No project[/] {slug!r}")
+        conn.close()
+        raise typer.Exit(code=1)
+    view = personal.project_view(conn, p.id)
+    console.print(f"[bold]{view.project.name}[/] [dim]({view.project.slug})[/]")
+    if view.project.description:
+        console.print(view.project.description)
+    if view.files:
+        console.print(f"\n[bold]{len(view.files)} file(s):[/]")
+        for _fid, path in view.files[:20]:
+            console.print(f"  · {path}")
+    if view.tasks:
+        console.print(f"\n[bold]{len(view.tasks)} task(s):[/]")
+        for tid, text in view.tasks[:20]:
+            console.print(f"  · #{tid}  {text}")
+    if view.people:
+        console.print(f"\n[bold]{len(view.people)} person:[/]")
+        for _pid, name in view.people:
+            console.print(f"  · {name}")
+    conn.close()
+
+
 @app.command()
 def vault(
     out: Path = typer.Argument(

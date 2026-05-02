@@ -426,6 +426,102 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_person_mentions_file
             ON person_mentions(file_id);
 
+        -- Habits (Phase 79). Recurring intentions with streak tracking.
+        -- A habit has a name, a target cadence (daily/weekly/N per
+        -- week), and check-ins land in habit_checkins. Streaks and
+        -- "X% adherence over the last 30 days" come from queries on
+        -- those tables.
+        CREATE TABLE IF NOT EXISTS habits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            cadence TEXT NOT NULL,             -- 'daily' | 'weekly' | 'N_per_week'
+            target_per_week INTEGER,           -- N for the N_per_week shape
+            created_at REAL NOT NULL,
+            archived_at REAL                   -- soft delete
+        );
+        CREATE INDEX IF NOT EXISTS idx_habits_active
+            ON habits(archived_at);
+
+        CREATE TABLE IF NOT EXISTS habit_checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+            date TEXT NOT NULL,                -- 'YYYY-MM-DD' local
+            note TEXT,
+            checked_at REAL NOT NULL,
+            UNIQUE(habit_id, date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_habit_checkins_habit_date
+            ON habit_checkins(habit_id, date DESC);
+
+        -- Goals (Phase 79). Aspirational targets with optional weekly
+        -- numeric bumps (e.g. "apply to 5 jobs/week"). The brief
+        -- references progress; weekly review tracks it.
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            target_per_week INTEGER,           -- numeric weekly target
+            description TEXT,
+            created_at REAL NOT NULL,
+            achieved_at REAL,                  -- explicit "done"
+            archived_at REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS goal_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            date TEXT NOT NULL,                -- 'YYYY-MM-DD'
+            count INTEGER NOT NULL DEFAULT 1,
+            note TEXT,
+            recorded_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_goal_progress_goal_date
+            ON goal_progress(goal_id, date DESC);
+
+        -- Journal entries (Phase 80). One per day per user; the daily
+        -- prompt asks for a 1-5 mood + free-text. Persisted as
+        -- ``journal://YYYY-MM-DD`` virtual paths in the index too,
+        -- so they're searchable alongside everything else, but this
+        -- table keeps the structured fields (mood int) for trend
+        -- queries against Oura.
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            mood INTEGER,                      -- 1-5; nullable for "skipped"
+            text TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_journal_date
+            ON journal_entries(date DESC);
+
+        -- Projects (Phase 81). Explicit grouping of brain content
+        -- around a theme. Different from auto-clusters (Phase 73) —
+        -- this is user-curated. project_items is a many-to-many
+        -- between projects and (file_id, task_id, person_id, etc).
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,         -- 'ml-capstone'
+            name TEXT NOT NULL,                -- 'ML Capstone'
+            description TEXT,
+            created_at REAL NOT NULL,
+            archived_at REAL,
+            status TEXT NOT NULL DEFAULT 'active'  -- active|paused|done
+        );
+
+        CREATE TABLE IF NOT EXISTS project_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,                -- 'file' | 'task' | 'person'
+            ref_id INTEGER NOT NULL,           -- file_id / task_id / person_id
+            added_at REAL NOT NULL,
+            note TEXT,
+            UNIQUE(project_id, kind, ref_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_items_project
+            ON project_items(project_id);
+        CREATE INDEX IF NOT EXISTS idx_project_items_ref
+            ON project_items(kind, ref_id);
+
         -- Study cards (Phase 67): flashcards generated from class
         -- transcripts. One row per (course_doc, question). Cards are
         -- materialised lazily by the LLM at first study or by the
