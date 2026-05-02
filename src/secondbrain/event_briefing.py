@@ -278,8 +278,16 @@ def _iter_ics(
 
 # =========================== prompt building ==========================
 
-def build_prompt(event: CalendarEvent) -> str:
-    """Frame the event for the chat agent to brief on."""
+def build_prompt(
+    event: CalendarEvent, conflicts: list[CalendarEvent] | None = None,
+) -> str:
+    """Frame the event for the chat agent to brief on.
+
+    When ``conflicts`` is non-empty, the prompt includes a "calendar
+    conflicts" section so the model knows to mention the overlap in the
+    "Anything urgent" output. Detection lives in
+    ``find_overlapping_events``; we just report what was found.
+    """
     lines = [
         "Generate a pre-event briefing the user can read in 30 seconds before "
         "walking in. Be tight, specific, and grounded.",
@@ -305,6 +313,14 @@ def build_prompt(event: CalendarEvent) -> str:
             d = d[:1500] + "\n[...truncated]"
         lines += ["", "Description:", d]
 
+    if conflicts:
+        lines += [
+            "",
+            "CALENDAR CONFLICTS — these other events overlap in time. Call "
+            "this out clearly under 'Anything urgent':",
+            _format_conflicts(conflicts),
+        ]
+
     lines += [
         "",
         "Please structure the briefing as:",
@@ -318,7 +334,8 @@ def build_prompt(event: CalendarEvent) -> str:
         "tailored to what you found.",
         "**Anything urgent** — deadlines, prep work, related items "
         "(e.g. assignments due today if it's a class; recent application "
-        "movement if it's a recruiting call).",
+        "movement if it's a recruiting call). If there are CALENDAR CONFLICTS "
+        "above, name them explicitly.",
         "",
         "Always cite sources inline. For each attendee, briefly note who they "
         "are if findable. If the user has had past meetings or threads with "
@@ -348,16 +365,23 @@ def _human_when(ts: float, duration_seconds: int) -> str:
 def generate_for_event(
     cfg: Config, conn, embedder: Embedder, reranker: Reranker | None,
     event: CalendarEvent,
+    conflicts: list[CalendarEvent] | None = None,
 ) -> dict:
     """Run the agent + persist the result. Returns a dict summarising the
-    outcome so the daemon / dashboard can react."""
+    outcome so the daemon / dashboard can react.
+
+    ``conflicts`` is the list of overlapping events the caller already
+    found (the scheduler precomputes this once per tick rather than
+    re-walking the calendar per event). Pass None to skip the
+    conflicts-block in the prompt.
+    """
     spend_before = 0.0
     try:
         spend_before = daily_spend_cents(cfg, "anthropic")
     except Exception:  # noqa: BLE001
         pass
 
-    prompt = build_prompt(event)
+    prompt = build_prompt(event, conflicts=conflicts)
     payload_json = _serialize_event(event)
     try:
         response = ask_brain(cfg, conn, embedder, reranker, prompt)
@@ -445,6 +469,10 @@ def run_briefings_if_due(
     lookahead_min = int(getattr(cfg, "briefing_lookahead_minutes", 30) or 30)
     cap_per_run = int(getattr(cfg, "briefing_max_per_run", 5) or 5)
 
+    # Pull a wider conflict window once (next 24h) so we can detect
+    # overlaps for any due event without re-walking calendars per-event.
+    conflict_pool = _gather_due_events(cfg, 24 * 3600)
+
     generated = 0
     for event in _gather_due_events(cfg, lookahead_min * 60):
         if generated >= cap_per_run:
@@ -455,8 +483,15 @@ def run_briefings_if_due(
         # get retried — likely transient (network, budget that's since reset).
         if existing is not None and not existing["error"]:
             continue
-        log.info("event briefing: generating for %r (%s)", event.title, event.source)
-        result = generate_for_event(cfg, conn, embedder, reranker, event)
+        conflicts = find_overlapping_events(event, conflict_pool)
+        log.info(
+            "event briefing: generating for %r (%s)%s",
+            event.title, event.source,
+            f" — {len(conflicts)} conflict(s)" if conflicts else "",
+        )
+        result = generate_for_event(
+            cfg, conn, embedder, reranker, event, conflicts=conflicts,
+        )
         generated += 1
         if result.get("ok"):
             try:
@@ -475,6 +510,54 @@ def _gather_due_events(cfg: Config, lookahead_seconds: int) -> list[CalendarEven
     events = list(iter_upcoming_events(cfg, lookahead_seconds))
     events.sort(key=lambda e: e.starts_at)
     return events
+
+
+def find_overlapping_events(
+    target: CalendarEvent, candidates: list[CalendarEvent],
+) -> list[CalendarEvent]:
+    """Return events that overlap with ``target`` in time, excluding the
+    target itself. Used by the briefing pipeline to surface "you also have
+    X scheduled at the same time."
+
+    Two events overlap when target_start < other_end AND other_start <
+    target_end. When duration is unknown (0), we treat the event as a
+    single point and only flag exact-time clashes.
+    """
+    target_end = target.starts_at + (target.duration_seconds or 0)
+    out: list[CalendarEvent] = []
+    for ev in candidates:
+        if ev.event_id == target.event_id and ev.source == target.source:
+            continue
+        ev_end = ev.starts_at + (ev.duration_seconds or 0)
+        # Strict overlap when both have duration; point-overlap (==) when
+        # neither does. The "or" handles either side being a point.
+        if target.duration_seconds == 0 and ev.duration_seconds == 0:
+            if target.starts_at == ev.starts_at:
+                out.append(ev)
+            continue
+        if target.starts_at < ev_end and ev.starts_at < target_end:
+            out.append(ev)
+    return out
+
+
+def _format_conflicts(conflicts: list[CalendarEvent]) -> str:
+    """One-line summary of overlapping events for the briefing prompt."""
+    if not conflicts:
+        return ""
+    pieces = []
+    for c in conflicts[:5]:
+        when = datetime.fromtimestamp(c.starts_at).strftime("%H:%M")
+        dur = (
+            f" (~{c.duration_seconds // 60} min)"
+            if c.duration_seconds else ""
+        )
+        cal = f" · {c.calendar_name}" if c.calendar_name else ""
+        pieces.append(f"{when}{dur} — {c.title}{cal}")
+    extra = (
+        f" + {len(conflicts) - 5} more"
+        if len(conflicts) > 5 else ""
+    )
+    return "\n".join(pieces) + extra
 
 
 # ============================== ad-hoc API ============================

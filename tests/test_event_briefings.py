@@ -16,11 +16,13 @@ from secondbrain.db import (
 )
 from secondbrain.event_briefing import (
     CalendarEvent,
+    _format_conflicts,
     _gcal_start_ts,
     _human_when,
     _normalize_gcal_event,
     _serialize_event,
     build_prompt,
+    find_overlapping_events,
     manual_event,
 )
 
@@ -218,6 +220,179 @@ def test_human_when_includes_relative_phrase():
 def test_human_when_handles_past_events():
     out = _human_when(time.time() - 600, 0)
     assert "started" in out  # past phrasing
+
+
+# =========================== conflict detection ======================
+
+def test_find_overlap_strict_overlap():
+    """Two events with overlapping ranges → conflict."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target", duration_seconds=3600,  # 1h
+    )
+    other = CalendarEvent(
+        event_id="o", source="x", starts_at=now + 1800,  # starts 30 min in
+        title="overlapping", duration_seconds=3600,
+    )
+    assert find_overlapping_events(target, [other]) == [other]
+
+
+def test_find_overlap_no_conflict_when_back_to_back():
+    """Event ending exactly when target starts → not a conflict."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target", duration_seconds=3600,
+    )
+    earlier = CalendarEvent(
+        event_id="e", source="x", starts_at=now - 1800,
+        title="ends right before", duration_seconds=1800,
+    )
+    assert find_overlapping_events(target, [earlier]) == []
+
+
+def test_find_overlap_excludes_target_itself():
+    """The target event shouldn't appear in its own conflict list."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target", duration_seconds=3600,
+    )
+    assert find_overlapping_events(target, [target]) == []
+
+
+def test_find_overlap_point_event_same_start():
+    """Two zero-duration events at the same start time → conflict."""
+    now = time.time()
+    a = CalendarEvent(event_id="a", source="x", starts_at=now,
+                      title="a", duration_seconds=0)
+    b = CalendarEvent(event_id="b", source="x", starts_at=now,
+                      title="b", duration_seconds=0)
+    assert find_overlapping_events(a, [b]) == [b]
+
+
+def test_find_overlap_point_event_different_start_no_conflict():
+    """Two zero-duration events at different starts → no conflict."""
+    now = time.time()
+    a = CalendarEvent(event_id="a", source="x", starts_at=now,
+                      title="a", duration_seconds=0)
+    b = CalendarEvent(event_id="b", source="x", starts_at=now + 60,
+                      title="b", duration_seconds=0)
+    assert find_overlapping_events(a, [b]) == []
+
+
+def test_find_overlap_partial_overlap_at_start():
+    """Other ends DURING target → conflict."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target", duration_seconds=3600,
+    )
+    other = CalendarEvent(
+        event_id="o", source="x", starts_at=now - 1800,
+        title="ends during target", duration_seconds=3600,  # ends now+1800
+    )
+    assert find_overlapping_events(target, [other]) == [other]
+
+
+def test_find_overlap_returns_multiple():
+    """Several overlapping events all surface."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target", duration_seconds=3600,
+    )
+    others = [
+        CalendarEvent(event_id=f"o{i}", source="x", starts_at=now + 60 * i,
+                      title=f"o{i}", duration_seconds=600)
+        for i in range(3)
+    ]
+    out = find_overlapping_events(target, others)
+    assert len(out) == 3
+
+
+def test_format_conflicts_truncates_long_list():
+    now = time.time()
+    many = [
+        CalendarEvent(event_id=f"o{i}", source="x", starts_at=now + 60 * i,
+                      title=f"event {i}", duration_seconds=900)
+        for i in range(10)
+    ]
+    out = _format_conflicts(many)
+    assert "+ 5 more" in out
+    # Top 5 are listed; the rest are summarized.
+    for i in range(5):
+        assert f"event {i}" in out
+
+
+def test_format_conflicts_empty_returns_empty_string():
+    assert _format_conflicts([]) == ""
+
+
+def test_build_prompt_with_conflicts_mentions_them():
+    """The conflict block should be visible in the rendered prompt so
+    the model includes it in 'Anything urgent'."""
+    now = time.time()
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=now,
+        title="target meeting", duration_seconds=1800,
+    )
+    other = CalendarEvent(
+        event_id="o", source="x", starts_at=now + 600,
+        title="conflicting class", duration_seconds=3600,
+    )
+    p = build_prompt(target, conflicts=[other])
+    assert "CALENDAR CONFLICTS" in p
+    assert "conflicting class" in p
+
+
+def test_build_prompt_without_conflicts_omits_block():
+    target = CalendarEvent(
+        event_id="t", source="x", starts_at=time.time(),
+        title="t", duration_seconds=1800,
+    )
+    p = build_prompt(target, conflicts=[])
+    # The instructions section may mention conflicts conditionally, but
+    # the dedicated conflicts block (which lists them) should be absent.
+    assert "these other events overlap in time" not in p
+
+
+def test_scheduler_passes_conflicts_to_generate(
+    fresh_db, tmp_cfg, fake_embedder, monkeypatch,
+):
+    """When the scheduler finds an event with overlaps, the conflict
+    list should reach generate_for_event."""
+    from secondbrain import event_briefing as eb
+
+    now = time.time()
+    target = CalendarEvent(
+        event_id="ev-target", source="google_calendar",
+        starts_at=now + 600, title="meeting", duration_seconds=1800,
+    )
+    overlap = CalendarEvent(
+        event_id="ev-overlap", source="google_calendar",
+        starts_at=now + 900, title="class", duration_seconds=3600,
+    )
+    # Both events visible to the scheduler's pool, but only target is
+    # in the lookahead window for "due" briefings.
+    monkeypatch.setattr(eb, "_gather_due_events",
+                        lambda cfg, lookahead_seconds: (
+                            [target] if lookahead_seconds < 3600
+                            else [target, overlap]
+                        ))
+
+    captured: dict = {}
+    def fake_generate(cfg, conn, embedder, reranker, event, conflicts=None):
+        captured["conflicts"] = conflicts
+        return {"ok": True, "text": "ok", "cents": 0.5}
+    monkeypatch.setattr(eb, "generate_for_event", fake_generate)
+    monkeypatch.setattr(eb, "notify", lambda *a, **kw: None)
+
+    eb.run_briefings_if_due(tmp_cfg, fresh_db, fake_embedder, None)
+    assert captured["conflicts"] is not None
+    assert len(captured["conflicts"]) == 1
+    assert captured["conflicts"][0].event_id == "ev-overlap"
 
 
 # =========================== ad-hoc events ============================
