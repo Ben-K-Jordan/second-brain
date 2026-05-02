@@ -369,6 +369,63 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_click_path_ts ON click_log(path, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_click_ts ON click_log(ts DESC);
 
+        -- People (Phase 65): de-duped, profile-shaped view of the
+        -- entities table. ``entities`` is per-chunk noisy (every spaCy
+        -- mention); this is one row per *resolved* person with their
+        -- mention history, contact info, and relationship metadata.
+        --
+        -- The canonical_name is the lowercase form that anchors
+        -- de-duplication: 'sarah chen' / 'Sarah Chen' / 'S Chen' all
+        -- map here. Aliases live in person_aliases below.
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_name TEXT NOT NULL,           -- lowercase, dedup key
+            display_name TEXT NOT NULL,             -- preferred capitalisation
+            email TEXT,                             -- primary email when known
+            company TEXT,
+            role TEXT,                              -- "PM", "Professor", etc.
+            notes TEXT,                             -- user-edited free text
+            birthday TEXT,                          -- 'MM-DD' or 'YYYY-MM-DD'
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            mention_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(canonical_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_people_email ON people(email);
+        CREATE INDEX IF NOT EXISTS idx_people_last_seen
+            ON people(last_seen_at DESC);
+
+        -- Aliases for a person — same human, multiple text forms.
+        -- Resolves "S. Chen" to person id N when "S. Chen" appears in
+        -- a doc. UNIQUE on alias_lower so "Sarah" can only map to one
+        -- person at a time (last-writer-wins through user re-tagging).
+        CREATE TABLE IF NOT EXISTS person_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL,                    -- preserve casing
+            alias_lower TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_person_aliases_person
+            ON person_aliases(person_id);
+
+        -- Per-mention link from a chunk to a person (Phase 66 — auto-
+        -- link entity mentions). One row per (chunk, person) pair so
+        -- we can render a doc with people highlighted + answer "what
+        -- docs mention Sarah?" in O(log n).
+        CREATE TABLE IF NOT EXISTS person_mentions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            mtime REAL NOT NULL,
+            UNIQUE(person_id, chunk_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_person_mentions_person_mtime
+            ON person_mentions(person_id, mtime DESC);
+        CREATE INDEX IF NOT EXISTS idx_person_mentions_file
+            ON person_mentions(file_id);
+
         -- Health metrics (Phase 56): structured numeric values from
         -- the Oura connector (and future Apple Health / Garmin etc).
         -- Stored separately from doc bodies so trend / correlation

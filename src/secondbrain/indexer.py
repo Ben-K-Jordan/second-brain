@@ -38,10 +38,11 @@ log = logging.getLogger(__name__)
 
 
 def _link_after_index(conn, file_id: int) -> None:
-    """Phase 52: compute backlinks for the freshly-indexed file.
+    """Phase 52 + 66: compute backlinks AND person-mention links for
+    the freshly-indexed file.
 
-    Best-effort — a backlinks failure must never take down an ingest.
-    Logged at WARNING so transient sqlite-vec hiccups are visible
+    Both calls are best-effort — a downstream failure must never take
+    down an ingest. Logged at WARNING so transient hiccups are visible
     without blowing up the indexer pipeline.
     """
     try:
@@ -49,6 +50,12 @@ def _link_after_index(conn, file_id: int) -> None:
         link_doc(conn, file_id)
     except Exception as e:  # noqa: BLE001
         log.warning("backlinks: link_doc failed for file_id=%s: %s",
+                    file_id, e)
+    try:
+        from .people import link_after_index
+        link_after_index(conn, file_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("people: link failed for file_id=%s: %s",
                     file_id, e)
 
 

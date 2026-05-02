@@ -1849,6 +1849,229 @@ def health_summary(
     conn.close()
 
 
+people_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 65 people module. De-duped, profile-shaped view of "
+         "the entity mentions across your brain. Each person carries "
+         "their mention history, contact info, and aliases. Run "
+         "`people backfill` once to seed from existing entities.",
+)
+app.add_typer(people_app, name="people")
+
+
+@people_app.command("list")
+def people_list(
+    order: str = typer.Option(
+        "recent", "--order",
+        help="recent | mentions | name",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """List people by recency / mention count / name."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = people_mod.list_people(conn, order=order, limit=limit)
+    if not rows:
+        console.print(
+            "[yellow]No people yet.[/]  Run "
+            "[cyan]secondbrain people backfill[/] to seed from entities.",
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None,
+                  title=f"People ({order})")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("name")
+    table.add_column("email", style="dim")
+    table.add_column("role", style="dim")
+    table.add_column("mentions", justify="right", style="dim")
+    table.add_column("last seen", style="dim")
+    now = time.time()
+    for p in rows:
+        days = max(0, int((now - p.last_seen_at) // 86400))
+        last = f"{days}d ago" if days else "today"
+        table.add_row(
+            str(p.id), p.display_name, p.email[:30],
+            p.role[:20], str(p.mention_count), last,
+        )
+    console.print(table)
+    conn.close()
+
+
+@people_app.command("show")
+def people_show(
+    name: str = typer.Argument(..., help="Name or substring."),
+) -> None:
+    """Show a person's full profile + recent mentions."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    p = people_mod.find_by_alias(conn, name)
+    if p is None:
+        rows = people_mod.search_people(conn, name, limit=5)
+        if not rows:
+            console.print(f"[yellow]No match for[/] {name!r}")
+            conn.close()
+            return
+        if len(rows) > 1:
+            console.print(f"[yellow]Multiple matches for[/] {name!r}:")
+            for r in rows:
+                console.print(f"  #{r.id}  {r.display_name}  {r.email}")
+            conn.close()
+            return
+        p = rows[0]
+    profile = people_mod.profile_for(conn, p.id)
+    console.print(f"[bold]{profile.person.display_name}[/] "
+                  f"[dim]#{profile.person.id}[/]")
+    if profile.person.email:
+        console.print(f"  email: {profile.person.email}")
+    if profile.person.company:
+        console.print(f"  company: {profile.person.company}")
+    if profile.person.role:
+        console.print(f"  role: {profile.person.role}")
+    if profile.person.birthday:
+        console.print(f"  birthday: {profile.person.birthday}")
+    console.print(
+        f"  mentions: {profile.person.mention_count}  "
+        f"[dim](first seen {profile.days_since_first_seen}d ago, "
+        f"last {profile.days_since_seen}d ago)[/]",
+    )
+    if profile.aliases:
+        console.print(
+            f"  aliases: {', '.join(profile.aliases)}",
+        )
+    if profile.person.notes:
+        console.print()
+        console.print(f"[dim]{profile.person.notes}[/]")
+    if profile.recent_mentions:
+        console.print()
+        console.print("[bold]Recent mentions:[/]")
+        for m in profile.recent_mentions[:10]:
+            when = time.strftime(
+                "%Y-%m-%d", time.localtime(m.mtime),
+            )
+            console.print(
+                f"  [{when}] {m.file_path}",
+            )
+            console.print(
+                f"    [dim]{m.chunk_text_preview[:120]}[/]",
+            )
+    conn.close()
+
+
+@people_app.command("edit")
+def people_edit(
+    person_id: int = typer.Argument(..., help="Person id (from `people list`)."),
+    email: str = typer.Option(None, "--email"),
+    company: str = typer.Option(None, "--company"),
+    role: str = typer.Option(None, "--role"),
+    notes: str = typer.Option(None, "--notes"),
+    birthday: str = typer.Option(
+        None, "--birthday",
+        help="MM-DD or YYYY-MM-DD",
+    ),
+) -> None:
+    """Edit a person's profile fields. Pass an empty string to clear."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if not people_mod.set_field(
+        conn, person_id, email=email, company=company,
+        role=role, notes=notes, birthday=birthday,
+    ):
+        console.print("[yellow]Nothing to update.[/]")
+    else:
+        console.print(f"[green]✓[/] Updated #{person_id}")
+    conn.close()
+
+
+@people_app.command("alias")
+def people_alias(
+    person_id: int = typer.Argument(..., help="Person id."),
+    alias: str = typer.Argument(..., help="New alias."),
+) -> None:
+    """Add an alias. The auto-linker picks it up after the next index."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if people_mod.add_alias(conn, person_id, alias):
+        people_mod.clear_alias_cache()
+        console.print(f"[green]✓[/] Added alias [bold]{alias}[/]")
+    else:
+        console.print("[yellow]Alias already exists.[/]")
+    conn.close()
+
+
+@people_app.command("unlink")
+def people_unlink(
+    alias: str = typer.Argument(..., help="Alias to remove."),
+) -> None:
+    """Drop an alias when the auto-linker mis-fired."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if people_mod.remove_alias(conn, alias):
+        people_mod.clear_alias_cache()
+        console.print(f"[green]✓[/] Removed alias [bold]{alias}[/]")
+    else:
+        console.print(f"[yellow]No alias[/] {alias!r}")
+    conn.close()
+
+
+@people_app.command("merge")
+def people_merge(
+    into_id: int = typer.Argument(..., help="Keep this person."),
+    from_id: int = typer.Argument(..., help="Merge from this id."),
+) -> None:
+    """Merge two people that should have been one. Aliases + mentions
+    move; the from-person is deleted."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    people_mod.merge_people(conn, into_id, from_id)
+    people_mod.clear_alias_cache()
+    console.print(f"[green]✓[/] Merged #{from_id} → #{into_id}")
+    conn.close()
+
+
+@people_app.command("backfill")
+def people_backfill(
+    relink: bool = typer.Option(
+        False, "--relink/--no-relink",
+        help="Also re-scan every chunk for mention links.",
+    ),
+    min_mentions: int = typer.Option(
+        2, "--min-mentions",
+        help="Promote entities mentioned at least N times.",
+    ),
+) -> None:
+    """Bulk-promote PERSON entities into people rows. Run once after
+    upgrading + occasionally after big ingest pushes."""
+    from . import people as people_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    n = people_mod.materialize_from_entities(
+        conn, min_mentions=min_mentions,
+    )
+    console.print(f"[green]✓[/] Created {n} new people row(s).")
+    if relink:
+        console.print("[cyan]Re-scanning chunks for mention links...[/]")
+        rows = conn.execute("SELECT id FROM files").fetchall()
+        total = 0
+        for r in rows:
+            total += people_mod.link_file_mentions(conn, int(r["id"]))
+        console.print(f"[green]✓[/] Linked {total} mention(s).")
+    conn.close()
+
+
 tasks_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 47 tasks. First-class action items extracted from "
