@@ -23,8 +23,10 @@ from .entities import make_entity_extractor
 from .image_embedder import make_image_embedder
 from .imager import make_ocr_engine
 from .indexer import IndexResult, index_folder
+from .reranker import make_reranker
 from .transcriber import make_transcriber
 from .watcher import Watcher
+from .watchlist import run_due_watchlists
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,11 @@ log = logging.getLogger(__name__)
 # bootstrap loop should as well). 10 minutes is comfortable - a busy reader
 # can hold the snapshot for that long without the WAL being a problem.
 _WAL_CHECKPOINT_INTERVAL_SEC = 600
+
+# How often the daemon should poll for due watchlists. Watchlist schedules
+# are in minutes, so 60s polling is enough to keep them within ~1 minute
+# of their requested cadence without busy-looping.
+_WATCHLIST_POLL_INTERVAL_SEC = 60
 
 
 def _make_log_handlers(log_path: Path) -> list[logging.Handler]:
@@ -169,16 +176,37 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
         image_embedder=image_embedder,
     )
     watcher.start(folders)
+    # Build a reranker once for watchlist runs so we don't re-instantiate
+    # per-poll. Cheap; just loads model metadata.
+    try:
+        reranker = make_reranker(cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reranker init failed; watchlists will run without rerank: %s", e)
+        reranker = None
     log.info("watcher running. Ctrl-C to stop.")
     last_checkpoint = time.time()
+    last_watchlist_poll = 0.0  # poll immediately on first iteration
     try:
         while True:
             time.sleep(1)
+            now = time.time()
             # Periodically truncate the WAL so a long-running daemon with an
             # active reader (the dashboard) doesn't let it grow unbounded.
-            if time.time() - last_checkpoint >= _WAL_CHECKPOINT_INTERVAL_SEC:
+            if now - last_checkpoint >= _WAL_CHECKPOINT_INTERVAL_SEC:
                 checkpoint_wal(conn)
-                last_checkpoint = time.time()
+                last_checkpoint = now
+            # Watchlist scheduler. Runs in the daemon thread; each due
+            # watchlist may take several seconds (Claude + tool use), so
+            # we serialise rather than spinning a worker pool. Acceptable
+            # for a single-user tool with O(10) watchlists.
+            if now - last_watchlist_poll >= _WATCHLIST_POLL_INTERVAL_SEC:
+                last_watchlist_poll = now
+                try:
+                    n = run_due_watchlists(cfg, conn, embedder, reranker)
+                    if n:
+                        log.info("watchlist scheduler: ran %d due watchlist(s)", n)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watchlist scheduler crashed: %s", e)
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:

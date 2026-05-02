@@ -237,6 +237,35 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_chat_msgs_conv
             ON chat_messages(conversation_id, seq);
 
+        -- Watchlists: saved recurring queries. The daemon runs each
+        -- watchlist on its schedule, captures the synthesized answer +
+        -- citations, and stores the run in watchlist_runs. The dashboard's
+        -- /watch page surfaces what's new since the last run.
+        CREATE TABLE IF NOT EXISTS watchlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            query TEXT NOT NULL,
+            schedule_minutes INTEGER NOT NULL DEFAULT 1440,  -- daily
+            last_run_at REAL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_watchlists_enabled ON watchlists(enabled);
+
+        CREATE TABLE IF NOT EXISTS watchlist_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            watchlist_id INTEGER NOT NULL
+                REFERENCES watchlists(id) ON DELETE CASCADE,
+            started_at REAL NOT NULL,
+            finished_at REAL,
+            answer TEXT,           -- synthesized text from ask_brain
+            citations_json TEXT,   -- JSON list of citation dicts
+            error TEXT,            -- non-null when the run failed
+            cents_spent REAL       -- estimated cost of this run
+        );
+        CREATE INDEX IF NOT EXISTS idx_wlruns_wl_started
+            ON watchlist_runs(watchlist_id, started_at DESC);
+
         -- Click-feedback: records which result paths the user actually
         -- opened from /search, /chat, /entity, etc. Used as a passive
         -- recency-weighted boost in ranking.
@@ -598,6 +627,127 @@ def chat_get_system_prompt(
         return None
     val = row["system_prompt"]
     return val if val and val.strip() else None
+
+
+# --- Watchlists --------------------------------------------------------
+
+def watchlist_create(
+    conn: sqlite3.Connection, name: str, query: str, schedule_minutes: int = 1440,
+) -> int:
+    """Create a recurring saved query. ``schedule_minutes`` defaults to 1440
+    (once a day). Returns the new id."""
+    cur = conn.execute(
+        "INSERT INTO watchlists(name, query, schedule_minutes, enabled, created_at) "
+        "VALUES (?, ?, ?, 1, ?) RETURNING id",
+        (name, query, max(5, int(schedule_minutes)), time.time()),
+    )
+    wid = cur.fetchone()["id"]
+    conn.commit()
+    return wid
+
+
+def watchlist_list(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All watchlists, with last-run timestamp included for the dashboard."""
+    return conn.execute(
+        "SELECT id, name, query, schedule_minutes, last_run_at, enabled, created_at "
+        "FROM watchlists ORDER BY created_at DESC"
+    ).fetchall()
+
+
+def watchlist_get(conn: sqlite3.Connection, watchlist_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM watchlists WHERE id = ?", (watchlist_id,),
+    ).fetchone()
+
+
+def watchlist_delete(conn: sqlite3.Connection, watchlist_id: int) -> None:
+    conn.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+    conn.commit()
+
+
+def watchlist_set_enabled(
+    conn: sqlite3.Connection, watchlist_id: int, enabled: bool,
+) -> None:
+    conn.execute(
+        "UPDATE watchlists SET enabled = ? WHERE id = ?",
+        (1 if enabled else 0, watchlist_id),
+    )
+    conn.commit()
+
+
+def watchlist_due(conn: sqlite3.Connection, now: float | None = None) -> list[sqlite3.Row]:
+    """Return enabled watchlists whose next-run time has passed.
+
+    A watchlist is due when ``last_run_at`` is null (never run) or when
+    ``now - last_run_at >= schedule_minutes * 60``. The daemon's scheduler
+    polls this and runs each due watchlist via ``run_watchlist``.
+    """
+    n = now if now is not None else time.time()
+    return conn.execute(
+        "SELECT id, name, query, schedule_minutes, last_run_at, enabled "
+        "FROM watchlists WHERE enabled = 1 AND ("
+        "  last_run_at IS NULL OR (? - last_run_at) >= (schedule_minutes * 60)"
+        ")",
+        (n,),
+    ).fetchall()
+
+
+def watchlist_run_record_start(conn: sqlite3.Connection, watchlist_id: int) -> int:
+    """Insert a watchlist_runs row marking the start of a run; return id."""
+    cur = conn.execute(
+        "INSERT INTO watchlist_runs(watchlist_id, started_at) "
+        "VALUES (?, ?) RETURNING id",
+        (watchlist_id, time.time()),
+    )
+    rid = cur.fetchone()["id"]
+    conn.commit()
+    return rid
+
+
+def watchlist_run_record_finish(
+    conn: sqlite3.Connection,
+    run_id: int,
+    answer: str | None = None,
+    citations_json: str | None = None,
+    error: str | None = None,
+    cents_spent: float | None = None,
+) -> None:
+    """Mark a watchlist run finished and persist the synthesized answer."""
+    conn.execute(
+        "UPDATE watchlist_runs SET finished_at = ?, answer = ?, "
+        "citations_json = ?, error = ?, cents_spent = ? WHERE id = ?",
+        (time.time(), answer, citations_json, error, cents_spent, run_id),
+    )
+    # Also bump last_run_at on the parent so watchlist_due moves on.
+    conn.execute(
+        "UPDATE watchlists SET last_run_at = ("
+        "  SELECT started_at FROM watchlist_runs WHERE id = ?"
+        ") WHERE id = ("
+        "  SELECT watchlist_id FROM watchlist_runs WHERE id = ?"
+        ")",
+        (run_id, run_id),
+    )
+    conn.commit()
+
+
+def watchlist_runs(
+    conn: sqlite3.Connection, watchlist_id: int, limit: int = 50,
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM watchlist_runs WHERE watchlist_id = ? "
+        "ORDER BY started_at DESC LIMIT ?",
+        (watchlist_id, limit),
+    ).fetchall()
+
+
+def watchlist_latest_run(
+    conn: sqlite3.Connection, watchlist_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM watchlist_runs WHERE watchlist_id = ? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (watchlist_id,),
+    ).fetchone()
 
 
 # --- Click-feedback ---------------------------------------------------

@@ -197,6 +197,17 @@ class Config:
     chat_max_tool_iterations: int = 4  # how many search rounds before forcing an answer
     chat_search_k: int = 6  # default chunks per search_brain call
 
+    # Web search (Anthropic server-side tool). When enabled, Claude can fetch
+    # fresh information from the open web during a chat turn - useful for
+    # "what came out today?", news, recruiting alerts, catching up on a topic.
+    # Off by default because it costs ~$0.01/search above the model fee.
+    web_search_enabled: bool = False
+    web_search_max_uses_per_turn: int = 3  # cost guard per turn
+    # Optional allowlist - if non-empty, only results from these hosts surface.
+    # Useful for recruiting boards (linkedin.com, lever.co, ...) or news
+    # (nytimes.com, ...). Leave empty for unrestricted.
+    web_search_allowed_domains: tuple[str, ...] = ()
+
     # Daily spend caps in cents (so $5 = 500). Refuses paid calls once today's
     # cumulative spend hits the cap. Set to 0 to disable. Defense in depth -
     # catches runaway loops fast; not a substitute for provider-side billing limits.
@@ -417,6 +428,12 @@ def load_config(path: Path | None = None) -> Config:
             cfg.chat_max_tool_iterations = int(data["chat_max_tool_iterations"])
         if "chat_search_k" in data:
             cfg.chat_search_k = int(data["chat_search_k"])
+        if "web_search_enabled" in data:
+            cfg.web_search_enabled = bool(data["web_search_enabled"])
+        if "web_search_max_uses_per_turn" in data:
+            cfg.web_search_max_uses_per_turn = int(data["web_search_max_uses_per_turn"])
+        if "web_search_allowed_domains" in data:
+            cfg.web_search_allowed_domains = tuple(data["web_search_allowed_domains"])
         if "substack_feeds" in data:
             cfg.substack_feeds = tuple(data["substack_feeds"])
         if "obsidian_vaults" in data:

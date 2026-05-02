@@ -1,0 +1,178 @@
+"""Recurring saved queries — the watchlist runner.
+
+A watchlist is a query you want answered on a schedule. The daemon polls
+``watchlist_due`` every minute or so; for each due watchlist it runs
+``run_watchlist`` which:
+
+  1. Calls ``ask_brain`` with a wrapper prompt that asks Claude "what's
+     new about <query> since <last_run_at>?". The model is free to use
+     ``search_brain`` (catch up on what you've already seen) and
+     ``web_search`` (find what's new).
+  2. Records the synthesized answer + citations + cost into
+     ``watchlist_runs``.
+  3. Bumps ``watchlists.last_run_at`` so the schedule advances.
+
+Failures are caught and stored in ``watchlist_runs.error`` so the
+dashboard can surface them.
+
+Designed to run from the daemon thread; opens its own DB connection
+because watchdog handlers run in worker threads.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from datetime import UTC, datetime
+
+from .budget import BudgetExceededError, daily_spend_cents
+from .chat import ChatResponse, ask_brain
+from .config import Config
+from .db import (
+    connect,
+    init_schema,
+    watchlist_due,
+    watchlist_latest_run,
+    watchlist_run_record_finish,
+    watchlist_run_record_start,
+)
+from .embedder import make_embedder
+from .reranker import make_reranker
+
+log = logging.getLogger(__name__)
+
+
+def _build_prompt(query: str, last_run_at: float | None) -> str:
+    """Wrap the user's query with a "what's new since X" framing."""
+    when = "ever" if not last_run_at else (
+        datetime.fromtimestamp(last_run_at, tz=UTC)
+        .strftime("%Y-%m-%d %H:%M UTC")
+    )
+    return (
+        f"Watchlist query: {query}\n\n"
+        f"Find what's new or relevant since {when}. Use web_search for "
+        f"fresh content; use search_brain to check what I've already seen "
+        f"(so you can highlight what's actually NEW, not just repeat). "
+        f"Answer as a tight bulleted list of items with one-line summaries "
+        f"and links. If nothing meaningful has changed, just say so."
+    )
+
+
+def run_watchlist(
+    cfg: Config, conn, embedder, reranker,
+    watchlist_id: int, query: str, last_run_at: float | None,
+) -> ChatResponse | None:
+    """Run a single watchlist and persist the result. Returns the
+    ChatResponse on success, or None on a budget / API error."""
+    run_id = watchlist_run_record_start(conn, watchlist_id)
+    spend_before = 0.0
+    try:
+        spend_before = daily_spend_cents(cfg, "anthropic")
+    except Exception:  # noqa: BLE001
+        pass
+
+    prompt = _build_prompt(query, last_run_at)
+    try:
+        response = ask_brain(cfg, conn, embedder, reranker, prompt)
+    except BudgetExceededError as e:
+        watchlist_run_record_finish(
+            conn, run_id, error=f"Anthropic budget exceeded: {e}",
+        )
+        return None
+    except Exception as e:  # noqa: BLE001
+        log.warning("watchlist %s failed: %s", watchlist_id, e)
+        watchlist_run_record_finish(conn, run_id, error=str(e)[:500])
+        return None
+
+    cents_spent: float | None = None
+    try:
+        cents_spent = max(0.0, daily_spend_cents(cfg, "anthropic") - spend_before)
+    except Exception:  # noqa: BLE001
+        pass
+
+    cites_payload = [
+        {
+            "kind": c.kind,
+            "file_path": c.file_path,
+            "url": c.url,
+            "page_title": c.page_title,
+            "chunk_index": c.chunk_index,
+            "score": round(c.score, 4),
+            "text": c.text if len(c.text) <= 600 else c.text[:600] + "…",
+        }
+        for c in response.citations
+    ]
+    watchlist_run_record_finish(
+        conn, run_id,
+        answer=response.text,
+        citations_json=json.dumps(cites_payload),
+        cents_spent=cents_spent,
+    )
+    log.info(
+        "watchlist %s ran in %.2f cents; %d citations",
+        watchlist_id,
+        cents_spent or 0.0,
+        len(response.citations),
+    )
+    return response
+
+
+def run_due_watchlists(cfg: Config, conn=None, embedder=None, reranker=None) -> int:
+    """Run every watchlist whose schedule has elapsed. Returns count.
+
+    Pass an existing ``conn`` / ``embedder`` / ``reranker`` to reuse the
+    daemon's singletons; otherwise we open our own.
+    """
+    own_conn = conn is None
+    if own_conn:
+        embedder = make_embedder(cfg)
+        conn = connect(cfg.db_path)
+        init_schema(conn, embedder.dim, embedder.name)
+        reranker = make_reranker(cfg)
+    try:
+        due = watchlist_due(conn)
+        if not due:
+            return 0
+        for row in due:
+            log.info("watchlist due: %s (%s)", row["name"], row["query"][:60])
+            try:
+                run_watchlist(
+                    cfg, conn, embedder, reranker,
+                    row["id"], row["query"], row["last_run_at"],
+                )
+            except Exception as e:  # noqa: BLE001
+                # Belt & braces: the function itself catches and stores
+                # its errors, but if anything escapes that path, we want
+                # one bad watchlist not to take down the rest.
+                log.warning("watchlist %s crashed: %s", row["id"], e)
+        return len(due)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def latest_summary(conn, watchlist_id: int) -> dict | None:
+    """Return the most recent finished run for the dashboard's "what's
+    new" panel: text + parsed citations + finished_at + error."""
+    row = watchlist_latest_run(conn, watchlist_id)
+    if row is None:
+        return None
+    cites: list = []
+    if row["citations_json"]:
+        try:
+            cites = json.loads(row["citations_json"])
+        except json.JSONDecodeError:
+            cites = []
+    return {
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "answer": row["answer"] or "",
+        "citations": cites,
+        "error": row["error"],
+        "cents_spent": row["cents_spent"],
+    }
+
+
+# Re-export for "from secondbrain.watchlist import time"
+_ = time

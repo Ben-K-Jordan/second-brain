@@ -42,25 +42,36 @@ You are the user's second brain — a friendly, concise assistant that answers \
 questions grounded in their personal knowledge base. The base contains \
 their files, notes, browser history, calendar events, emails (Gmail), Drive \
 docs, GitHub issues, Linear tickets, Slack messages, Reddit/HN/Pocket items, \
-and X archive content.
+X archive content, and past chat conversations with you.
 
-You have one tool: ``search_brain(query, k)``. Use it eagerly for any \
-factual question — your training data does NOT contain the user's personal \
-content. When in doubt, search.
+You have two tools:
+- ``search_brain(query, k)``: semantic + keyword search over the user's \
+  indexed content. Use this for anything personal, anything they've already \
+  written/saved/visited.
+- ``web_search`` (when available): live results from the open web. Use this \
+  for time-sensitive questions ("what PM internships came out today", \
+  current news, fresh information) and for topics the user hasn't yet \
+  indexed. Prefer this when the question references "today", "this week", \
+  "latest", or asks about something happening now.
 
 Rules:
-1. Always search before answering anything that would require knowing what's \
-   in the user's brain. Don't guess.
-2. If the search returns nothing relevant, say "I couldn't find that in your \
-   brain" — don't fabricate.
-3. Cite specific sources by referring to them by their path (e.g. \
-   "in github://owner/repo/issues/42"). The UI renders those as links.
-4. Keep answers tight. Bullet points and short paragraphs over essays.
-5. If a search came back with related-but-not-quite-right context, refine \
-   the query and search again. You can search up to a few times per turn.
-6. When the user asks a follow-up question, prefer reusing context from \
-   earlier in the conversation; only re-search if the new question is on a \
-   different topic.
+1. Always search before answering anything you can't be certain of. Don't \
+   guess. Pick the right tool: brain for personal/historical, web for \
+   fresh/external.
+2. If both tools are relevant (e.g. "have I been keeping up with X?"), \
+   use both — search the brain for what they already know, then web for \
+   what's new since then.
+3. If a search returns nothing relevant, say so plainly. Don't fabricate.
+4. Cite specific sources. For brain results use the path \
+   (e.g. "github://owner/repo/issues/42"); for web results cite the URL. \
+   The UI renders both as links.
+5. Keep answers tight. Bullet points and short paragraphs over essays.
+6. When refining: if a search came back with related-but-not-quite-right \
+   context, refine the query and search again. You can search up to a few \
+   times per turn.
+7. When the user asks a follow-up question, prefer reusing context from \
+   earlier in the conversation; only re-search if the new question is on \
+   a different topic.
 """
 
 
@@ -93,12 +104,22 @@ _SEARCH_TOOL: dict[str, Any] = {
 
 @dataclass
 class Citation:
-    """One source the model retrieved while answering."""
+    """One source the model retrieved while answering.
+
+    Brain citations come from ``search_brain`` and have a chunk_id +
+    chunk_index pointing into the local index. Web citations come from
+    Anthropic's server-side web_search and have ``kind="web"`` with the
+    page URL stored in ``file_path`` (so the existing dashboard rendering
+    "just works") plus ``url`` and ``page_title`` for richer display.
+    """
     chunk_id: int
     file_path: str
     chunk_index: int
     text: str
     score: float
+    kind: str = "brain"
+    url: str = ""
+    page_title: str = ""
 
 
 @dataclass
@@ -178,6 +199,35 @@ def _normalize_history(history: list[dict] | None) -> list[dict]:
     return [dict(m) for m in history]
 
 
+def _extract_web_search_rows(block: Any) -> list[dict[str, str]]:
+    """Pull URL / title / snippet from a web_search_tool_result block.
+
+    The Anthropic SDK returns these as Pydantic objects with a ``content``
+    field that's a list of items. Each item has ``url`` and ``title``;
+    ``encrypted_content`` is opaque and we ignore it. We're tolerant of
+    both the nested-object shape and a stringified-JSON fallback.
+    """
+    content = getattr(block, "content", None)
+    if content is None:
+        return []
+    if isinstance(content, str):
+        # Error case: content is a string error message, not a result list.
+        return []
+    rows: list[dict[str, str]] = []
+    for item in content:
+        # Items are usually web_search_result objects with .url / .title
+        url = getattr(item, "url", None) or (
+            item.get("url") if isinstance(item, dict) else None
+        ) or ""
+        title = getattr(item, "title", None) or (
+            item.get("title") if isinstance(item, dict) else None
+        ) or ""
+        if not url:
+            continue
+        rows.append({"url": url, "title": title or url})
+    return rows
+
+
 def stream_chat(
     cfg: Config,
     conn,
@@ -225,6 +275,21 @@ def stream_chat(
     # back to the search-grounded brain prompt.
     active_system_prompt = (system_prompt or "").strip() or _SYSTEM_PROMPT
 
+    # Build the tool list. search_brain is always available; web_search is
+    # opt-in (cfg.web_search_enabled). The web_search tool is server-side -
+    # Anthropic executes it and returns results inline; we don't run anything
+    # locally, but we DO record the cost.
+    base_tools: list[dict[str, Any]] = [_SEARCH_TOOL]
+    if cfg.web_search_enabled:
+        web_tool: dict[str, Any] = {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": max(1, cfg.web_search_max_uses_per_turn),
+        }
+        if cfg.web_search_allowed_domains:
+            web_tool["allowed_domains"] = list(cfg.web_search_allowed_domains)
+        base_tools.append(web_tool)
+
     citations_by_id: dict[int, Citation] = {}
     final_text_parts: list[str] = []
 
@@ -241,7 +306,7 @@ def stream_chat(
                 model=cfg.chat_model,
                 max_tokens=cfg.chat_max_tokens,
                 system=active_system_prompt,
-                tools=[] if force_answer else [_SEARCH_TOOL],
+                tools=[] if force_answer else base_tools,
                 messages=messages,
             ) as stream:
                 this_iter_text: list[str] = []
@@ -269,15 +334,74 @@ def stream_chat(
         except Exception as e:  # noqa: BLE001
             log.warning("chat usage recording failed: %s", e)
 
-        # Pull text into the running tally and surface tool calls (which
-        # don't appear in text_stream and live only in the resolved blocks).
+        # Server-side web_search billing: each request to the tool costs
+        # ~$0.01 regardless of result count. Anthropic exposes the count
+        # via response.usage.server_tool_use.web_search_requests.
+        web_search_requests = 0
+        try:
+            stu = getattr(response.usage, "server_tool_use", None)
+            if stu is not None:
+                web_search_requests = int(getattr(stu, "web_search_requests", 0) or 0)
+        except Exception:  # noqa: BLE001
+            web_search_requests = 0
+        if web_search_requests > 0:
+            try:
+                record_usage(
+                    cfg, "anthropic", "anthropic-web-search",
+                    input_tokens=web_search_requests,
+                    note=f"web_search:iter{iteration}",
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("web_search usage recording failed: %s", e)
+
+        # Pull text into the running tally, surface client-side tool calls
+        # (search_brain), and harvest server-side web_search citations as
+        # they live in the resolved Message's content blocks.
         tool_calls: list[Any] = []
         for block in response.content:
-            if block.type == "text":
+            btype = getattr(block, "type", None)
+            if btype == "text":
                 if block.text:
                     final_text_parts.append(block.text)
-            elif block.type == "tool_use":
+            elif btype == "tool_use":
                 tool_calls.append(block)
+            elif btype == "web_search_tool_result":
+                # Server tool result: a list of source rows. Stream a
+                # ``results`` event for the dashboard's progress trail and
+                # capture each result as a Citation so it shows up in the
+                # final sources list. Don't loop back to the model - the
+                # web tool is server-side; Claude already has the content.
+                rows = _extract_web_search_rows(block)
+                if rows:
+                    yield ChatTurnEvent("results", [
+                        {
+                            "file_path": r["url"],
+                            "chunk_index": None,
+                            "score": 1.0,
+                            "kind": "web",
+                            "page_title": r.get("title", ""),
+                        }
+                        for r in rows
+                    ])
+                    for r in rows:
+                        url = r.get("url") or ""
+                        if not url or url in citations_by_id:
+                            continue
+                        # Use a stable surrogate "chunk_id" derived from the
+                        # URL so de-dup works across iterations and matches
+                        # the citations_by_id contract (int keys). Negative
+                        # to avoid colliding with real chunk ids.
+                        sid = -(abs(hash(url)) % (1 << 31))
+                        citations_by_id[sid] = Citation(
+                            chunk_id=sid,
+                            file_path=url,
+                            chunk_index=0,
+                            text=r.get("snippet") or r.get("title") or "",
+                            score=1.0,
+                            kind="web",
+                            url=url,
+                            page_title=r.get("title", ""),
+                        )
 
         if response.stop_reason == "tool_use" and tool_calls and not force_answer:
             # Append the assistant turn (text + tool_use) to history, then
@@ -343,7 +467,15 @@ def stream_chat(
         break
 
     final_text = "".join(final_text_parts).strip() or "(no response)"
-    citations = sorted(citations_by_id.values(), key=lambda c: -c.score)
+    # Sort: brain citations first (sorted by score), then web citations
+    # (preserve discovery order). Mixed UIs render the brain stuff with
+    # rich snippets and the web stuff as link cards.
+    brain_cites = sorted(
+        (c for c in citations_by_id.values() if c.kind == "brain"),
+        key=lambda c: -c.score,
+    )
+    web_cites = [c for c in citations_by_id.values() if c.kind == "web"]
+    citations = list(brain_cites) + list(web_cites)
     yield ChatTurnEvent("done", {
         "text": final_text,
         "citations": [
@@ -355,6 +487,9 @@ def stream_chat(
                 # Truncate the text we send to the UI; the full text lives
                 # in the index and the user can click through.
                 "text": c.text if len(c.text) <= 800 else c.text[:800] + "…",
+                "kind": c.kind,
+                "url": c.url,
+                "page_title": c.page_title,
             }
             for c in citations
         ],
@@ -394,10 +529,15 @@ def ask_brain(
             for c in event.data.get("citations", []) or []:
                 citations.append(Citation(
                     chunk_id=c["chunk_id"],
+                    # chunk_index comes through as None for web citations;
+                    # default to 0 so the dataclass typing stays clean.
+                    chunk_index=c.get("chunk_index") or 0,
                     file_path=c["file_path"],
-                    chunk_index=c["chunk_index"],
                     text=c.get("text", ""),
                     score=c["score"],
+                    kind=c.get("kind", "brain"),
+                    url=c.get("url", ""),
+                    page_title=c.get("page_title", ""),
                 ))
             text_parts = [event.data.get("text", "") or "".join(text_parts)]
         elif event.kind == "error":

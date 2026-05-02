@@ -79,6 +79,10 @@ _PRICES_USD_PER_M: dict[str, dict[str, float]] = {
     "claude-opus-4-6":     {"input": 5.00, "output": 25.00},
     "claude-sonnet-4-6":   {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5":    {"input": 1.00, "output": 5.00},
+    # Anthropic web-search server tool: billed at $10 per 1k searches.
+    # We bill it as a faux "model" with input_tokens = number of searches
+    # so it shows up alongside chat traffic in the spend ledger.
+    "anthropic-web-search": {"input": 10_000.0},  # $10 per 1k = $10_000 per 1M
 }
 
 

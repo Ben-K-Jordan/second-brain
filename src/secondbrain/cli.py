@@ -799,6 +799,182 @@ def chat(
         conn.close()
 
 
+watch_app = typer.Typer(
+    no_args_is_help=True,
+    help="Manage saved recurring queries (watchlists). The daemon runs each "
+         "watchlist on its schedule and saves a synthesized 'what's new' "
+         "summary you can read on the /watch dashboard page.",
+)
+app.add_typer(watch_app, name="watch")
+
+
+@watch_app.command("list")
+def watch_list() -> None:
+    """List all watchlists."""
+    from .db import watchlist_list
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = watchlist_list(conn)
+    if not rows:
+        console.print("[yellow]No watchlists yet.[/]  Add one with: [cyan]secondbrain watch add ...[/]")
+        return
+    table = Table(show_header=True, box=None, title="Watchlists")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("name", style="bold")
+    table.add_column("query")
+    table.add_column("every", style="dim")
+    table.add_column("last run", style="dim")
+    table.add_column("on?", justify="center", width=3)
+    import time as _time
+
+    for r in rows:
+        sched = r["schedule_minutes"]
+        if sched >= 1440 and sched % 1440 == 0:
+            every = f"{sched // 1440}d"
+        elif sched >= 60 and sched % 60 == 0:
+            every = f"{sched // 60}h"
+        else:
+            every = f"{sched}m"
+        last = "(never)" if not r["last_run_at"] else _time.strftime(
+            "%Y-%m-%d %H:%M", _time.localtime(r["last_run_at"])
+        )
+        on = "✓" if r["enabled"] else "·"
+        q = r["query"] if len(r["query"]) <= 60 else r["query"][:60] + "…"
+        table.add_row(str(r["id"]), r["name"], q, every, last, on)
+    console.print(table)
+    conn.close()
+
+
+@watch_app.command("add")
+def watch_add(
+    name: str = typer.Argument(..., help="Short name for this watchlist."),
+    query: str = typer.Argument(..., help="The query to run on each schedule."),
+    every: str = typer.Option(
+        "1d", "--every", "-e",
+        help="How often to run (e.g. '15m', '2h', '1d'). Min 5 minutes.",
+    ),
+) -> None:
+    """Save a new recurring query.
+
+    Example: secondbrain watch add 'pm-internships' 'product manager
+    internship postings opened today at top tech companies' --every 1d
+    """
+    from .db import watchlist_create
+
+    minutes = _parse_every(every)
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    wid = watchlist_create(conn, name, query, schedule_minutes=minutes)
+    console.print(
+        f"[green]Created[/] watchlist #{wid} '[bold]{name}[/]' running every "
+        f"{minutes} minute(s)."
+    )
+    console.print("It will run automatically once the daemon picks it up.")
+    console.print("Run it now: [cyan]secondbrain watch run " + str(wid) + "[/]")
+    conn.close()
+
+
+def _parse_every(s: str) -> int:
+    """Parse '15m' / '2h' / '1d' into minutes. Bare integer = minutes."""
+    s = (s or "").strip().lower()
+    if not s:
+        return 1440
+    unit_map = {"m": 1, "h": 60, "d": 24 * 60}
+    if s[-1] in unit_map:
+        try:
+            n = int(s[:-1])
+        except ValueError as exc:
+            raise typer.BadParameter(f"can't parse --every {s!r}") from exc
+        return max(5, n * unit_map[s[-1]])
+    try:
+        return max(5, int(s))
+    except ValueError as exc:
+        raise typer.BadParameter(f"can't parse --every {s!r}") from exc
+
+
+@watch_app.command("remove")
+def watch_remove(
+    watchlist_id: int = typer.Argument(..., help="Watchlist id from `watch list`."),
+) -> None:
+    """Delete a watchlist (cascades to all its run history)."""
+    from .db import watchlist_delete
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    watchlist_delete(conn, watchlist_id)
+    console.print(f"[green]Deleted[/] watchlist #{watchlist_id}.")
+    conn.close()
+
+
+@watch_app.command("run")
+def watch_run(
+    watchlist_id: int | None = typer.Argument(
+        None, help="Specific watchlist id. Omit to run all due watchlists.",
+    ),
+) -> None:
+    """Run a watchlist now (don't wait for the schedule)."""
+    from .db import watchlist_get
+    from .watchlist import run_due_watchlists, run_watchlist
+
+    cfg = load_config()
+    conn, embedder = _open_state(cfg)
+    reranker = make_reranker(cfg)
+    if watchlist_id is None:
+        n = run_due_watchlists(cfg, conn, embedder, reranker)
+        console.print(f"[green]Ran[/] {n} due watchlist(s).")
+        conn.close()
+        return
+    row = watchlist_get(conn, watchlist_id)
+    if row is None:
+        console.print(f"[red]Watchlist #{watchlist_id} not found.[/]")
+        raise typer.Exit(code=1)
+    console.print(f"[cyan]Running[/] '{row['name']}'...")
+    response = run_watchlist(
+        cfg, conn, embedder, reranker,
+        row["id"], row["query"], row["last_run_at"],
+    )
+    if response is None:
+        console.print("[red]Run failed; see daemon log for details.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    console.print()
+    console.print(response.text)
+    console.print()
+    console.print(f"[dim]{len(response.citations)} source(s)[/]")
+    conn.close()
+
+
+@watch_app.command("show")
+def watch_show(
+    watchlist_id: int = typer.Argument(..., help="Watchlist id."),
+) -> None:
+    """Show the most recent run output for a watchlist."""
+    from .db import watchlist_get
+    from .watchlist import latest_summary
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    row = watchlist_get(conn, watchlist_id)
+    if row is None:
+        console.print(f"[red]Watchlist #{watchlist_id} not found.[/]")
+        raise typer.Exit(code=1)
+    s = latest_summary(conn, watchlist_id)
+    console.print(f"[bold]{row['name']}[/]  [dim]({row['query']})[/]")
+    if s is None:
+        console.print("[dim]Never run.[/]")
+        conn.close()
+        return
+    if s["error"]:
+        console.print(f"[red]Last run errored:[/] {s['error']}")
+        conn.close()
+        return
+    console.print(s["answer"] or "(no answer)")
+    console.print()
+    console.print(f"[dim]{len(s['citations'])} source(s)[/]")
+    conn.close()
+
+
 @app.command()
 def dashboard(
     port: int = typer.Option(8765, "--port", "-p", help="HTTP port."),

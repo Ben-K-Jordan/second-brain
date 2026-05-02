@@ -627,11 +627,26 @@ CHAT_JS = r"""
         citEl.appendChild(header);
         citations.forEach((c) => {
             const card = document.createElement('div');
-            card.className = 'chat-citation';
+            card.className = 'chat-citation' + (c.kind === 'web' ? ' chat-citation-web' : '');
             const link = document.createElement('a');
-            link.href = `/file?path=${encodeURIComponent(c.file_path)}`;
-            link.textContent = c.file_path + (c.chunk_index !== undefined ? ` · chunk ${c.chunk_index}` : '');
+            if (c.kind === 'web') {
+                // External link to the source page; open in new tab so the
+                // chat doesn't navigate away.
+                link.href = c.url || c.file_path;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.textContent = c.page_title || c.url || c.file_path;
+            } else {
+                link.href = `/file?path=${encodeURIComponent(c.file_path)}`;
+                link.textContent = c.file_path + (c.chunk_index !== undefined && c.chunk_index !== null ? ` · chunk ${c.chunk_index}` : '');
+            }
             card.appendChild(link);
+            if (c.kind === 'web' && (c.url || c.file_path)) {
+                const sub = document.createElement('div');
+                sub.className = 'chat-citation-suburl';
+                sub.textContent = c.url || c.file_path;
+                card.appendChild(sub);
+            }
             if (c.text) {
                 const sn = document.createElement('div');
                 sn.className = 'chat-citation-snippet';
@@ -911,6 +926,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Overview", "/"),
         ("Chat", "/chat"),
         ("Search", "/search"),
+        ("Watch", "/watch"),
         ("Graph", "/graph"),
         ("Entities", "/entities"),
         ("Folders", "/folders"),
@@ -1812,6 +1828,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     margin-top: 6px; color: #aaa; white-space: pre-wrap; font-family: var(--mono);
     font-size: 11.5px; max-height: 80px; overflow: hidden;
 }}
+.chat-citation-web {{ border-left-color: #5af0ff; }}
+.chat-citation-web a::before {{ content: "↗ "; color: #5af0ff; }}
+.chat-citation-suburl {{
+    margin-top: 4px; color: #5af0ff; font-family: var(--mono); font-size: 11px;
+    opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
 .chat-form {{
     margin-top: 14px; display: flex; flex-direction: column; gap: 8px;
 }}
@@ -2025,6 +2047,235 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 httponly=True, samesite="strict", path="/",
             )
         return resp
+
+    # --- Watchlists --------------------------------------------------
+
+    @app.get("/watch", response_class=HTMLResponse)
+    def watch_page():
+        from .db import watchlist_list
+        from .watchlist import latest_summary
+
+        cfg, conn, _, _ = get_state()
+        rows = watchlist_list(conn)
+        items_html: list[str] = []
+        for r in rows:
+            sched = r["schedule_minutes"]
+            if sched >= 1440 and sched % 1440 == 0:
+                every = f"{sched // 1440}d"
+            elif sched >= 60 and sched % 60 == 0:
+                every = f"{sched // 60}h"
+            else:
+                every = f"{sched}m"
+            last = "(never)" if not r["last_run_at"] else time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(r["last_run_at"])
+            )
+            s = latest_summary(conn, r["id"])
+            answer_html = ""
+            cite_html = ""
+            if s and s.get("answer"):
+                answer_html = (
+                    '<div class="watch-answer">'
+                    f'{escape(s["answer"])}'
+                    '</div>'
+                )
+                cites = s.get("citations") or []
+                if cites:
+                    cite_pieces: list[str] = []
+                    for c in cites:
+                        kind = c.get("kind", "brain")
+                        if kind == "web":
+                            url = c.get("url") or c.get("file_path", "")
+                            label = c.get("page_title") or url
+                            cite_pieces.append(
+                                f'<a href="{escape(url)}" target="_blank" '
+                                f'rel="noopener noreferrer" class="watch-cite watch-cite-web">'
+                                f'↗ {escape(label)}</a>'
+                            )
+                        else:
+                            fp = c.get("file_path", "")
+                            cite_pieces.append(
+                                f'<a href="/file?path={urllib.parse.quote_plus(fp)}" '
+                                f'class="watch-cite">{escape(fp)}</a>'
+                            )
+                    cite_html = (
+                        '<div class="watch-cites">' + "".join(cite_pieces) + "</div>"
+                    )
+            elif s and s.get("error"):
+                answer_html = (
+                    f'<div class="watch-answer watch-error">'
+                    f'last run errored: {escape(s["error"])}</div>'
+                )
+
+            on_off_btn = (
+                '<button name="action" value="disable">disable</button>'
+                if r["enabled"]
+                else '<button name="action" value="enable">enable</button>'
+            )
+            items_html.append(f"""
+<article class="watch-card">
+    <header class="watch-head">
+        <span class="watch-name">{escape(r['name'])}</span>
+        <span class="watch-sched">every {every} · last: {last}</span>
+    </header>
+    <div class="watch-q">"{escape(r['query'])}"</div>
+    {answer_html}
+    {cite_html}
+    <form method="post" action="/watch/{r['id']}/action" class="watch-actions">
+        <button name="action" value="run">run now</button>
+        {on_off_btn}
+        <button name="action" value="delete" class="watch-danger"
+                onclick="return confirm('Delete this watchlist?');">delete</button>
+    </form>
+</article>""")
+
+        items = "".join(items_html) or (
+            '<div class="empty">No watchlists yet. Add one below.</div>'
+        )
+        body = f"""
+<h1>Watchlists</h1>
+<p class="muted" style="margin-top:-8px;">
+    Recurring saved queries. The daemon runs each one on its schedule and
+    captures a fresh "what's new since last run" summary using
+    <code>{escape(cfg.chat_model)}</code> with web search and your brain
+    as tools.
+    {"<strong style='color:var(--green);'>Web search is enabled.</strong>"
+     if cfg.web_search_enabled else
+     "<strong style='color:#ff5c5c;'>Web search is OFF</strong> "
+     "in config; watchlists will only see your indexed brain. "
+     "Set <code>web_search_enabled = true</code> in config.toml to turn on."}
+</p>
+
+<form method="post" action="/watch/new" class="watch-new card">
+    <div class="watch-new-row">
+        <input type="text" name="name" placeholder="name (e.g. pm-internships)" required>
+        <select name="every">
+            <option value="15m">every 15m</option>
+            <option value="1h">every hour</option>
+            <option value="6h">every 6h</option>
+            <option value="1d" selected>every day</option>
+            <option value="3d">every 3 days</option>
+            <option value="7d">every week</option>
+        </select>
+    </div>
+    <textarea name="query" rows="2" required
+        placeholder="What product manager internships came out today at top tech companies?"></textarea>
+    <div class="watch-form-row">
+        <button type="submit">+ create watchlist</button>
+        <span class="muted" style="font-size:11px;">
+            ~$0.02-0.10 per run depending on web-search use.
+        </span>
+    </div>
+</form>
+
+<div class="watch-list">{items}</div>
+
+<style>
+.watch-card {{
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--green-dim);
+    padding: 14px 16px; margin: 12px 0;
+}}
+.watch-head {{ display: flex; justify-content: space-between; gap: 12px; }}
+.watch-name {{ font-weight: 600; color: var(--green); font-family: var(--mono); }}
+.watch-sched {{ font-size: 11.5px; color: #888; }}
+.watch-q {{ margin: 6px 0; color: #ccc; font-style: italic; font-size: 13px; }}
+.watch-answer {{
+    margin: 10px 0; padding: 10px 12px;
+    background: #0a0a0a; border-left: 2px solid var(--border);
+    white-space: pre-wrap; font-size: 13px; line-height: 1.55;
+}}
+.watch-error {{ color: #ff5c5c; }}
+.watch-cites {{ display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }}
+.watch-cite {{
+    color: var(--green); font-size: 11.5px; font-family: var(--mono);
+    text-decoration: none; padding: 2px 0;
+}}
+.watch-cite-web {{ color: #5af0ff; }}
+.watch-cite:hover {{ text-decoration: underline; }}
+.watch-actions {{
+    display: flex; gap: 10px; margin-top: 10px;
+}}
+.watch-actions button {{ font-size: 11px; }}
+.watch-danger {{ background: transparent; color: #ff5c5c; border-color: #4a1c1c; }}
+.watch-new {{
+    margin-top: 12px; display: flex; flex-direction: column; gap: 8px;
+}}
+.watch-new-row {{ display: flex; gap: 8px; }}
+.watch-new-row input {{ flex: 1; }}
+.watch-new textarea, .watch-new input, .watch-new select {{
+    background: #0e0e0e; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 8px 10px; font: 13px var(--mono);
+}}
+.watch-form-row {{ display: flex; gap: 12px; align-items: center; }}
+</style>"""
+        return HTMLResponse(_layout("Watchlists", body, "watch"))
+
+    @app.post("/watch/new")
+    async def watch_new(request: Request):
+        from .db import watchlist_create
+
+        _, conn, _, _ = get_state()
+        # Same-origin guard mirroring /ingest.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        name = (form.get("name") or "").strip()
+        query = (form.get("query") or "").strip()
+        every = (form.get("every") or "1d").strip()
+        if not name or not query:
+            return RedirectResponse(url="/watch", status_code=303)
+        # Reuse the CLI's parser so we accept the same notation.
+        from .cli import _parse_every  # noqa: PLC0415
+        try:
+            minutes = _parse_every(every)
+        except Exception:  # noqa: BLE001
+            minutes = 1440
+        watchlist_create(conn, name, query, schedule_minutes=minutes)
+        return RedirectResponse(url="/watch", status_code=303)
+
+    @app.post("/watch/{watchlist_id:int}/action")
+    async def watch_action(watchlist_id: int, request: Request):
+        from .db import (
+            watchlist_delete,
+            watchlist_get,
+            watchlist_set_enabled,
+        )
+        from .watchlist import run_watchlist
+
+        cfg, conn, embedder, reranker = get_state()
+        # Same-origin guard.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
+        form = await request.form()
+        action = (form.get("action") or "").strip()
+        row = watchlist_get(conn, watchlist_id)
+        if row is None:
+            return RedirectResponse(url="/watch", status_code=303)
+        if action == "delete":
+            watchlist_delete(conn, watchlist_id)
+        elif action == "disable":
+            watchlist_set_enabled(conn, watchlist_id, False)
+        elif action == "enable":
+            watchlist_set_enabled(conn, watchlist_id, True)
+        elif action == "run":
+            run_watchlist(
+                cfg, conn, embedder, reranker,
+                row["id"], row["query"], row["last_run_at"],
+            )
+        return RedirectResponse(url="/watch", status_code=303)
 
     @app.get("/briefing", response_class=HTMLResponse)
     def briefing_page(hours: int = 24):
