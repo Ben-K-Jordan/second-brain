@@ -209,6 +209,96 @@ header .kbd-hint:hover {
     color: var(--green); border-color: var(--green-dim);
     box-shadow: inset 0 0 0 1px var(--green-soft), 0 0 12px var(--green-soft);
 }
+/* Nav badges — count chips that show pending state. JS populates
+   `[data-badge]` after page load via /api/nav-counts; the empty
+   state collapses to display:none so non-pending items stay clean. */
+.nav-badge {
+    display: none;
+    margin-left: 6px;
+    padding: 0 5px; min-width: 16px; height: 14px; line-height: 14px;
+    border-radius: 7px; background: var(--green-soft);
+    border: 1px solid var(--green-dim); color: var(--green);
+    font-size: 10px; text-align: center; font-family: var(--mono);
+    text-shadow: 0 0 4px var(--green-glow);
+}
+.nav-badge.has-count { display: inline-block; }
+.nav-badge.urgent {
+    background: rgba(255,77,77,0.10); border-color: var(--red);
+    color: var(--red); text-shadow: 0 0 4px rgba(255,77,77,0.45);
+}
+/* "More ▾" dropdown — overflow menu for the long tail of pages.
+   Uses native <details>/<summary> so no JS toggle needed. */
+.nav-more { position: relative; }
+.nav-more summary {
+    list-style: none; cursor: pointer;
+    color: var(--text-2); padding: 6px 10px; font-size: 12.5px;
+    border: 1px solid transparent; border-radius: var(--r);
+    transition: all var(--ease);
+}
+.nav-more summary::-webkit-details-marker { display: none; }
+.nav-more summary:hover {
+    color: var(--green); background: var(--green-soft);
+    border-color: var(--border-strong);
+}
+.nav-more[open] summary {
+    color: var(--green); background: var(--green-soft);
+    border-color: var(--green-dim);
+}
+.nav-more-pop {
+    position: absolute; top: calc(100% + 6px); right: 0;
+    min-width: 520px; padding: var(--s-4);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    box-shadow: var(--shadow-pop);
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-4);
+    z-index: 20;
+}
+.nav-more-group h4 {
+    margin: 0 0 var(--s-2);
+    font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--text-3);
+}
+.nav-more-group h4::before { content: "// "; color: var(--text-4); }
+.nav-more-group a {
+    display: block; padding: 4px 6px; font-size: 12px;
+    color: var(--text-2); border-radius: var(--r);
+    transition: all var(--ease);
+}
+.nav-more-group a:hover {
+    color: var(--green); background: var(--green-soft);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+/* Launchpad — Overview-page grid of grouped page links. */
+.launchpad {
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r); padding: var(--s-5);
+    margin-bottom: var(--s-5);
+}
+.launchpad-grid {
+    display: grid; gap: var(--s-5);
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.launchpad-group h3 {
+    margin: 0 0 var(--s-2);
+    font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--green-dim);
+}
+.launchpad-group h3::before { content: "[ "; color: var(--green-dim); }
+.launchpad-group h3::after  { content: " ]"; color: var(--green-dim); }
+.launchpad-group a {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 4px 6px; font-size: 12.5px;
+    color: var(--text); border-radius: var(--r);
+    transition: all var(--ease);
+}
+.launchpad-group a:hover {
+    color: var(--green); background: var(--green-soft);
+    text-shadow: 0 0 6px var(--green-glow);
+}
+.launchpad-group a .meta {
+    color: var(--text-3); font-size: 11px;
+}
 .kbd {
     display: inline-block; padding: 1px 5px; border-radius: 2px;
     background: #000; border: 1px solid var(--border-strong);
@@ -530,6 +620,33 @@ td.num { font-family: var(--mono); text-align: right; color: var(--amber); }
 """
 
 
+NAV_BADGES_JS = r"""
+(function () {
+    // Populate count chips on the primary nav (Tasks / Drafts /
+    // Insights). One fetch per page load against /api/nav-counts.
+    // Failure is silent — the badges just stay hidden.
+    fetch('/api/nav-counts', {credentials: 'same-origin'})
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+            if (!data) return;
+            document.querySelectorAll('[data-badge]').forEach(function (el) {
+                const key = el.getAttribute('data-badge');
+                const n = data[key];
+                if (typeof n !== 'number' || n <= 0) return;
+                el.textContent = n > 99 ? '99+' : String(n);
+                el.classList.add('has-count');
+                // Drafts + urgent insights get the red urgent style;
+                // tasks stay green even when they pile up.
+                if (data.urgent && data.urgent[key]) {
+                    el.classList.add('urgent');
+                }
+            });
+        })
+        .catch(function () { /* best-effort, badges stay hidden */ });
+})();
+"""
+
+
 CLICK_BEACON_JS = r"""
 (function () {
     // Listens for clicks on any [data-sb-click] link and fires a tiny POST
@@ -771,14 +888,35 @@ PALETTE_JS = r"""
     let selectedIdx = 0;
     let abortCtrl = null;
 
+    // ⌘K can now jump to any page in the app — not just the small
+    // hand-picked subset the original palette had. Order roughly by
+    // most-likely-to-want; fuzzy match takes care of the rest.
     const STATIC_PAGES = [
-        {kind: 'page', icon: '⌂', label: 'Overview',  href: '/',          meta: ''},
-        {kind: 'page', icon: '⌕', label: 'Search',    href: '/search',    meta: ''},
-        {kind: 'page', icon: '◊', label: 'Graph',     href: '/graph',     meta: ''},
-        {kind: 'page', icon: '※', label: 'Entities',  href: '/entities',  meta: ''},
-        {kind: 'page', icon: '⊟', label: 'Folders',   href: '/folders',   meta: ''},
-        {kind: 'page', icon: '☼', label: 'Briefing',  href: '/briefing',  meta: ''},
-        {kind: 'page', icon: '+',  label: 'Ingest URL',href: '/ingest',   meta: ''},
+        {kind: 'page', icon: '⌂', label: 'Overview',   href: '/',              meta: ''},
+        {kind: 'page', icon: '☼', label: 'Brief',      href: '/brief',         meta: 'morning'},
+        {kind: 'page', icon: '⌕', label: 'Search',     href: '/search',        meta: ''},
+        {kind: 'page', icon: '⌨', label: 'Chat',       href: '/chat',          meta: 'ask the brain'},
+        {kind: 'page', icon: '✓', label: 'Tasks',      href: '/tasks',         meta: ''},
+        {kind: 'page', icon: '✉', label: 'Drafts',     href: '/drafts',        meta: 'email'},
+        {kind: 'page', icon: '!', label: 'Insights',   href: '/insights',      meta: ''},
+        {kind: 'page', icon: '◇', label: 'Habits',     href: '/habits',        meta: ''},
+        {kind: 'page', icon: '✎', label: 'Journal',    href: '/journal',       meta: ''},
+        {kind: 'page', icon: '♥', label: 'Health',     href: '/health',        meta: 'oura'},
+        {kind: 'page', icon: '☺', label: 'People',     href: '/people',        meta: ''},
+        {kind: 'page', icon: '⌘', label: 'Memory',     href: '/memory',        meta: 'chat recall'},
+        {kind: 'page', icon: '⌘', label: 'Projects',   href: '/projects',      meta: ''},
+        {kind: 'page', icon: '?', label: 'Study',      href: '/study/review',  meta: 'flashcards'},
+        {kind: 'page', icon: '⏱', label: 'Snapshots',  href: '/snapshots',     meta: 'temporal'},
+        {kind: 'page', icon: '◊', label: 'Graph',      href: '/graph',         meta: ''},
+        {kind: 'page', icon: '※', label: 'Entities',   href: '/entities',      meta: ''},
+        {kind: 'page', icon: '⊟', label: 'Folders',    href: '/folders',       meta: ''},
+        {kind: 'page', icon: '◉', label: 'Watch',      href: '/watch',         meta: 'watchlists'},
+        {kind: 'page', icon: '☐', label: 'Queue',      href: '/queue',         meta: 'reading'},
+        {kind: 'page', icon: '✦', label: 'Apps',       href: '/applications',  meta: 'job apps'},
+        {kind: 'page', icon: '☼', label: 'Briefings',  href: '/briefings',     meta: 'pre-meeting'},
+        {kind: 'page', icon: '☼', label: 'Daily',      href: '/briefing',      meta: 'briefing'},
+        {kind: 'page', icon: '#', label: 'Queries',    href: '/queries',       meta: 'history'},
+        {kind: 'page', icon: '+', label: 'Ingest URL', href: '/ingest',        meta: ''},
     ];
 
     function open() {
@@ -930,37 +1068,75 @@ PALETTE_JS = r"""
 """
 
 
-def _layout(title: str, body: str, active: str = "") -> str:
-    nav_items = [
-        ("Overview", "/"),
-        ("Brief", "/brief"),
-        ("Chat", "/chat"),
-        ("Tasks", "/tasks"),
-        ("People", "/people"),
-        ("Health", "/health"),
-        ("Habits", "/habits"),
-        ("Journal", "/journal"),
-        ("Projects", "/projects"),
-        ("Drafts", "/drafts"),
-        ("Insights", "/insights"),
-        ("Memory", "/memory"),
-        ("Study", "/study/review"),
+# Primary nav — kept tight (6 items) so it doesn't wrap. Items with a
+# pending-state count get a [data-badge] span that JS populates from
+# /api/nav-counts on page load. Anything not on this short list lives
+# in the "More ▾" dropdown below or is reachable via ⌘K.
+_PRIMARY_NAV = [
+    # (label, href, badge_key) — badge_key=None means no count chip
+    ("Brief",    "/brief",    None),
+    ("Chat",     "/chat",     None),
+    ("Tasks",    "/tasks",    "tasks"),
+    ("Search",   "/search",   None),
+    ("Drafts",   "/drafts",   "drafts"),
+    ("Insights", "/insights", "insights"),
+]
+
+# Overflow nav — grouped by purpose so users can scan to the right
+# section instead of reading 25 alphabetical labels. Each tuple:
+# (group_title, [(label, href), ...]).
+_NAV_GROUPS = [
+    ("Personal", [
+        ("Habits",   "/habits"),
+        ("Journal",  "/journal"),
+        ("Health",   "/health"),
+        ("People",   "/people"),
+        ("Memory",   "/memory"),
+    ]),
+    ("Knowledge", [
+        ("Projects",  "/projects"),
+        ("Study",     "/study/review"),
         ("Snapshots", "/snapshots"),
-        ("Briefings", "/briefings"),
-        ("Queue", "/queue"),
-        ("Search", "/search"),
-        ("Watch", "/watch"),
-        ("Apps", "/applications"),
-        ("Graph", "/graph"),
-        ("Entities", "/entities"),
-        ("Folders", "/folders"),
-        ("Daily", "/briefing"),
-        ("Queries", "/queries"),
-        ("Ingest", "/ingest"),
-    ]
-    nav = "".join(
-        f'<a href="{href}" class="{"active" if href.split("/")[1] == active else ""}">{escape(name)}</a>'
-        for name, href in nav_items
+        ("Graph",     "/graph"),
+        ("Entities",  "/entities"),
+    ]),
+    ("Sources", [
+        ("Watch",      "/watch"),
+        ("Queue",      "/queue"),
+        ("Apps",       "/applications"),
+        ("Briefings",  "/briefings"),
+        ("Daily",      "/briefing"),
+    ]),
+    ("System", [
+        ("Overview",  "/"),
+        ("Folders",   "/folders"),
+        ("Queries",   "/queries"),
+        ("Ingest",    "/ingest"),
+    ]),
+]
+
+
+def _layout(title: str, body: str, active: str = "") -> str:
+    # Primary nav items — first slug after "/" is the active marker.
+    primary_html = "".join(
+        f'<a href="{href}" '
+        f'class="{"active" if href.split("/")[1] == active else ""}">'
+        f'{escape(name)}'
+        + (f'<span class="nav-badge" data-badge="{badge}"></span>'
+           if badge else "")
+        + '</a>'
+        for name, href, badge in _PRIMARY_NAV
+    )
+    # Overflow dropdown — grouped pages reached via "More ▾".
+    more_html = "".join(
+        '<div class="nav-more-group">'
+        f'<h4>{escape(title_g)}</h4>'
+        + "".join(
+            f'<a href="{href}">{escape(name)}</a>'
+            for name, href in items
+        )
+        + '</div>'
+        for title_g, items in _NAV_GROUPS
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -973,8 +1149,14 @@ def _layout(title: str, body: str, active: str = "") -> str:
 </head>
 <body>
     <header>
-        <div class="brand">second-brain</div>
-        <nav>{nav}</nav>
+        <div class="brand"><a href="/" style="color:inherit;">second-brain</a></div>
+        <nav>
+            {primary_html}
+            <details class="nav-more">
+                <summary>More ▾</summary>
+                <div class="nav-more-pop">{more_html}</div>
+            </details>
+        </nav>
         <div class="spacer"></div>
         <button class="kbd-hint" id="open-palette" title="Open command palette">
             <span>Search</span> <span class="kbd">⌘K</span>
@@ -995,6 +1177,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         </div>
     </div>
     <script>{PALETTE_JS}</script>
+    <script>{NAV_BADGES_JS}</script>
     <script>{CLICK_BEACON_JS}</script>
 </body>
 </html>
@@ -1451,8 +1634,64 @@ def create_app():
             )
         spend_html = "".join(spend_lines) or '<div class="muted">(no spend recorded yet)</div>'
 
+        # Launchpad: every page in the app, grouped by purpose. Lets
+        # the user reach anywhere from Overview without scanning a
+        # 25-item top nav. Counts (tasks/drafts/insights) get JS-
+        # populated badges via /api/nav-counts.
+        launchpad_groups = [
+            ("Today", [
+                ("Brief",     "/brief",         None),
+                ("Chat",      "/chat",          None),
+                ("Tasks",     "/tasks",         "tasks"),
+                ("Drafts",    "/drafts",        "drafts"),
+                ("Insights",  "/insights",      "insights"),
+                ("Search",    "/search",        None),
+            ]),
+            ("Personal", [
+                ("Habits",    "/habits",        None),
+                ("Journal",   "/journal",       None),
+                ("Health",    "/health",        None),
+                ("People",    "/people",        None),
+                ("Memory",    "/memory",        None),
+            ]),
+            ("Knowledge", [
+                ("Projects",  "/projects",      None),
+                ("Study",     "/study/review",  None),
+                ("Snapshots", "/snapshots",     None),
+                ("Graph",     "/graph",         None),
+                ("Entities",  "/entities",      None),
+                ("Folders",   "/folders",       None),
+            ]),
+            ("Sources & system", [
+                ("Watch",     "/watch",         None),
+                ("Queue",     "/queue",         None),
+                ("Apps",      "/applications",  None),
+                ("Briefings", "/briefings",     None),
+                ("Daily",     "/briefing",      None),
+                ("Queries",   "/queries",       None),
+                ("Ingest",    "/ingest",        None),
+            ]),
+        ]
+        launchpad_html = "".join(
+            '<div class="launchpad-group">'
+            f'<h3>{escape(title_g)}</h3>'
+            + "".join(
+                f'<a href="{href}">'
+                f'<span>{escape(name)}</span>'
+                + (f'<span class="meta nav-badge" data-badge="{badge}"></span>'
+                   if badge else "")
+                + '</a>'
+                for name, href, badge in items
+            )
+            + '</div>'
+            for title_g, items in launchpad_groups
+        )
+
         body = f"""
 <h1>Overview</h1>
+<section class="launchpad">
+    <div class="launchpad-grid">{launchpad_html}</div>
+</section>
 <div class="grid">
     <div class="card">
         <h2>Index</h2>
@@ -4436,6 +4675,40 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         _, conn, _, _ = get_state()
         log_click(conn, path, source, chunk_id=chunk_id)
         return {"ok": True}
+
+    @app.get("/api/nav-counts")
+    def api_nav_counts():
+        """Pending-state counts for the primary nav badges. Cheap —
+        three small reads against the read-only conn. Failures inside
+        any one count fall back to 0 so a missing schema (fresh brain)
+        doesn't break the nav."""
+        cfg, conn, _, _ = get_read_state()
+        out = {"tasks": 0, "drafts": 0, "insights": 0,
+               "urgent": {"drafts": False, "insights": False}}
+        # Open tasks
+        try:
+            from . import tasks as tasks_mod
+            out["tasks"] = len(tasks_mod.list_open(conn, limit=200))
+        except Exception:  # noqa: BLE001
+            pass
+        # Pending drafts
+        try:
+            from . import email_assist
+            n_drafts = len(email_assist.list_unsent_drafts(conn, limit=200))
+            out["drafts"] = n_drafts
+            # Drafts pile up faster than tasks; flag urgent past 5.
+            if n_drafts >= 5:
+                out["urgent"]["drafts"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        # Active (un-deduped) insights
+        try:
+            from . import synthesis
+            insights = synthesis.detect_insights(conn)
+            out["insights"] = len(insights)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     @app.get("/api/palette")
     def api_palette(q: str = ""):

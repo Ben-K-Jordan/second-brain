@@ -219,6 +219,128 @@ def test_svg_sparkline_handles_single_point():
     assert "<polyline" not in svg
 
 
+# ============================ Nav redesign (v3 round 5) ==============
+
+def test_primary_nav_is_six_items():
+    """The redesign caps the primary nav at 6 items so it doesn't
+    wrap. Verifying the constant directly so a future addition has
+    to think twice."""
+    from secondbrain.dashboard import _PRIMARY_NAV
+
+    assert len(_PRIMARY_NAV) == 6
+    labels = {item[0] for item in _PRIMARY_NAV}
+    # Daily-use anchor items must all be present.
+    assert {"Brief", "Chat", "Tasks", "Search", "Drafts", "Insights"} == labels
+
+
+def test_nav_groups_cover_all_pages():
+    """Every page that *was* in the old flat nav has to live somewhere
+    — primary, More dropdown, or launchpad. This test pins down the
+    invariant: nothing got dropped during the cut."""
+    from secondbrain.dashboard import _NAV_GROUPS, _PRIMARY_NAV
+
+    primary_hrefs = {item[1] for item in _PRIMARY_NAV}
+    overflow_hrefs = {
+        href for _g, items in _NAV_GROUPS for _name, href in items
+    }
+    must_be_reachable = {
+        "/", "/brief", "/chat", "/tasks", "/people", "/health",
+        "/habits", "/journal", "/projects", "/drafts", "/insights",
+        "/memory", "/study/review", "/snapshots", "/briefings",
+        "/queue", "/search", "/watch", "/applications", "/graph",
+        "/entities", "/folders", "/briefing", "/queries", "/ingest",
+    }
+    reachable = primary_hrefs | overflow_hrefs
+    missing = must_be_reachable - reachable
+    assert not missing, f"Pages dropped from nav: {missing}"
+
+
+def test_layout_renders_more_dropdown(client):
+    """The "More ▾" dropdown should show up on every page so the
+    overflow nav is always reachable."""
+    r = client.get("/brief")
+    assert r.status_code == 200
+    assert "nav-more" in r.text
+    assert "More" in r.text
+
+
+def test_layout_renders_badge_spans_for_pending_items(client):
+    """Tasks / Drafts / Insights all get badge spans in the markup
+    even when their count is zero — JS reveals them after fetch."""
+    r = client.get("/brief")
+    assert 'data-badge="tasks"' in r.text
+    assert 'data-badge="drafts"' in r.text
+    assert 'data-badge="insights"' in r.text
+
+
+def test_layout_includes_nav_badges_js(client):
+    """The page should ship the JS that populates badges on load."""
+    r = client.get("/brief")
+    assert "/api/nav-counts" in r.text
+    assert "data-badge" in r.text
+
+
+# ============================ /api/nav-counts =========================
+
+def test_api_nav_counts_returns_zero_on_empty_brain(client):
+    """A brain with no tasks, drafts, or insights should report
+    all-zero counts without crashing."""
+    r = client.get("/api/nav-counts")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["tasks"] == 0
+    assert data["drafts"] == 0
+    assert data["insights"] == 0
+    assert data["urgent"]["drafts"] is False
+
+
+def test_api_nav_counts_reflects_open_tasks(client):
+    """Adding a task bumps the tasks count immediately."""
+    client.post("/tasks/add", data={"text": "ping the nav-counts test"})
+    r = client.get("/api/nav-counts")
+    assert r.status_code == 200
+    assert r.json()["tasks"] >= 1
+
+
+# ============================ Overview launchpad ======================
+
+def test_overview_renders_launchpad(client):
+    """The Overview page should now include the launchpad grid that
+    links to every page grouped by purpose."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert 'class="launchpad' in r.text
+    # All four group headings appear
+    for group in ("Today", "Personal", "Knowledge", "Sources"):
+        assert group in r.text
+
+
+def test_overview_launchpad_links_to_every_section(client):
+    """Quick spot-check: at least one link from each launchpad group
+    should be present in the rendered HTML."""
+    r = client.get("/")
+    for href in ("/brief", "/habits", "/snapshots", "/watch"):
+        assert f'href="{href}"' in r.text
+
+
+# ============================ Palette pages ==========================
+
+def test_palette_js_includes_recent_pages():
+    """The ⌘K palette's STATIC_PAGES list should now reach every
+    user-visible page — not just the 7 the original palette had."""
+    from secondbrain.dashboard import PALETTE_JS
+
+    # All these pages were missing from the old static list.
+    for label in (
+        "Brief", "Chat", "Tasks", "Drafts", "Insights",
+        "Habits", "Journal", "Health", "People", "Memory",
+        "Projects", "Study", "Snapshots",
+    ):
+        assert f"label: '{label}'" in PALETTE_JS, (
+            f"Palette missing page: {label}"
+        )
+
+
 def test_svg_sparkline_handles_empty():
     from secondbrain.dashboard import _svg_sparkline
     assert _svg_sparkline([], width=100, height=20) == ""
