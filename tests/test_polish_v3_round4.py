@@ -99,12 +99,24 @@ def test_email_classifier_rejects_garbage_local_label(tmp_cfg, monkeypatch):
 
 
 def test_email_drafter_falls_back_to_local(tmp_cfg, monkeypatch):
+    """Round-6 update: the structured drafter expects JSON output. A
+    capable local model that returns valid JSON gives us a real
+    DraftOutput; less-capable ones return None and the caller skips."""
+    import json as _json
+
     from secondbrain import email_assist, local_llm
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    payload = _json.dumps({
+        "primary": "Tomorrow works for me — let's say 2pm.",
+        "alternative": "Tomorrow at 2pm sounds great!",
+        "reasoning": "Casual scheduling reply.",
+        "confidence": 0.7,
+        "open_questions": [],
+    })
     fake_out = local_llm.LocalCompletion(
-        text="Hi! Thanks for the note — I'll get back to you tomorrow.",
-        model="llama3.1", prompt_tokens=200, completion_tokens=20,
+        text=payload,
+        model="llama3.1", prompt_tokens=200, completion_tokens=80,
     )
     with patch.object(local_llm, "is_available", return_value=True), \
          patch.object(local_llm, "complete", return_value=fake_out):
@@ -112,7 +124,9 @@ def test_email_drafter_falls_back_to_local(tmp_cfg, monkeypatch):
             from_="x@y", subject="hello", body="when do you have time?",
             style_samples="", user_name="Ben", cfg=tmp_cfg,
         )
-    assert "tomorrow" in out
+    assert out is not None
+    assert "Tomorrow" in out.primary
+    assert "Tomorrow at 2pm" in out.alternative
 
 
 def test_chat_local_fallback_helper_returns_response(

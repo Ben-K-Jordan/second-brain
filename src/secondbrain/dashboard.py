@@ -4379,6 +4379,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.get("/drafts", response_class=HTMLResponse)
     def drafts_view():
         from . import email_assist
+        from .safety import redact_text as _redact
 
         cfg, conn, _, _ = get_state()
         drafts = email_assist.list_unsent_drafts(conn)
@@ -4397,20 +4398,111 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             when = time.strftime(
                 "%Y-%m-%d %H:%M", time.localtime(d.generated_at),
             )
+
+            # Round 6: rich metadata block when the structured drafter
+            # ran. Old single-version drafts skip the meta + alt sections
+            # cleanly because the fields are None / empty.
+            meta_html = ""
+            if d.analysis is not None:
+                a = d.analysis
+                tone = ", ".join(a.tone_signals) or "neutral"
+                points_html = "".join(
+                    f"<li>{escape(_redact(p))}</li>"
+                    for p in a.key_points
+                ) or "<li class='muted'>(none)</li>"
+                meta_html = (
+                    f'<div class="meta-row" style="display:flex;gap:18px;'
+                    f'flex-wrap:wrap;font-size:12px;color:var(--text-2);'
+                    f'margin:4px 0 12px;">'
+                    f'<span><span class="muted">intent:</span> {escape(a.intent)}</span>'
+                    f'<span><span class="muted">to:</span> {escape(a.sender_relationship)}</span>'
+                    f'<span><span class="muted">tone:</span> {escape(tone)}</span>'
+                    f'<span><span class="muted">length:</span> {escape(a.length_target)}</span>'
+                    + (f'<span><span class="muted">conf:</span> '
+                       f'{d.confidence:.0%}</span>' if d.confidence else '')
+                    + f'</div>'
+                    f'<details style="margin:6px 0;font-size:12px;">'
+                    f'<summary class="muted">sender asked for…</summary>'
+                    f'<ul style="margin:6px 0 0 0;">{points_html}</ul>'
+                    f'</details>'
+                )
+
+            # Reasoning bubble — short LLM explanation of choices.
+            reasoning_html = ""
+            if d.reasoning:
+                reasoning_html = (
+                    f'<details style="margin:8px 0;font-size:12px;">'
+                    f'<summary class="muted">why this draft</summary>'
+                    f'<p style="margin:6px 0 0 0;color:var(--text-2);">'
+                    f'{escape(_redact(d.reasoning))}</p>'
+                    f'</details>'
+                )
+
+            # Open questions checklist — explicit TODOs the user has to
+            # decide before sending. Rendered as a checkbox list so the
+            # user can mentally tick them off as they fill placeholders.
+            todos_html = ""
+            if d.open_questions:
+                todos_html = (
+                    '<div class="card" style="background:rgba(255,183,0,0.05);'
+                    'border-color:var(--amber);margin:8px 0;padding:8px 12px;">'
+                    '<div class="muted" style="font-size:11px;'
+                    'text-transform:uppercase;letter-spacing:0.05em;'
+                    'margin-bottom:4px;">Decide before sending</div>'
+                    + '<ul style="margin:0;padding-left:18px;">'
+                    + "".join(
+                        f'<li>{escape(_redact(q))}</li>'
+                        for q in d.open_questions
+                    )
+                    + '</ul></div>'
+                )
+
+            # Primary draft block + (optional) alternative-tone version
+            # in a side-by-side fold-out. Use <details> so users with
+            # the right tone-match on the primary don't have to look
+            # at the alternative.
+            primary_html = (
+                f'<div class="muted" style="font-size:11px;'
+                f'text-transform:uppercase;letter-spacing:0.05em;'
+                f'margin:12px 0 4px;">Primary</div>'
+                f'<pre style="white-space:pre-wrap;font-family:inherit;'
+                f'margin:0;background:var(--bg-input);padding:10px;'
+                f'border-radius:var(--r);border:1px solid var(--border-strong);">'
+                f'{escape(_redact(d.draft_text))}</pre>'
+            )
+            alt_html = ""
+            if d.alternative_text and d.alternative_text != d.draft_text:
+                alt_html = (
+                    f'<details style="margin-top:8px;">'
+                    f'<summary class="muted" style="font-size:11px;'
+                    f'text-transform:uppercase;letter-spacing:0.05em;'
+                    f'cursor:pointer;">Alternative tone</summary>'
+                    f'<pre style="white-space:pre-wrap;font-family:inherit;'
+                    f'margin:6px 0 0 0;background:var(--bg-input);padding:10px;'
+                    f'border-radius:var(--r);border:1px solid var(--border-strong);">'
+                    f'{escape(_redact(d.alternative_text))}</pre>'
+                    f'</details>'
+                )
+
             items.append(
                 f'<div class="card" style="margin-bottom:12px;">'
-                f'<div class="stat"><strong>Draft #{d.id}</strong>'
-                f'<span class="v muted">{when}</span></div>'
-                f'<pre style="white-space:pre-wrap;font-family:inherit;'
-                f'margin:8px 0;background:#f8f8f8;padding:8px;'
-                f'border-radius:4px;">{escape(d.draft_text)}</pre>'
+                f'<div class="stat" style="border-bottom:none;padding-bottom:0;">'
+                f'<strong>Draft #{d.id}</strong>'
+                f'<span class="v muted">{when}</span>'
+                f'</div>'
+                f'{meta_html}'
+                f'{todos_html}'
+                f'{primary_html}'
+                f'{alt_html}'
+                f'{reasoning_html}'
+                f'<div style="margin-top:12px;">'
                 f'<form method="post" action="/drafts/{d.id}/sent" '
                 f'style="display:inline;margin-right:8px;">'
                 f'<button type="submit">Mark sent</button></form>'
                 f'<form method="post" action="/drafts/{d.id}/discard" '
                 f'style="display:inline;">'
                 f'<button type="submit" class="link-btn">Discard</button>'
-                f'</form>'
+                f'</form></div>'
                 f'</div>',
             )
         body = (
