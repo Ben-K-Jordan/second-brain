@@ -414,6 +414,31 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: take_snapshot_if_due(cfg, conn),
     ))
 
+    # Phase 65: people backfill — promote PERSON entities into the
+    # people table when they cross the 2-mention threshold. Runs
+    # every 6h so newly-mentioned humans get profiles within a day
+    # without us re-scanning the entities table on every brief.
+    from .people import (
+        clear_alias_cache as _people_clear_cache,
+    )
+    from .people import (
+        materialize_from_entities as _people_backfill,
+    )
+
+    def _people_backfill_job(conn):
+        n = _people_backfill(conn)
+        # Invalidate the alias-matcher cache when new aliases land
+        # so the next link_chunk_mentions sees them.
+        if n:
+            _people_clear_cache()
+        return n
+
+    sched.register(Job(
+        name="people_backfill",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=6),
+        fn=_people_backfill_job,
+    ))
+
     return sched
 
 

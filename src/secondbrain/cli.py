@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -87,6 +88,241 @@ def init() -> None:
             "    - Set VOYAGE_API_KEY for the API embedder, or\n"
             "    - Run `pip install -e .[local]` for the local fallback."
         )
+
+
+def _update_toml_keys(text: str, updates: dict[str, str]) -> str:
+    """Rewrite a flat TOML config so the listed keys carry the new
+    values. Keys that don't exist in the source get appended at the end
+    so we never silently drop a user's selection. Quoting is the
+    caller's responsibility — pass already-formatted TOML literals
+    (`'"foo"'`, `"true"`, `"42"`).
+
+    Deliberately string-based rather than via tomli_w because the
+    config has rich comments we want to preserve verbatim.
+    """
+    import re as _re
+
+    out = text
+    for key, val in updates.items():
+        pat = _re.compile(
+            rf"^(\s*){_re.escape(key)}\s*=.*$", _re.MULTILINE,
+        )
+        if pat.search(out):
+            out = pat.sub(rf"\1{key} = {val}", out, count=1)
+        else:
+            if not out.endswith("\n"):
+                out += "\n"
+            out += f"{key} = {val}\n"
+    return out
+
+
+def _toml_str(s: str) -> str:
+    """Quote a string for TOML — escapes backslashes + quotes."""
+    s2 = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s2}"'
+
+
+def _toml_str_list(items: list[str]) -> str:
+    """Format a list of strings as a TOML array."""
+    if not items:
+        return "[]"
+    inner = ", ".join(_toml_str(x) for x in items)
+    return f"[{inner}]"
+
+
+def _suggest_watched_folders() -> list[Path]:
+    """Walk the most-likely watch targets in the user's home and return
+    the ones that actually exist. Cross-platform safe — Windows users
+    get OneDrive\\Documents, macOS / Linux users skip it silently."""
+    home = Path.home()
+    candidates = [
+        home / "Documents",
+        home / "Desktop",
+        home / "Downloads",
+        home / "OneDrive" / "Documents",
+        home / "Notes",
+    ]
+    return [p for p in candidates if p.is_dir()]
+
+
+@app.command()
+def setup() -> None:
+    """Interactive onboarding wizard.
+
+    Walks a first-time user through the choices that actually matter:
+    embedder credentials, at-least-one watched folder, daily-brief
+    email if they want it, and an optional bootstrap index. Idempotent
+    — re-run any time to tweak settings; existing config keys are
+    updated in place rather than overwritten.
+    """
+    cfg = load_config()
+    write_default_config(cfg)
+    console.print()
+    console.print("[bold cyan]second-brain setup[/]")
+    console.print(f"Data directory: [cyan]{cfg.data_dir}[/]")
+    console.print(f"Config: [cyan]{cfg.config_path}[/]")
+    console.print()
+
+    updates: dict[str, str] = {}
+
+    # ---- Step 1: embedder ------------------------------------------------
+    console.print("[bold]1. Embedder[/]")
+    if cfg.voyage_api_key or os.environ.get("VOYAGE_API_KEY"):
+        console.print(
+            "  [green]✓[/] VOYAGE_API_KEY detected — using Voyage "
+            f"({cfg.voyage_model}).",
+        )
+    else:
+        console.print(
+            "  [yellow]No VOYAGE_API_KEY set.[/] Voyage gives the best "
+            "retrieval quality (~$0.05 / 1M tokens; free tier covers "
+            "most personal use).",
+        )
+        console.print("  Get one at https://voyageai.com")
+        console.print(
+            "  Set it in your shell: "
+            "[cyan]setx VOYAGE_API_KEY \"...\"[/] (Windows) "
+            "or [cyan]export VOYAGE_API_KEY=...[/] (mac/linux),",
+        )
+        console.print(
+            "  then re-run setup. Or skip: the local fallback works "
+            "with [cyan]pip install -e .[local][/].",
+        )
+    console.print()
+
+    # ---- Step 2: Anthropic (optional but high-value) --------------------
+    console.print("[bold]2. AI features (chat, briefings, HyDE)[/]")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        console.print(
+            "  [green]✓[/] ANTHROPIC_API_KEY detected — chat / briefings "
+            "/ HyDE will work out of the box.",
+        )
+    else:
+        console.print(
+            "  [yellow]No ANTHROPIC_API_KEY set.[/] Without it, the "
+            "core ingest + search still work, but `ask`, `chat`, "
+            "and the daily brief polish pass are disabled.",
+        )
+        console.print("  Get one at https://console.anthropic.com")
+    console.print()
+
+    # ---- Step 3: watched folders ----------------------------------------
+    console.print("[bold]3. Watched folders[/]")
+    if cfg.watched_folders:
+        console.print(
+            "  [green]✓[/] Already watching: "
+            + ", ".join(str(p) for p in cfg.watched_folders),
+        )
+        if typer.confirm("  Edit the watched-folder list?", default=False):
+            cfg.watched_folders = []
+    if not cfg.watched_folders:
+        suggested = _suggest_watched_folders()
+        chosen: list[Path] = []
+        for p in suggested:
+            if typer.confirm(f"  Watch {p}?", default=False):
+                chosen.append(p)
+        while True:
+            extra = typer.prompt(
+                "  Any other folder to watch? (path or empty to skip)",
+                default="", show_default=False,
+            ).strip()
+            if not extra:
+                break
+            ep = Path(extra).expanduser()
+            if not ep.exists():
+                console.print(f"  [yellow]Skipped — {ep} doesn't exist.[/]")
+                continue
+            chosen.append(ep)
+        if chosen:
+            updates["watched_folders"] = _toml_str_list(
+                [str(p) for p in chosen],
+            )
+            cfg.watched_folders = chosen
+            console.print(
+                f"  [green]✓[/] Will watch {len(chosen)} folder(s).",
+            )
+        else:
+            console.print(
+                "  [yellow]No folders selected.[/] You can index "
+                "ad-hoc via [cyan]secondbrain index <path>[/], or "
+                "edit watched_folders in the config later.",
+            )
+    console.print()
+
+    # ---- Step 4: daily brief --------------------------------------------
+    console.print("[bold]4. Daily brief email (optional)[/]")
+    if typer.confirm(
+        "  Email yourself a morning brief? (calendar + tasks + queue)",
+        default=False,
+    ):
+        send_time = typer.prompt(
+            "  Send time (local, HH:MM)", default="07:00",
+        ).strip()
+        smtp_host = typer.prompt(
+            "  SMTP host", default="smtp.gmail.com",
+        ).strip()
+        smtp_user = typer.prompt(
+            "  SMTP username (your sending email)", default="",
+        ).strip()
+        recipients = typer.prompt(
+            "  Recipient(s), comma-separated", default=smtp_user or "",
+        ).strip()
+        updates["daily_brief_enabled"] = "true"
+        updates["daily_brief_send_time"] = _toml_str(send_time)
+        updates["digest_smtp_host"] = _toml_str(smtp_host)
+        updates["digest_smtp_user"] = _toml_str(smtp_user)
+        updates["digest_to"] = _toml_str(recipients)
+        console.print(
+            "  [green]✓[/] Daily brief enabled. Set the SMTP password "
+            "with [cyan]setx SECONDBRAIN_SMTP_PASSWORD \"...\"[/] "
+            "(Gmail: use an app password from "
+            "https://myaccount.google.com/apppasswords).",
+        )
+    else:
+        console.print("  [dim](skipped)[/]")
+    console.print()
+
+    # ---- Persist + final next-steps -------------------------------------
+    if updates:
+        text = cfg.config_path.read_text(encoding="utf-8")
+        new_text = _update_toml_keys(text, updates)
+        cfg.config_path.write_text(new_text, encoding="utf-8")
+        console.print(
+            f"[green]✓[/] Wrote {len(updates)} setting(s) to "
+            f"[cyan]{cfg.config_path}[/]",
+        )
+
+    # ---- Step 5: bootstrap index now ------------------------------------
+    cfg = load_config()  # re-read so watched_folders reflects edits
+    if cfg.watched_folders and typer.confirm(
+        "\nIndex your watched folders now? (you can also do this "
+        "later via `secondbrain daemon`)",
+        default=True,
+    ):
+        for folder in cfg.watched_folders:
+            console.print(f"\n[cyan]→ Indexing {folder}…[/]")
+            try:
+                conn, embedder = _open_state(cfg)
+                result = index_folder(cfg, conn, embedder, folder)
+                console.print(
+                    f"  [green]✓[/] {result.files_indexed} files, "
+                    f"{result.chunks_indexed} chunks "
+                    f"({result.files_skipped} skipped).",
+                )
+                conn.close()
+            except Exception as e:  # noqa: BLE001
+                console.print(f"  [red]✗ {type(e).__name__}: {e}[/]")
+                console.print(
+                    "  [dim]Continuing — you can retry this folder later.[/]",
+                )
+
+    console.print()
+    console.print("[bold green]Setup complete.[/]")
+    console.print("Try:")
+    console.print("  [cyan]secondbrain status[/]            — see what's indexed")
+    console.print("  [cyan]secondbrain search 'query'[/]    — search your brain")
+    console.print("  [cyan]secondbrain daemon[/]            — run continuously")
+    console.print("  [cyan]secondbrain dashboard[/]         — web UI on localhost")
 
 
 @app.command()
@@ -391,6 +627,53 @@ def index(
     conn.close()
 
 
+_RELATIVE_DATE_RE = re.compile(
+    r"^\s*(\d+)\s+(day|week|month|year)s?\s+ago\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_as_of(raw: str) -> float | None:
+    """Parse `--as-of` user input into a unix timestamp.
+
+    Accepts:
+      - 'YYYY-MM-DD'
+      - 'YYYY-MM-DDTHH:MM:SS'
+      - relative: 'N days ago', 'N weeks ago', 'N months ago', 'N years ago'
+      - 'yesterday', 'last week', 'last month', 'last year'
+
+    Returns None when the string isn't recognised. Months / years are
+    approximated (30 / 365 days) — close enough for "what did I know
+    around then" semantics.
+    """
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    now = time.time()
+    if s == "yesterday":
+        return now - 86400
+    if s == "last week":
+        return now - 7 * 86400
+    if s == "last month":
+        return now - 30 * 86400
+    if s == "last year":
+        return now - 365 * 86400
+    m = _RELATIVE_DATE_RE.match(s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        days = {"day": 1, "week": 7, "month": 30, "year": 365}[unit]
+        return now - n * days * 86400
+    # ISO date / datetime
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return _dt.strptime(raw.strip(), fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Query string."),
@@ -404,6 +687,16 @@ def search(
     folder: str = typer.Option(None, "--folder", help="Restrict to files under a path prefix."),
     kind: str = typer.Option(None, "--kind", help="Restrict to a kind: document/code/audio_video/image/url."),
     since_days: int = typer.Option(None, "--since-days", help="Restrict to files modified in the last N days."),
+    as_of: str = typer.Option(
+        None, "--as-of",
+        help="Phase 87 temporal query: 'YYYY-MM-DD' or relative like '6 months ago' / "
+             "'last week'. Filters to files that existed at the closest "
+             "preceding weekly snapshot.",
+    ),
+    show_summary: bool = typer.Option(
+        True, "--summary/--no-summary",
+        help="Render auto-summary TL;DR (Phase 74) above each hit.",
+    ),
 ) -> None:
     """Search the index from the command line."""
     cfg = load_config()
@@ -412,6 +705,22 @@ def search(
     a = alpha if alpha is not None else cfg.hybrid_alpha
     # If the user pinned alpha explicitly via --alpha, skip adaptive override.
     use_adaptive = cfg.adaptive_alpha and alpha is None
+    as_of_ts = None
+    if as_of:
+        as_of_ts = _parse_as_of(as_of)
+        if as_of_ts is None:
+            console.print(
+                f"[yellow]Couldn't parse --as-of {as_of!r}. "
+                f"Try 'YYYY-MM-DD' or '6 months ago'.[/]",
+            )
+            conn.close()
+            raise typer.Exit(code=1)
+        from datetime import datetime as _dt
+        when_str = _dt.fromtimestamp(as_of_ts).strftime("%Y-%m-%d")
+        console.print(
+            f"[dim]Filtering to files known to the brain on or before "
+            f"{when_str}.[/]",
+        )
     results = hybrid_search(
         conn, embedder, query, k=k, alpha=a,
         reranker=reranker, rerank_overfetch=cfg.rerank_overfetch,
@@ -430,13 +739,34 @@ def search(
         click_boost_max=cfg.click_boost_max if cfg.click_boost_enabled else 1.0,
         click_boost_half_life_days=cfg.click_boost_half_life_days,
         cfg=cfg,
+        as_of_ts=as_of_ts,
     )
     if not results:
         console.print("[yellow]No matches.[/]")
         return
+    # Phase 74 hookup: lazy-fetch summaries for each result's file
+    # in one query so the loop below can render TL;DRs alongside.
+    summary_by_path: dict[str, str] = {}
+    if show_summary:
+        try:
+            paths = list({r.file_path for r in results})
+            placeholders = ",".join("?" * len(paths))
+            sum_rows = conn.execute(
+                f"SELECT f.path, s.tldr FROM doc_summaries s "
+                f"JOIN files f ON f.id = s.file_id "
+                f"WHERE f.path IN ({placeholders})",
+                paths,
+            ).fetchall()
+            summary_by_path = {r["path"]: r["tldr"] for r in sum_rows}
+        except Exception:  # noqa: BLE001
+            pass
+
     for i, r in enumerate(results, 1):
         tag = "reranked" if r.reranked else "+".join(r.sources)
         console.rule(f"[bold]{i}.[/] {r.file_path}  [dim](chunk {r.chunk_index} | {tag} | {r.score:.4f})")
+        tldr = summary_by_path.get(r.file_path)
+        if tldr:
+            console.print(f"[italic dim]TL;DR: {tldr}[/]\n")
         console.print(r.text if len(r.text) <= 1200 else r.text[:1200] + "...")
     conn.close()
 

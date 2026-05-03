@@ -346,6 +346,7 @@ def hybrid_search(
     click_boost_max: float = 1.0,
     click_boost_half_life_days: float = 14.0,
     cfg: Config | None = None,
+    as_of_ts: float | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search and return up to k merged results.
 
@@ -515,7 +516,44 @@ def hybrid_search(
                 start_offset=start_offset,
             )
         )
+    if as_of_ts is not None:
+        results = _filter_by_snapshot(conn, results, as_of_ts)
     return results
+
+
+def _filter_by_snapshot(
+    conn: sqlite3.Connection,
+    results: list[SearchResult],
+    as_of_ts: float,
+) -> list[SearchResult]:
+    """Phase 87 — restrict the result set to files that existed at
+    the snapshot closest to ``as_of_ts``.
+
+    No-op when no snapshot covers that horizon (we'd rather return
+    too much than nothing). Uses the snapshot's file_id set as a
+    membership filter on the result paths' file ids.
+    """
+    try:
+        from .memory import snapshot_at
+    except ImportError:
+        return results
+    snap = snapshot_at(conn, as_of_ts)
+    if snap is None:
+        return results
+    if not results:
+        return results
+    paths = {r.file_path for r in results}
+    placeholders = ",".join("?" * len(paths))
+    rows = conn.execute(
+        f"SELECT id, path FROM files WHERE path IN ({placeholders})",
+        list(paths),
+    ).fetchall()
+    fid_by_path = {r["path"]: int(r["id"]) for r in rows}
+    snap_ids = snap.file_ids
+    return [
+        r for r in results
+        if fid_by_path.get(r.file_path) in snap_ids
+    ]
 
 
 def vector_only(

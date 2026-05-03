@@ -183,6 +183,15 @@ class GapLine:
 
 
 @dataclass
+class ProjectClusterLine:
+    """Phase 73 — auto-detected cluster the brief surfaces."""
+    suggested_name: str
+    seed_title: str
+    n_members: int
+    score: float
+
+
+@dataclass
 class DailyBrief:
     """The whole morning brief in one structured object."""
     generated_at: float
@@ -202,6 +211,9 @@ class DailyBrief:
     email: EmailTriageLine | None = None                         # Phase 82
     knowledge_gaps: list[GapLine] = field(default_factory=list)  # Phase 68
     pending_email_drafts: int = 0                                # Phase 83
+    project_clusters: list[ProjectClusterLine] = field(          # Phase 73
+        default_factory=list,
+    )
 
 
 @dataclass
@@ -237,6 +249,7 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         email=_email_section(conn),
         knowledge_gaps=_gaps_section(conn),
         pending_email_drafts=_pending_drafts_count(conn),
+        project_clusters=_project_clusters_section(conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -355,6 +368,35 @@ def _gaps_section(conn: sqlite3.Connection) -> list[GapLine]:
     return [GapLine(gap_id=g.id, question=g.question) for g in gaps]
 
 
+def _project_clusters_section(
+    conn: sqlite3.Connection,
+) -> list[ProjectClusterLine]:
+    """Phase 73 hookup — top auto-detected project clusters from
+    the backlinks graph. Capped at 3 to keep the brief tight; the
+    detector itself is bounded by min_cluster_size = 3 so we don't
+    surface noise."""
+    try:
+        from . import synthesis
+    except ImportError:
+        return []
+    try:
+        clusters = synthesis.detect_project_clusters(
+            conn, max_clusters=3, min_size=3,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: project clusters failed: %s", e)
+        return []
+    return [
+        ProjectClusterLine(
+            suggested_name=c.suggested_name,
+            seed_title=c.seed_title,
+            n_members=len(c.member_paths),
+            score=c.score,
+        )
+        for c in clusters
+    ]
+
+
 def _pending_drafts_count(conn: sqlite3.Connection) -> int:
     """Phase 83 — count of email drafts awaiting your review."""
     try:
@@ -383,7 +425,8 @@ def _has_actionable_content(brief: DailyBrief) -> bool:
         or brief.insights
         or (brief.email and brief.email.urgent)
         or brief.pending_email_drafts
-        or brief.knowledge_gaps,
+        or brief.knowledge_gaps
+        or brief.project_clusters,
     )
 
 
@@ -777,6 +820,8 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_queue(brief.queue_top)
     if brief.watchlist_highlights:
         yield _render_watchlist(brief.watchlist_highlights)
+    if brief.project_clusters:
+        yield _render_project_clusters(brief.project_clusters)
     if brief.knowledge_gaps:
         yield _render_gaps(brief.knowledge_gaps)
     if brief.habits:
@@ -929,6 +974,21 @@ def _render_email(email: EmailTriageLine, n_drafts: int) -> str:
         out.append(
             f"- ✉️ **{n_drafts} draft(s) awaiting review** "
             f"_(`secondbrain drafts list`)_",
+        )
+    return "\n".join(out)
+
+
+def _render_project_clusters(items: list[ProjectClusterLine]) -> str:
+    """Phase 73 — auto-detected project clusters from the backlinks
+    graph. We surface these as candidate working sets the user might
+    want to formalise (give a real name, pin to dashboard, etc.)."""
+    out = ["## Possible projects forming", "",
+           "_Recently-clustered docs that look like a working set:_",
+           ""]
+    for c in items:
+        name = c.suggested_name or c.seed_title
+        out.append(
+            f"- **{name}** — {c.n_members} docs around _{c.seed_title}_",
         )
     return "\n".join(out)
 

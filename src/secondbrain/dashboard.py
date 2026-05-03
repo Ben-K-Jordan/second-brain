@@ -997,13 +997,20 @@ def _layout(title: str, body: str, active: str = "") -> str:
 """
 
 
-def _result_block(r, source_label: str = "search") -> str:
+def _result_block(
+    r, source_label: str = "search", *, tldr: str | None = None,
+) -> str:
     sources = "+".join(r.sources) if r.sources else "rerank"
     age = ""
     if r.mtime is not None:
         days = (time.time() - r.mtime) / 86400
         age = f" · {days:.1f}d ago"
-    snippet = escape(r.text if len(r.text) <= 1500 else r.text[:1500] + "…")
+    # Phase 88 polish: snippet preview goes through redact so SSNs /
+    # API keys / JWTs don't render to the dashboard.
+    from .safety import redact_text as _redact
+    snippet = escape(_redact(
+        r.text if len(r.text) <= 1500 else r.text[:1500] + "…",
+    ))
     # data-* attributes drive the click-feedback beacon. The JS in CLICK_JS
     # listens for clicks anywhere inside .result and POSTs /api/click with
     # the path/chunk_id; subsequent searches lift recently-opened paths.
@@ -1013,10 +1020,18 @@ def _result_block(r, source_label: str = "search") -> str:
         f'data-sb-chunk="{r.chunk_id}" data-sb-source="{escape(source_label)}">'
         f"{escape(r.file_path)}</a>"
     )
+    # Phase 74: TL;DR rendered as a one-line italic above the snippet
+    # when present. Conditional so we don't waste vertical space on
+    # docs without summaries.
+    tldr_html = (
+        f'<div class="tldr"><em>TL;DR:</em> {escape(tldr)}</div>'
+        if tldr else ""
+    )
     return f"""
 <article class="result">
     <h3>{file_link}</h3>
     <div class="meta">chunk {r.chunk_index} · {sources}{age} · score {r.score:.4f}</div>
+    {tldr_html}
     <div class="snippet">{snippet}</div>
 </article>"""
 
@@ -1514,7 +1529,28 @@ def create_app():
                 cfg=cfg,
             )
             if results:
-                results_html = "".join(_result_block(r) for r in results)
+                # Phase 74: lazy-fetch TL;DRs for the result paths so
+                # each block can render its summary preview without a
+                # separate per-block query.
+                summary_by_path: dict[str, str] = {}
+                try:
+                    paths = list({r.file_path for r in results})
+                    placeholders = ",".join("?" * len(paths))
+                    sum_rows = conn.execute(
+                        f"SELECT f.path, s.tldr FROM doc_summaries s "
+                        f"JOIN files f ON f.id = s.file_id "
+                        f"WHERE f.path IN ({placeholders})",
+                        paths,
+                    ).fetchall()
+                    summary_by_path = {
+                        r["path"]: r["tldr"] for r in sum_rows
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
+                results_html = "".join(
+                    _result_block(r, tldr=summary_by_path.get(r.file_path))
+                    for r in results
+                )
             else:
                 results_html = '<div class="empty">No matches.</div>'
 
