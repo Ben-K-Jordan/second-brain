@@ -281,6 +281,32 @@ def stream_chat(
     # back to the search-grounded brain prompt.
     active_system_prompt = (system_prompt or "").strip() or _SYSTEM_PROMPT
 
+    # Phase 86: cross-conversation memory recall. Pull the top-K
+    # memories most relevant to the user's current message and prepend
+    # to the system prompt so the agent has context from prior chats
+    # without having to search for it. We stash the surfaced ids on
+    # stream_chat itself so the post-stream ``mark_referenced`` (in
+    # ask_brain) can bump usage counts. Best-effort — failures don't
+    # block the chat.
+    surfaced_memory_ids: list[int] = []
+    try:
+        from .memory import most_relevant_memories, render_memories_for_prompt
+        relevant = most_relevant_memories(conn, user_message, k=8)
+        if relevant:
+            surfaced_memory_ids = [m.id for m in relevant]
+            memory_block = render_memories_for_prompt(relevant)
+            if memory_block:
+                active_system_prompt = (
+                    f"{active_system_prompt}\n\n{memory_block}"
+                )
+    except Exception as e:  # noqa: BLE001
+        log.warning("memory: recall failed: %s", e)
+    # Stash for ask_brain's post-stream mark_referenced call. Module-
+    # attribute is the cheapest cross-call channel — alternative
+    # would be threading a return value through stream_chat's event
+    # protocol, which is overkill for an audit signal.
+    stream_chat._last_memory_ids = surfaced_memory_ids  # type: ignore[attr-defined]
+
     # Build the tool list. search_brain is always available; web_search is
     # opt-in (cfg.web_search_enabled). The web_search tool is server-side -
     # Anthropic executes it and returns results inline; we don't run anything

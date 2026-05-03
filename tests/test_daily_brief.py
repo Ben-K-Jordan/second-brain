@@ -890,3 +890,263 @@ def test_minimal_md_to_html_escapes_special_characters():
     assert "&amp;" in html
     # Raw special chars should NOT have escaped through.
     assert "a < b" not in html
+
+
+# ============== Polish v3: integration with new phases ===============
+
+def test_brief_renders_habits_section(fresh_db):
+    """Phase 79 hookup — habits with current streak appear in the brief."""
+    from datetime import date, timedelta
+
+    from secondbrain import personal
+    from secondbrain.daily_brief import _habits_section
+
+    hid = personal.add_habit(fresh_db, "Workout", cadence="daily")
+    today = date.today()
+    for i in range(3):
+        personal.checkin(
+            fresh_db, hid, when=today - timedelta(days=i),
+        )
+    out = _habits_section(fresh_db)
+    assert len(out) == 1
+    assert out[0].name == "Workout"
+    assert out[0].streak_days == 3
+
+
+def test_brief_renders_goals_section(fresh_db):
+    from secondbrain import personal
+    from secondbrain.daily_brief import _goals_section
+
+    personal.add_goal(
+        fresh_db, "Apply to jobs", target_per_week=5,
+    )
+    out = _goals_section(fresh_db)
+    assert len(out) == 1
+    assert out[0].name == "Apply to jobs"
+    assert out[0].target_per_week == 5
+    assert out[0].on_track is False  # 0/5
+
+
+def test_brief_renders_email_section(fresh_db):
+    """Phase 82 hookup — triage counts surface as a brief section."""
+    from secondbrain import email_assist
+    from secondbrain.daily_brief import _email_section
+
+    # Seed classifications directly (bypassing classify_one which
+    # needs chunks). The brief only reads from email_classifications,
+    # so this is the unit under test.
+    email_assist._ensure_schema(fresh_db)
+    for i, label in enumerate(["urgent", "urgent", "newsletter"]):
+        cur = fresh_db.execute(
+            "INSERT INTO files(path, mtime, size, kind, indexed_at) "
+            "VALUES (?, ?, 1, 'url', ?)",
+            (f"imap://msgid/{i}", time.time(), time.time()),
+        )
+        fid = cur.lastrowid
+        fresh_db.execute(
+            "INSERT INTO email_classifications"
+            "(file_id, label, classified_at) VALUES (?, ?, ?)",
+            (fid, label, time.time()),
+        )
+    fresh_db.commit()
+    out = _email_section(fresh_db)
+    assert out is not None
+    assert out.urgent == 2
+    assert out.other == 1
+
+
+def test_brief_renders_knowledge_gaps(fresh_db):
+    """Phase 68 hookup — open gaps surface as study targets."""
+    from secondbrain import study
+    from secondbrain.daily_brief import _gaps_section
+
+    study.log_gap(
+        fresh_db, "what is X?", n_results=0, top_score=None,
+    )
+    out = _gaps_section(fresh_db)
+    assert len(out) == 1
+    assert "what is X" in out[0].question
+
+
+def test_brief_pending_drafts_count(fresh_db):
+    """Phase 83 hookup — pending drafts count surfaces."""
+    from secondbrain.daily_brief import _pending_drafts_count
+
+    # No drafts yet.
+    assert _pending_drafts_count(fresh_db) == 0
+    # Seed a classified email + a draft.
+    cur = fresh_db.execute(
+        "INSERT INTO files(path, mtime, size, kind, indexed_at) "
+        "VALUES (?, ?, 1, 'url', ?)",
+        ("imap://msgid/x", time.time(), time.time()),
+    )
+    fid = cur.lastrowid
+    fresh_db.execute(
+        "INSERT INTO email_drafts(file_id, draft_text, generated_at) "
+        "VALUES (?, ?, ?)",
+        (fid, "draft text", time.time()),
+    )
+    fresh_db.commit()
+    assert _pending_drafts_count(fresh_db) == 1
+
+
+def test_render_includes_insights_at_top(fresh_db):
+    """Insights should render BEFORE calendar — user should clock
+    them first."""
+    from secondbrain.daily_brief import (
+        DailyBrief,
+        InsightLine,
+        format_markdown,
+    )
+
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(starts_at=time.time(), title="Standup")],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+        insights=[InsightLine(
+            headline="You've referenced 'voyage' 5x this week",
+            detail="2× jump vs prior 3 weeks. Synthesise?",
+        )],
+    )
+    md = format_markdown(brief, header_date="today")
+    pos_insights = md.find("## Worth noticing")
+    pos_calendar = md.find("## Today on the calendar")
+    assert -1 < pos_insights < pos_calendar
+
+
+def test_render_habits_streaks_get_fire_emoji():
+    """30+ day streaks get 🔥. 100+ get 🏔. <7 stay plain."""
+    from secondbrain.daily_brief import (
+        DailyBrief,
+        HabitLine,
+        format_markdown,
+    )
+
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(starts_at=time.time(), title="X")],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+        habits=[
+            HabitLine(name="Plain", streak_days=3,
+                      expected_30d=30, actual_30d=20),
+            HabitLine(name="Sparkle", streak_days=10,
+                      expected_30d=30, actual_30d=25),
+            HabitLine(name="Fire", streak_days=45,
+                      expected_30d=30, actual_30d=29),
+            HabitLine(name="Mountain", streak_days=200,
+                      expected_30d=30, actual_30d=30),
+        ],
+    )
+    md = format_markdown(brief, header_date="today")
+    # No marker on plain.
+    assert "Plain** — 3d streak" in md
+    assert "✨" in md
+    assert "🔥" in md
+    assert "🏔" in md
+
+
+def test_render_goals_marks_off_track():
+    from secondbrain.daily_brief import (
+        DailyBrief,
+        GoalLine,
+        format_markdown,
+    )
+
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(starts_at=time.time(), title="X")],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+        goals=[
+            GoalLine(
+                name="Apply to jobs", target_per_week=5,
+                progress_this_week=2, on_track=False,
+            ),
+        ],
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "Apply to jobs" in md
+    assert "2/5" in md
+    # Off-track marker is `[·]`, on-track is `[✓]`.
+    assert "[·]" in md
+
+
+def test_pending_drafts_in_email_section():
+    """When the email section has pending drafts, render the count
+    + how to review them."""
+    from secondbrain.daily_brief import (
+        DailyBrief,
+        EmailTriageLine,
+        format_markdown,
+    )
+
+    brief = DailyBrief(
+        generated_at=time.time(),
+        today_events=[FakeEvent(starts_at=time.time(), title="X")],
+        assignments_due_soon=[], open_action_items=[],
+        queue_top=[], watchlist_highlights=[],
+        email=EmailTriageLine(urgent=2, response=3, other=10),
+        pending_email_drafts=4,
+    )
+    md = format_markdown(brief, header_date="today")
+    assert "## Email" in md
+    assert "2 urgent" in md
+    assert "4 draft" in md
+    assert "secondbrain drafts" in md  # CLI hint
+
+
+def test_actionable_content_includes_insights_email_drafts_gaps():
+    """The 'quiet day' classifier needs to weight the new signals."""
+    from secondbrain.daily_brief import (
+        DailyBrief,
+        EmailTriageLine,
+        GapLine,
+        InsightLine,
+        _has_actionable_content,
+    )
+
+    base = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+    )
+    assert _has_actionable_content(base) is False
+
+    with_insight = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        insights=[InsightLine(headline="x", detail="y")],
+    )
+    assert _has_actionable_content(with_insight) is True
+
+    with_drafts = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        pending_email_drafts=2,
+    )
+    assert _has_actionable_content(with_drafts) is True
+
+    with_urgent = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        email=EmailTriageLine(urgent=3),
+    )
+    assert _has_actionable_content(with_urgent) is True
+
+    with_gaps = DailyBrief(
+        generated_at=time.time(),
+        today_events=[], assignments_due_soon=[],
+        open_action_items=[], queue_top=[],
+        watchlist_highlights=[],
+        knowledge_gaps=[GapLine(gap_id=1, question="q?")],
+    )
+    assert _has_actionable_content(with_gaps) is True

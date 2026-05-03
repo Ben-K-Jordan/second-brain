@@ -936,7 +936,12 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Brief", "/brief"),
         ("Chat", "/chat"),
         ("Tasks", "/tasks"),
+        ("People", "/people"),
         ("Health", "/health"),
+        ("Habits", "/habits"),
+        ("Journal", "/journal"),
+        ("Projects", "/projects"),
+        ("Drafts", "/drafts"),
         ("Briefings", "/briefings"),
         ("Queue", "/queue"),
         ("Search", "/search"),
@@ -3619,6 +3624,387 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             + rest_html
         )
         return HTMLResponse(_layout("Health", body, "health"))
+
+    # --- Phase 65: people page -----------------------------------------
+
+    @app.get("/people", response_class=HTMLResponse)
+    def people_view():
+        from . import people as people_mod
+
+        cfg, conn, _, _ = get_read_state()
+        rows = people_mod.list_people(conn, order="recent", limit=100)
+        if not rows:
+            body = (
+                "<h1>People</h1>"
+                "<div class='card'><p class='muted'>"
+                "No people yet. Run "
+                "<code>secondbrain people backfill</code> to seed from "
+                "PERSON entities the spaCy NER has already extracted."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("People", body, "people"))
+        now = time.time()
+        items_html = "".join(
+            f'<div class="stat">'
+            f'<span><a href="/person?id={p.id}">{escape(p.display_name)}</a> '
+            f'<span class="muted">{escape(p.email or "")}</span></span>'
+            f'<span class="v muted">'
+            f'{p.mention_count} mentions · '
+            f'{max(0, int((now - p.last_seen_at) // 86400))}d'
+            f'</span></div>'
+            for p in rows
+        )
+        body = (
+            f"<h1>People</h1><div class='card'>"
+            f"<h2>Recent ({len(rows)})</h2>{items_html}</div>"
+        )
+        return HTMLResponse(_layout("People", body, "people"))
+
+    @app.get("/person", response_class=HTMLResponse)
+    def person_detail(id: int):  # noqa: A002
+        from . import people as people_mod
+
+        cfg, conn, _, _ = get_read_state()
+        profile = people_mod.profile_for(conn, id)
+        if profile is None:
+            return HTMLResponse(_layout(
+                f"Person #{id}",
+                f"<h1>Person #{id} not found</h1>", "people",
+            ))
+        meta_lines = [
+            f"<div class='stat'><span class='muted'>Mentions</span>"
+            f"<span class='v'>{profile.person.mention_count}</span></div>",
+            f"<div class='stat'><span class='muted'>First seen</span>"
+            f"<span class='v'>{profile.days_since_first_seen}d ago</span></div>",
+            f"<div class='stat'><span class='muted'>Last seen</span>"
+            f"<span class='v'>{profile.days_since_seen}d ago</span></div>",
+        ]
+        if profile.person.email:
+            meta_lines.append(
+                f"<div class='stat'><span class='muted'>Email</span>"
+                f"<span class='v'>{escape(profile.person.email)}</span></div>",
+            )
+        if profile.person.role:
+            meta_lines.append(
+                f"<div class='stat'><span class='muted'>Role</span>"
+                f"<span class='v'>{escape(profile.person.role)}</span></div>",
+            )
+        if profile.person.company:
+            meta_lines.append(
+                f"<div class='stat'><span class='muted'>Company</span>"
+                f"<span class='v'>{escape(profile.person.company)}</span></div>",
+            )
+        mentions_html = ""
+        if profile.recent_mentions:
+            items = []
+            for m in profile.recent_mentions:
+                when = time.strftime(
+                    "%Y-%m-%d", time.localtime(m.mtime),
+                )
+                items.append(
+                    f'<article class="result">'
+                    f'<h3><a href="/file?path={urllib.parse.quote_plus(m.file_path)}">'
+                    f'{escape(m.file_path)}</a></h3>'
+                    f'<div class="meta">{when}</div>'
+                    f'<div class="snippet">{escape(m.chunk_text_preview)}</div>'
+                    f'</article>',
+                )
+            mentions_html = (
+                f"<div class='card'><h2>Recent mentions "
+                f"({len(profile.recent_mentions)})</h2>"
+                + "".join(items) + "</div>"
+            )
+        aliases_html = (
+            f"<p class='muted'>Aliases: {escape(', '.join(profile.aliases))}</p>"
+            if profile.aliases else ""
+        )
+        body = (
+            f"<h1>{escape(profile.person.display_name)}</h1>"
+            f"{aliases_html}"
+            f"<div class='card'><h2>Profile</h2>"
+            + "".join(meta_lines) + "</div>"
+            + (f"<div class='card'><h2>Notes</h2><p>{escape(profile.person.notes)}</p></div>"
+               if profile.person.notes else "")
+            + mentions_html
+        )
+        return HTMLResponse(_layout(
+            profile.person.display_name, body, "people",
+        ))
+
+    # --- Phase 79: habits page -----------------------------------------
+
+    @app.get("/habits", response_class=HTMLResponse)
+    def habits_view():
+        from . import personal
+
+        cfg, conn, _, _ = get_state()
+        habits = personal.list_habits(conn)
+        if not habits:
+            body = (
+                "<h1>Habits</h1><div class='card'><p class='muted'>"
+                "No habits yet. Run "
+                "<code>secondbrain habits add &lt;name&gt;</code> "
+                "to start tracking.</p></div>"
+            )
+            return HTMLResponse(_layout("Habits", body, "habits"))
+        items = []
+        for h in habits:
+            s = personal.habit_status(conn, h.id)
+            adh = (
+                f"{s.checkins_last_30d}/{s.expected_30d}"
+                if s.expected_30d else f"{s.checkins_last_30d}"
+            )
+            marker = (
+                "🏔" if s.current_streak_days >= 100
+                else "🔥" if s.current_streak_days >= 30
+                else "✨" if s.current_streak_days >= 7 else ""
+            )
+            items.append(
+                f'<div class="stat">'
+                f'<span>{marker} <strong>{escape(h.name)}</strong> '
+                f'<span class="muted">({h.cadence})</span></span>'
+                f'<span class="v">{s.current_streak_days}d streak '
+                f'<span class="muted">· {adh}/30d</span> '
+                f'<form method="post" action="/habits/{h.id}/checkin" '
+                f'style="display:inline">'
+                f'<button class="link-btn" type="submit">✓ today</button>'
+                f'</form></span>'
+                f'</div>',
+            )
+        goals = personal.list_goals(conn)
+        goals_html = ""
+        if goals:
+            g_items = []
+            for g in goals:
+                gs = personal.goal_status(conn, g.id)
+                target = (
+                    f"/{g.target_per_week}" if g.target_per_week else ""
+                )
+                track = "good" if gs.on_track else "warn"
+                g_items.append(
+                    f'<div class="stat">'
+                    f'<span><strong>{escape(g.name)}</strong></span>'
+                    f'<span class="v {track}">{gs.progress_this_week}{target} '
+                    f'<span class="muted">this wk</span></span>'
+                    f'</div>',
+                )
+            goals_html = (
+                "<div class='card'><h2>Goals</h2>"
+                + "".join(g_items) + "</div>"
+            )
+        body = (
+            "<h1>Habits</h1><div class='card'><h2>Habits</h2>"
+            + "".join(items) + "</div>"
+            + goals_html
+        )
+        return HTMLResponse(_layout("Habits", body, "habits"))
+
+    @app.post("/habits/{habit_id:int}/checkin")
+    def habits_checkin_post(habit_id: int):
+        from fastapi.responses import RedirectResponse
+
+        from . import personal
+        cfg, conn, _, _ = get_state()
+        personal.checkin(conn, habit_id)
+        return RedirectResponse(url="/habits", status_code=303)
+
+    # --- Phase 80: journal page ----------------------------------------
+
+    @app.get("/journal", response_class=HTMLResponse)
+    def journal_view():
+        from . import personal
+
+        cfg, conn, _, _ = get_state()
+        entries = personal.recent_journal(conn, days=30)
+        items = []
+        for e in entries:
+            mood_str = "·" * (e.mood or 0) if e.mood else "—"
+            items.append(
+                f'<div class="card" style="margin-bottom:8px;">'
+                f'<div class="stat"><strong>{e.date}</strong>'
+                f'<span class="v muted">{mood_str} ({e.mood or "—"}/5)</span></div>'
+                f'<p>{escape(e.text or "(no text)")}</p>'
+                f'</div>',
+            )
+        # Today's entry form.
+        today_entry = personal.get_journal(conn)
+        today_text = today_entry.text if today_entry else ""
+        today_mood = today_entry.mood if today_entry and today_entry.mood else 3
+        body = (
+            f"<h1>Journal</h1>"
+            f"<div class='card'><h2>Today</h2>"
+            f"<form method='post' action='/journal/add'>"
+            f"  <label>Mood (1-5): "
+            f"  <input type='number' name='mood' min='1' max='5' "
+            f"   value='{today_mood}' style='width:60px;'></label>"
+            f"  <textarea name='text' rows='3' style='width:100%;margin-top:8px;'>"
+            f"{escape(today_text)}</textarea>"
+            f"  <button type='submit' style='margin-top:8px;'>Save</button>"
+            f"</form></div>"
+            + (f"<h2 style='margin-top:24px;'>Recent ({len(entries)})</h2>"
+               + "".join(items) if items else "")
+        )
+        return HTMLResponse(_layout("Journal", body, "journal"))
+
+    @app.post("/journal/add")
+    def journal_add_post(
+        text: str = Form(""), mood: int = Form(0),
+    ):
+        from fastapi.responses import RedirectResponse
+
+        from . import personal
+        cfg, conn, embedder, _ = get_state()
+        personal.upsert_journal(
+            conn, mood=mood if mood > 0 else None, text=text,
+        )
+        entry = personal.get_journal(conn)
+        if entry:
+            personal.index_journal_entry(cfg, conn, embedder, entry)
+        return RedirectResponse(url="/journal", status_code=303)
+
+    # --- Phase 81: projects page ---------------------------------------
+
+    @app.get("/projects", response_class=HTMLResponse)
+    def projects_view():
+        from . import personal
+
+        cfg, conn, _, _ = get_read_state()
+        projects = personal.list_projects(conn)
+        if not projects:
+            body = (
+                "<h1>Projects</h1><div class='card'><p class='muted'>"
+                "No projects yet. Run "
+                "<code>secondbrain project new &lt;name&gt;</code>."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Projects", body, "projects"))
+        items = "".join(
+            f'<div class="stat">'
+            f'<span><a href="/project?slug={p.slug}">'
+            f'<strong>{escape(p.name)}</strong></a> '
+            f'<span class="muted">({p.slug})</span></span>'
+            f'<span class="v muted">{p.status}</span></div>'
+            for p in projects
+        )
+        body = (
+            f"<h1>Projects</h1><div class='card'><h2>Active</h2>{items}</div>"
+        )
+        return HTMLResponse(_layout("Projects", body, "projects"))
+
+    @app.get("/project", response_class=HTMLResponse)
+    def project_detail(slug: str):
+        from . import personal
+
+        cfg, conn, _, _ = get_read_state()
+        p = personal.get_project_by_slug(conn, slug)
+        if p is None:
+            return HTMLResponse(_layout(
+                slug, f"<h1>Project '{escape(slug)}' not found</h1>",
+                "projects",
+            ))
+        view = personal.project_view(conn, p.id)
+        sections: list[str] = []
+        if view.files:
+            files_html = "".join(
+                f'<div class="stat">'
+                f'<a href="/file?path={urllib.parse.quote_plus(path)}">'
+                f'{escape(path)}</a></div>'
+                for _fid, path in view.files
+            )
+            sections.append(
+                f"<div class='card'><h2>Files ({len(view.files)})</h2>"
+                + files_html + "</div>",
+            )
+        if view.tasks:
+            tasks_html = "".join(
+                f'<div class="stat">'
+                f'<span><code>#{tid}</code> {escape(text)}</span></div>'
+                for tid, text in view.tasks
+            )
+            sections.append(
+                f"<div class='card'><h2>Tasks ({len(view.tasks)})</h2>"
+                + tasks_html + "</div>",
+            )
+        if view.people:
+            ppl_html = "".join(
+                f'<div class="stat"><a href="/person?id={pid}">'
+                f'{escape(name)}</a></div>'
+                for pid, name in view.people
+            )
+            sections.append(
+                f"<div class='card'><h2>People ({len(view.people)})</h2>"
+                + ppl_html + "</div>",
+            )
+        body = (
+            f"<h1>{escape(view.project.name)}</h1>"
+            + (f"<p>{escape(view.project.description)}</p>"
+               if view.project.description else "")
+            + "".join(sections)
+        )
+        return HTMLResponse(_layout(view.project.name, body, "projects"))
+
+    # --- Phase 83: drafts page -----------------------------------------
+
+    @app.get("/drafts", response_class=HTMLResponse)
+    def drafts_view():
+        from . import email_assist
+
+        cfg, conn, _, _ = get_state()
+        drafts = email_assist.list_unsent_drafts(conn)
+        if not drafts:
+            body = (
+                "<h1>Email drafts</h1><div class='card'><p class='muted'>"
+                "No pending drafts. The daemon generates drafts for "
+                "emails classified urgent/response — wait for the next "
+                "tick or trigger via "
+                "<code>secondbrain sync imap</code> + the daemon."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Drafts", body, "drafts"))
+        items = []
+        for d in drafts:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(d.generated_at),
+            )
+            items.append(
+                f'<div class="card" style="margin-bottom:12px;">'
+                f'<div class="stat"><strong>Draft #{d.id}</strong>'
+                f'<span class="v muted">{when}</span></div>'
+                f'<pre style="white-space:pre-wrap;font-family:inherit;'
+                f'margin:8px 0;background:#f8f8f8;padding:8px;'
+                f'border-radius:4px;">{escape(d.draft_text)}</pre>'
+                f'<form method="post" action="/drafts/{d.id}/sent" '
+                f'style="display:inline;margin-right:8px;">'
+                f'<button type="submit">Mark sent</button></form>'
+                f'<form method="post" action="/drafts/{d.id}/discard" '
+                f'style="display:inline;">'
+                f'<button type="submit" class="link-btn">Discard</button>'
+                f'</form>'
+                f'</div>',
+            )
+        body = (
+            f"<h1>Email drafts ({len(drafts)})</h1>"
+            + "".join(items)
+        )
+        return HTMLResponse(_layout("Drafts", body, "drafts"))
+
+    @app.post("/drafts/{draft_id:int}/sent")
+    def drafts_mark_sent(draft_id: int):
+        from fastapi.responses import RedirectResponse
+
+        from . import email_assist
+        cfg, conn, _, _ = get_state()
+        email_assist.mark_draft_sent(conn, draft_id)
+        return RedirectResponse(url="/drafts", status_code=303)
+
+    @app.post("/drafts/{draft_id:int}/discard")
+    def drafts_discard(draft_id: int):
+        from fastapi.responses import RedirectResponse
+
+        from . import email_assist
+        cfg, conn, _, _ = get_state()
+        email_assist.discard_draft(conn, draft_id)
+        return RedirectResponse(url="/drafts", status_code=303)
 
     # --- Browser extension API ----------------------------------------
     # These endpoints are consumed by the multi-AI bridge browser

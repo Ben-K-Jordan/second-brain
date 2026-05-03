@@ -344,7 +344,13 @@ def store_citations(
         if not text:
             continue
         text = text[:_MAX_CITED_TEXT_LEN]
-        cited_fid = _resolve_citation(conn, text, c.get("year"))
+        # Pass src_file_id so the resolver can exclude self-matches:
+        # an essay that *cites* "Smith, 2024" also *contains* the
+        # string "Smith, 2024", which without the exclusion would
+        # cause the resolver to point the citation at itself.
+        cited_fid = _resolve_citation(
+            conn, text, c.get("year"), exclude_file_id=src_file_id,
+        )
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO citations"
@@ -361,6 +367,7 @@ def store_citations(
 
 def _resolve_citation(
     conn: sqlite3.Connection, cited_text: str, year: int | None,
+    *, exclude_file_id: int | None = None,
 ) -> int | None:
     """Best-effort resolution of a citation string to a file_id in
     the brain. Two paths:
@@ -370,15 +377,27 @@ def _resolve_citation(
       2. Substring on path/title: 'arxiv-2401.12345' style refs match
          file paths containing the same id.
 
+    ``exclude_file_id`` (optional): never resolve to this file. The
+    common case is passing the citing doc's own id so we don't
+    accidentally make a paper cite itself when the citation string
+    appears in its own body.
+
     Returns None when no confident match.
     """
     # Quick path: arxiv / DOI ids in the citation text.
     arxiv_match = re.search(r"\b(\d{4}\.\d{4,5})\b", cited_text)
     if arxiv_match:
-        row = conn.execute(
-            "SELECT id FROM files WHERE path LIKE ? LIMIT 1",
-            (f"%{arxiv_match.group(1)}%",),
-        ).fetchone()
+        if exclude_file_id is not None:
+            row = conn.execute(
+                "SELECT id FROM files WHERE path LIKE ? AND id != ? "
+                "LIMIT 1",
+                (f"%{arxiv_match.group(1)}%", exclude_file_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM files WHERE path LIKE ? LIMIT 1",
+                (f"%{arxiv_match.group(1)}%",),
+            ).fetchone()
         if row:
             return int(row["id"])
     # Author-year heuristic: pull leading capitalised word + the year.
@@ -388,21 +407,49 @@ def _resolve_citation(
     author_token = re.sub(r"[^A-Za-z\-]", "", words[0])
     if len(author_token) < 3:
         return None
-    # Look for files whose first chunk H1 mentions both the author
-    # and the year. Bounded to 200-most-recent docs to keep the scan
-    # cheap.
-    rows = conn.execute(
-        "SELECT f.id, c.text "
-        "FROM files f JOIN chunks c ON c.file_id = f.id "
-        "WHERE c.chunk_index = 0 "
-        "ORDER BY f.indexed_at DESC LIMIT 200",
-    ).fetchall()
+    # Look for files whose first chunk's H1 line (not full body)
+    # mentions both the author and the year. H1-only is a much
+    # stricter heuristic: an essay that *cites* "Smith, 2024" in the
+    # body shouldn't claim to BE that paper. Only docs whose title
+    # genuinely names the author + year qualify.
+    #
+    # Bounded to 200-most-recent docs. Excludes the citing file.
+    if exclude_file_id is not None:
+        rows = conn.execute(
+            "SELECT f.id, c.text "
+            "FROM files f JOIN chunks c ON c.file_id = f.id "
+            "WHERE c.chunk_index = 0 AND f.id != ? "
+            "ORDER BY f.indexed_at DESC LIMIT 200",
+            (exclude_file_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT f.id, c.text "
+            "FROM files f JOIN chunks c ON c.file_id = f.id "
+            "WHERE c.chunk_index = 0 "
+            "ORDER BY f.indexed_at DESC LIMIT 200",
+        ).fetchall()
     needle_year = str(year)
+    author_lower = author_token.lower()
     for r in rows:
-        text = (r["text"] or "").lower()
-        if author_token.lower() in text and needle_year in text:
+        h1 = _first_h1_line(r["text"] or "").lower()
+        if not h1:
+            continue
+        if author_lower in h1 and needle_year in h1:
             return int(r["id"])
     return None
+
+
+def _first_h1_line(text: str) -> str:
+    """Return the first '# heading' line of a Markdown chunk, or an
+    empty string when the doc doesn't lead with a heading."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()
+        if s:
+            return ""  # first non-empty line wasn't a heading
+    return ""
 
 
 def get_citations_from(

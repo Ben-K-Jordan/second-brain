@@ -143,6 +143,46 @@ class CompletedTask:
 
 
 @dataclass
+class HabitLine:
+    """One row in the morning brief's habits section."""
+    name: str
+    streak_days: int
+    expected_30d: int
+    actual_30d: int
+
+
+@dataclass
+class GoalLine:
+    """One row in the morning brief's goals section."""
+    name: str
+    target_per_week: int | None
+    progress_this_week: int
+    on_track: bool
+
+
+@dataclass
+class InsightLine:
+    """One Phase-75 'I noticed X' surface."""
+    headline: str
+    detail: str
+
+
+@dataclass
+class EmailTriageLine:
+    """Phase 82 — counts of unread email by triage label, last 7d."""
+    urgent: int = 0
+    response: int = 0
+    other: int = 0   # informational + newsletter + automated, rolled up
+
+
+@dataclass
+class GapLine:
+    """Phase 68 — top open knowledge gaps surfaced in the brief."""
+    gap_id: int
+    question: str
+
+
+@dataclass
 class DailyBrief:
     """The whole morning brief in one structured object."""
     generated_at: float
@@ -155,6 +195,13 @@ class DailyBrief:
     health: HealthSnapshot | None = None       # Phase 56 hookup
     yesterday_done: list[CompletedTask] = field(default_factory=list)
     revisit_suggestions: list[RevisitSuggestion] = field(default_factory=list)
+    # Polish v3 (post-Phase 89): personal context + active surfacing.
+    habits: list[HabitLine] = field(default_factory=list)        # Phase 79
+    goals: list[GoalLine] = field(default_factory=list)          # Phase 79
+    insights: list[InsightLine] = field(default_factory=list)    # Phase 75
+    email: EmailTriageLine | None = None                         # Phase 82
+    knowledge_gaps: list[GapLine] = field(default_factory=list)  # Phase 68
+    pending_email_drafts: int = 0                                # Phase 83
 
 
 @dataclass
@@ -184,6 +231,12 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         watchlist_highlights=_watchlist_highlights(conn),
         health=_health_snapshot(conn),
         yesterday_done=_yesterday_done(conn),
+        habits=_habits_section(conn),
+        goals=_goals_section(conn),
+        insights=_insights_section(conn),
+        email=_email_section(conn),
+        knowledge_gaps=_gaps_section(conn),
+        pending_email_drafts=_pending_drafts_count(conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -192,13 +245,145 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
     return brief
 
 
+def _habits_section(conn: sqlite3.Connection) -> list[HabitLine]:
+    """Pull active habits + their streak data. Phase 79 hookup —
+    surfaces 'you've journaled 23 days straight'-style nudges."""
+    try:
+        from . import personal as personal_mod
+    except ImportError:
+        return []
+    try:
+        habits = personal_mod.list_habits(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: habits query failed: %s", e)
+        return []
+    out: list[HabitLine] = []
+    for h in habits[:8]:
+        try:
+            status = personal_mod.habit_status(conn, h.id)
+        except Exception:  # noqa: BLE001
+            continue
+        out.append(HabitLine(
+            name=h.name,
+            streak_days=status.current_streak_days,
+            expected_30d=status.expected_30d,
+            actual_30d=status.checkins_last_30d,
+        ))
+    return out
+
+
+def _goals_section(conn: sqlite3.Connection) -> list[GoalLine]:
+    """Pull active goals + this-week progress. Phase 79 hookup."""
+    try:
+        from . import personal as personal_mod
+    except ImportError:
+        return []
+    try:
+        goals = personal_mod.list_goals(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: goals query failed: %s", e)
+        return []
+    out: list[GoalLine] = []
+    for g in goals[:8]:
+        try:
+            status = personal_mod.goal_status(conn, g.id)
+        except Exception:  # noqa: BLE001
+            continue
+        out.append(GoalLine(
+            name=g.name,
+            target_per_week=g.target_per_week,
+            progress_this_week=status.progress_this_week,
+            on_track=status.on_track,
+        ))
+    return out
+
+
+def _insights_section(conn: sqlite3.Connection) -> list[InsightLine]:
+    """Pull active insights from Phase 75. The dedup window in
+    detect_insights ensures we don't re-surface the same insight
+    daily."""
+    try:
+        from . import synthesis
+    except ImportError:
+        return []
+    try:
+        raw = synthesis.detect_insights(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: insights query failed: %s", e)
+        return []
+    return [
+        InsightLine(headline=i.headline, detail=i.detail)
+        for i in raw[:5]
+    ]
+
+
+def _email_section(conn: sqlite3.Connection) -> EmailTriageLine | None:
+    """Phase 82 hookup. Returns None when no triage data exists yet."""
+    try:
+        from . import email_assist
+    except ImportError:
+        return None
+    try:
+        counts = email_assist.label_counts(conn, days=7)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: email counts failed: %s", e)
+        return None
+    if not counts:
+        return None
+    return EmailTriageLine(
+        urgent=int(counts.get("urgent", 0)),
+        response=int(counts.get("response", 0)),
+        other=int(
+            counts.get("informational", 0)
+            + counts.get("newsletter", 0)
+            + counts.get("automated", 0),
+        ),
+    )
+
+
+def _gaps_section(conn: sqlite3.Connection) -> list[GapLine]:
+    """Phase 68 hookup — top open knowledge gaps."""
+    try:
+        from . import study
+    except ImportError:
+        return []
+    try:
+        gaps = study.list_gaps(conn, limit=5)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: gaps query failed: %s", e)
+        return []
+    return [GapLine(gap_id=g.id, question=g.question) for g in gaps]
+
+
+def _pending_drafts_count(conn: sqlite3.Connection) -> int:
+    """Phase 83 — count of email drafts awaiting your review."""
+    try:
+        from . import email_assist
+    except ImportError:
+        return 0
+    try:
+        return len(email_assist.list_unsent_drafts(conn, limit=200))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _has_actionable_content(brief: DailyBrief) -> bool:
-    """A 'live' brief has at least one section with stuff to do today."""
+    """A 'live' brief has at least one section with stuff to do today.
+
+    Extended in the polish pass to include Phase 75 insights (you
+    should clock these), Phase 82 urgent emails, Phase 83 pending
+    drafts, and Phase 68 knowledge gaps — all of which carry weight
+    against the 'quiet day' classification.
+    """
     return bool(
         brief.today_events
         or brief.assignments_due_soon
         or brief.open_action_items
-        or brief.queue_top,
+        or brief.queue_top
+        or brief.insights
+        or (brief.email and brief.email.urgent)
+        or brief.pending_email_drafts
+        or brief.knowledge_gaps,
     )
 
 
@@ -567,11 +752,15 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
     """Yield the markdown for each non-empty section, in display order.
 
     Order is intentional: time-sensitive content (calendar, due
-    assignments) front-loads, then action items the user can knock
-    off, then health context (Oura) since it modulates the rest of
-    the day, then the slower-burn surfaces (queue, watchlists), then
-    yesterday's wins as a closing flourish, then quiet-day fallbacks.
+    assignments) front-loads, then proactive insights the user
+    should clock immediately, then action items they can knock off,
+    then physical context (health), then slower-burn surfaces
+    (email, queue, watchlists, gaps), then personal-tracking
+    surfaces (habits, goals, yesterday's wins), then quiet-day
+    fallbacks.
     """
+    if brief.insights:
+        yield _render_insights(brief.insights)
     if brief.today_events:
         yield _render_events(brief.today_events)
     if brief.assignments_due_soon:
@@ -580,10 +769,20 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_action_items(brief.open_action_items)
     if brief.health is not None and brief.health.metrics:
         yield _render_health(brief.health)
+    if brief.email is not None and (
+        brief.email.urgent or brief.email.response or brief.email.other
+    ):
+        yield _render_email(brief.email, brief.pending_email_drafts)
     if brief.queue_top:
         yield _render_queue(brief.queue_top)
     if brief.watchlist_highlights:
         yield _render_watchlist(brief.watchlist_highlights)
+    if brief.knowledge_gaps:
+        yield _render_gaps(brief.knowledge_gaps)
+    if brief.habits:
+        yield _render_habits(brief.habits)
+    if brief.goals:
+        yield _render_goals(brief.goals)
     if brief.yesterday_done:
         yield _render_yesterday_done(brief.yesterday_done)
     if brief.revisit_suggestions:
@@ -701,6 +900,85 @@ def _render_watchlist(items: list[WatchlistHighlight]) -> str:
         out.append(f"- **{h.name}** — {h.new_count} new")
         for p in h.sample_paths:
             out.append(f"  - {p}")
+    return "\n".join(out)
+
+
+def _render_insights(items: list[InsightLine]) -> str:
+    """Phase 75 — proactive 'I noticed X' surfacing. Front of brief."""
+    out = ["## Worth noticing", ""]
+    for ins in items:
+        out.append(f"- **{ins.headline}**")
+        if ins.detail:
+            out.append(f"  {ins.detail}")
+    return "\n".join(out)
+
+
+def _render_email(email: EmailTriageLine, n_drafts: int) -> str:
+    """Phase 82 + 83 — email triage counts + pending drafts to review."""
+    out = ["## Email", ""]
+    bits = []
+    if email.urgent:
+        bits.append(f"**{email.urgent} urgent**")
+    if email.response:
+        bits.append(f"{email.response} need response")
+    if email.other:
+        bits.append(f"{email.other} other")
+    if bits:
+        out.append(f"- {' · '.join(bits)} _(last 7 days)_")
+    if n_drafts > 0:
+        out.append(
+            f"- ✉️ **{n_drafts} draft(s) awaiting review** "
+            f"_(`secondbrain drafts list`)_",
+        )
+    return "\n".join(out)
+
+
+def _render_gaps(items: list[GapLine]) -> str:
+    """Phase 68 — questions ask_brain couldn't answer well."""
+    out = ["## Knowledge gaps", "",
+           "_Questions you asked that returned weak results — study targets:_",
+           ""]
+    for g in items:
+        out.append(f"- _#{g.gap_id}_ {g.question[:120]}")
+    return "\n".join(out)
+
+
+def _render_habits(items: list[HabitLine]) -> str:
+    """Phase 79 — habit streaks + 30d adherence."""
+    out = ["## Habits", ""]
+    for h in items:
+        # Streak emoji at 7+ days, fire at 30+, mountain at 100+.
+        marker = ""
+        if h.streak_days >= 100:
+            marker = "🏔 "
+        elif h.streak_days >= 30:
+            marker = "🔥 "
+        elif h.streak_days >= 7:
+            marker = "✨ "
+        adh = (
+            f" _({h.actual_30d}/{h.expected_30d} this month)_"
+            if h.expected_30d else ""
+        )
+        out.append(
+            f"- {marker}**{h.name}** — {h.streak_days}d streak{adh}",
+        )
+    return "\n".join(out)
+
+
+def _render_goals(items: list[GoalLine]) -> str:
+    """Phase 79 — goal progress this week."""
+    out = ["## Goals (this week)", ""]
+    for g in items:
+        if g.target_per_week:
+            track = "✓" if g.on_track else "·"
+            out.append(
+                f"- [{track}] **{g.name}** — "
+                f"{g.progress_this_week}/{g.target_per_week}",
+            )
+        else:
+            out.append(
+                f"- **{g.name}** — {g.progress_this_week} this week",
+            )
     return "\n".join(out)
 
 

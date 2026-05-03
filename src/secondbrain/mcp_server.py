@@ -871,6 +871,335 @@ def health_metric(metric: str, days: int = 14) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def find_person(query: str, limit: int = 5) -> str:
+    """Phase 65 — find a person by name or email substring. Returns
+    profile snapshots including last-seen, mention count, recent
+    docs, and aliases. Use this when the user asks 'who is Sarah?',
+    'when did I last meet with Prof. Garcia?', or 'show me everyone
+    I've met from Anthropic'."""
+    from . import people as people_mod
+
+    cfg, conn, _, _ = _get_read_state()
+    rows = people_mod.search_people(conn, query, limit=limit)
+    if not rows:
+        return f"No people match {query!r}."
+    lines = [f"Matches for {query!r}:"]
+    for p in rows:
+        days = max(0, int((time.time() - p.last_seen_at) // 86400))
+        bits = [f"#{p.id} {p.display_name}"]
+        if p.email:
+            bits.append(p.email)
+        if p.role:
+            bits.append(p.role)
+        if p.company:
+            bits.append(p.company)
+        bits.append(f"{p.mention_count} mentions, last seen {days}d ago")
+        lines.append("  " + " · ".join(bits))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def person_profile(name: str) -> str:
+    """Phase 65 — full profile + recent mention timeline for one person.
+    Pass the canonical name, an alias, or any name that resolves
+    uniquely; ambiguous queries return a list to disambiguate."""
+    from . import people as people_mod
+
+    cfg, conn, _, _ = _get_read_state()
+    p = people_mod.find_by_alias(conn, name)
+    if p is None:
+        rows = people_mod.search_people(conn, name, limit=5)
+        if not rows:
+            return f"No person matches {name!r}."
+        if len(rows) > 1:
+            return (
+                "Multiple matches; specify more precisely:\n"
+                + "\n".join(f"  #{r.id} {r.display_name}" for r in rows)
+            )
+        p = rows[0]
+    profile = people_mod.profile_for(conn, p.id)
+    lines = [f"# {profile.person.display_name}"]
+    if profile.person.email:
+        lines.append(f"Email: {profile.person.email}")
+    if profile.person.role:
+        lines.append(f"Role: {profile.person.role}")
+    if profile.person.company:
+        lines.append(f"Company: {profile.person.company}")
+    lines.append(
+        f"Mentions: {profile.person.mention_count} "
+        f"(first seen {profile.days_since_first_seen}d ago, "
+        f"last {profile.days_since_seen}d ago)",
+    )
+    if profile.aliases:
+        lines.append(f"Aliases: {', '.join(profile.aliases)}")
+    if profile.person.notes:
+        lines.append("")
+        lines.append(f"Notes: {profile.person.notes}")
+    if profile.recent_mentions:
+        lines.append("")
+        lines.append("## Recent mentions")
+        for m in profile.recent_mentions[:10]:
+            when = time.strftime(
+                "%Y-%m-%d", time.localtime(m.mtime),
+            )
+            lines.append(f"  [{when}] {m.file_path}")
+            lines.append(f"    {m.chunk_text_preview[:160]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def study_status(course: str = "") -> str:
+    """Phase 67 — study card status: total cards, due now, weak
+    concepts. Pass a course code (e.g. 'BME410') to scope, or omit
+    for an overall view."""
+    from . import study as study_mod
+
+    cfg, conn, _, _ = _get_read_state()
+    code = course.upper().replace(" ", "").replace("-", "") if course else None
+    if code:
+        cards = study_mod.cards_for_course(conn, code)
+    else:
+        rows = conn.execute("SELECT * FROM study_cards").fetchall()
+        cards = [study_mod._row_to_card(r) for r in rows]
+    if not cards:
+        return (
+            "No study cards yet. Run `secondbrain study generate` to "
+            "materialise from your class transcripts."
+        )
+    n_due = len(study_mod.due_cards(conn, course_code=code, limit=1000))
+    n_reviewed = sum(1 for c in cards if c.review_count > 0)
+    lines = [
+        f"Cards: {len(cards)} total, {n_due} due now, "
+        f"{n_reviewed} reviewed at least once",
+    ]
+    weak = study_mod.weak_concepts(conn, course_code=code, limit=5)
+    if weak:
+        lines.append("")
+        lines.append("Weak concepts (<3 reviews → not shown):")
+        for concept, acc, n in weak:
+            lines.append(f"  {acc:.0%}  {concept} ({n} reviews)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_knowledge_gaps(limit: int = 10) -> str:
+    """Phase 68 — questions you asked the brain that came back
+    weak. These are good study targets / things to learn next."""
+    from . import study as study_mod
+
+    cfg, conn, _, _ = _get_read_state()
+    rows = study_mod.list_gaps(conn, limit=limit)
+    if not rows:
+        return "No knowledge gaps logged."
+    lines = [f"Open knowledge gaps ({len(rows)}):"]
+    for g in rows:
+        when = time.strftime("%Y-%m-%d", time.localtime(g.asked_at))
+        lines.append(f"  [{when}] #{g.id} {g.question[:100]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def remember_fact(key: str, content: str, kind: str = "fact") -> str:
+    """Phase 86 — persist a fact / preference / context across chat
+    conversations. ``key`` is a short topic anchor (e.g. 'voyage-key'
+    or 'meeting-style'). ``kind`` is 'fact' / 'preference' / 'context'.
+
+    Use this when the user says 'remember that ...', 'always do X for
+    me', or shares a stable preference you should carry to future
+    conversations. The next session's chat will see the fact in the
+    system prompt automatically."""
+    from .memory import remember
+
+    cfg, conn, _, _ = _get_state()
+    try:
+        mid = remember(
+            conn, key=key, content=content, kind=kind, confidence=0.9,
+        )
+    except ValueError as e:
+        return f"Couldn't remember: {e}"
+    return f"Remembered #{mid}: '{key}' = {content}"
+
+
+@mcp.tool()
+def recall_memories(query: str, limit: int = 5) -> str:
+    """Phase 86 — search across persisted cross-conversation memories.
+    Returns the top-K most relevant by token overlap."""
+    from .memory import most_relevant_memories
+
+    cfg, conn, _, _ = _get_read_state()
+    rows = most_relevant_memories(conn, query, k=limit)
+    if not rows:
+        return f"No memories match {query!r}."
+    lines = [f"Memories matching {query!r}:"]
+    for m in rows:
+        lines.append(f"  · [{m.kind}] {m.key}: {m.content}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_habits() -> str:
+    """Phase 79 — list active habits with current streak + 30-day
+    adherence. Use to answer 'how am I doing on my habits?' style
+    questions."""
+    from . import personal
+
+    cfg, conn, _, _ = _get_read_state()
+    habits = personal.list_habits(conn)
+    if not habits:
+        return "No habits configured."
+    lines = ["Habits:"]
+    for h in habits:
+        s = personal.habit_status(conn, h.id)
+        adh = (
+            f"{s.checkins_last_30d}/{s.expected_30d}"
+            if s.expected_30d else f"{s.checkins_last_30d}"
+        )
+        lines.append(
+            f"  · #{h.id} {h.name} ({h.cadence}) — "
+            f"{s.current_streak_days}d streak, {adh} this month",
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_goals() -> str:
+    """Phase 79 — active goals with this-week progress + on-track flag."""
+    from . import personal
+
+    cfg, conn, _, _ = _get_read_state()
+    goals = personal.list_goals(conn)
+    if not goals:
+        return "No goals configured."
+    lines = ["Goals (this week):"]
+    for g in goals:
+        s = personal.goal_status(conn, g.id)
+        if g.target_per_week:
+            track = "✓" if s.on_track else "·"
+            lines.append(
+                f"  [{track}] #{g.id} {g.name} — "
+                f"{s.progress_this_week}/{g.target_per_week}",
+            )
+        else:
+            lines.append(
+                f"  · #{g.id} {g.name} — {s.progress_this_week} "
+                "(no weekly target)",
+            )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_journal(text: str = "", mood: int = 0) -> str:
+    """Phase 80 — add or update today's journal entry. ``mood`` 1-5
+    (0 = leave unchanged), ``text`` free-form. Use when the user
+    says 'log mood 4', 'journal: had a great day', or similar."""
+    from . import personal
+
+    cfg, conn, _, _ = _get_state()
+    eid = personal.upsert_journal(
+        conn, mood=mood if mood > 0 else None, text=text,
+    )
+    return f"Journal entry #{eid} saved."
+
+
+@mcp.tool()
+def list_projects() -> str:
+    """Phase 81 — explicit project tracker. List active projects."""
+    from . import personal
+
+    cfg, conn, _, _ = _get_read_state()
+    projects = personal.list_projects(conn)
+    if not projects:
+        return "No projects configured."
+    lines = ["Projects:"]
+    for p in projects:
+        lines.append(f"  · #{p.id} {p.slug} ({p.status}) — {p.name}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def project_overview(slug: str) -> str:
+    """Phase 81 — full view of a project: tagged files, tasks, people."""
+    from . import personal
+
+    cfg, conn, _, _ = _get_read_state()
+    p = personal.get_project_by_slug(conn, slug)
+    if p is None:
+        return f"No project '{slug}'."
+    view = personal.project_view(conn, p.id)
+    lines = [f"# {view.project.name} ({view.project.slug})"]
+    if view.project.description:
+        lines.append(view.project.description)
+    if view.files:
+        lines.append(f"\nFiles ({len(view.files)}):")
+        for _fid, path in view.files[:20]:
+            lines.append(f"  · {path}")
+    if view.tasks:
+        lines.append(f"\nTasks ({len(view.tasks)}):")
+        for tid, text in view.tasks[:20]:
+            lines.append(f"  · #{tid} {text}")
+    if view.people:
+        lines.append(f"\nPeople ({len(view.people)}):")
+        for _pid, name in view.people:
+            lines.append(f"  · {name}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_email_drafts() -> str:
+    """Phase 83 — pending email drafts awaiting your review."""
+    from . import email_assist
+
+    cfg, conn, _, _ = _get_read_state()
+    drafts = email_assist.list_unsent_drafts(conn)
+    if not drafts:
+        return "No pending drafts."
+    lines = [f"Pending drafts ({len(drafts)}):"]
+    for d in drafts:
+        when = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(d.generated_at),
+        )
+        preview = d.draft_text[:160].replace("\n", " ")
+        lines.append(f"  · #{d.id} [{when}] {preview}…")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_related_via_citations(path: str, direction: str = "outgoing") -> str:
+    """Phase 85 — citation graph navigation. ``direction`` is
+    'outgoing' (what THIS doc cites) or 'incoming' (what cites this).
+
+    Use to answer 'what did this paper cite?' or 'who cites this
+    paper?' research questions."""
+    from . import pdf_annotations as pa
+
+    cfg, conn, _, _ = _get_read_state()
+    row = conn.execute(
+        "SELECT id FROM files WHERE path = ?", (path,),
+    ).fetchone()
+    if row is None:
+        return f"Doc not in index: {path}"
+    fid = int(row["id"])
+    if direction == "incoming":
+        cites = pa.get_citations_to(conn, fid)
+        if not cites:
+            return f"No incoming citations to {path}."
+        lines = [f"Citations TO {path}:"]
+        for c in cites:
+            year = f" ({c.year})" if c.year else ""
+            lines.append(f"  · {c.cited_text}{year}")
+    else:
+        cites = pa.get_citations_from(conn, fid)
+        if not cites:
+            return f"No outgoing citations from {path}."
+        lines = [f"Citations FROM {path}:"]
+        for c in cites:
+            resolved = " → " if c.cited_file_id else " (unresolved)"
+            year = f" ({c.year})" if c.year else ""
+            lines.append(f"  · {c.cited_text}{year}{resolved}")
+    return "\n".join(lines)
+
+
 def run() -> None:
     """Run the MCP server over stdio. Used by `secondbrain serve`."""
     _get_state()  # warm caches before we start serving

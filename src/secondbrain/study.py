@@ -147,14 +147,17 @@ def docs_pending_cards(
 
     Uses the chunks' first-line H1 to find titles since `files.title`
     isn't a column (the title lives in the chunk body)."""
+    # LEFT JOIN over NOT IN: at scale (lots of cards) the subquery
+    # was rebuilding the full set per outer row. Anti-join via NULL
+    # check is index-friendly.
     rows = conn.execute(
         "SELECT f.id, c.text "
-        "FROM files f JOIN chunks c ON c.file_id = f.id "
+        "FROM files f "
+        "JOIN chunks c ON c.file_id = f.id "
+        "LEFT JOIN study_cards sc ON sc.file_id = f.id "
         "WHERE c.chunk_index = 0 "
         "  AND (f.path LIKE 'transcript://%' OR f.path LIKE 'imap://%') "
-        "  AND f.id NOT IN ("
-        "    SELECT DISTINCT file_id FROM study_cards WHERE file_id IS NOT NULL"
-        "  ) "
+        "  AND sc.file_id IS NULL "
         "ORDER BY f.indexed_at DESC LIMIT ?",
         (limit * 4,),  # over-fetch then filter to course-coded ones
     ).fetchall()

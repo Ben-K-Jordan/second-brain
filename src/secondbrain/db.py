@@ -64,13 +64,19 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     """Open a read-only connection. Does not contend for the write lock - used
     by `status`, `spend`, and search paths so they coexist cleanly with a busy
     daemon. Skips init_schema; the caller is asserting the DB is already set up.
+
+    ``check_same_thread=False`` mirrors the writer's connect() so the
+    dashboard (which serves requests on worker threads but caches a
+    single read-only conn in its state) doesn't trip on cross-thread
+    use. Read-only conns have no write lock to contend over, so the
+    safety story is unchanged from sqlite's defaults.
     """
     if not db_path.exists():
         raise FileNotFoundError(
             f"No index at {db_path}. Run `secondbrain index <folder>` first."
         )
     uri = f"file:{db_path.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
