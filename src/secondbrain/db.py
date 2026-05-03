@@ -426,6 +426,50 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         CREATE INDEX IF NOT EXISTS idx_person_mentions_file
             ON person_mentions(file_id);
 
+        -- Cross-conversation memory (Phase 86). Persistent facts /
+        -- preferences / context distilled from chat conversations so
+        -- the next chat session can pick up where the last one left
+        -- off without re-loading the entire transcript.
+        --
+        -- A memory has a key (short label, dedup anchor) + content
+        -- (the actual fact) + provenance (which conversation it came
+        -- from). Confidence + last_referenced_at let the chat agent
+        -- prioritise + age-out stale memories.
+        CREATE TABLE IF NOT EXISTS chat_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL,                  -- short topic key
+            content TEXT NOT NULL,              -- the persisted fact
+            kind TEXT NOT NULL,                 -- 'fact' | 'preference' | 'context'
+            source_conversation_id INTEGER,     -- where it was distilled
+            created_at REAL NOT NULL,
+            last_referenced_at REAL,            -- when chat last surfaced it
+            reference_count INTEGER NOT NULL DEFAULT 0,
+            confidence REAL NOT NULL DEFAULT 0.7,
+            UNIQUE(key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_mem_kind ON chat_memories(kind);
+        CREATE INDEX IF NOT EXISTS idx_chat_mem_referenced
+            ON chat_memories(last_referenced_at DESC);
+
+        -- Temporal index snapshots (Phase 87). On every brief / weekly
+        -- review / on-demand 'snapshot' command, capture which file_ids
+        -- existed in the brain at that moment. Lets queries answer
+        -- "what did I know about X 3 months ago?" by filtering files
+        -- to those present in the snapshot at that time.
+        --
+        -- We store snapshots sparsely (one per week is plenty); a query
+        -- finds the closest preceding snapshot and uses its file_id set
+        -- as the "as-of" view.
+        CREATE TABLE IF NOT EXISTS index_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            taken_at REAL NOT NULL,
+            file_ids_json TEXT NOT NULL,         -- JSON array of ints
+            label TEXT,                          -- optional human label
+            n_files INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshots_taken_at
+            ON index_snapshots(taken_at DESC);
+
         -- PDF annotations (Phase 84). Highlights / notes / strikeouts
         -- pulled from a PDF's annotation layer (the markup users add
         -- in Preview, Acrobat, Drawboard, etc). One row per annotation;

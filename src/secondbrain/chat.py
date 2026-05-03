@@ -566,6 +566,16 @@ def ask_brain(
         citations=citations,
         iterations=iterations,
     )
+    # Phase 86: bump reference counts on memories that the chat
+    # surfaced to the prompt. Lets recall prioritise active context
+    # in subsequent calls.
+    try:
+        memory_ids = getattr(stream_chat, "_last_memory_ids", None)
+        if memory_ids:
+            from .memory import mark_referenced
+            mark_referenced(conn, memory_ids)
+    except Exception as e:  # noqa: BLE001
+        log.warning("memory: mark_referenced failed: %s", e)
     # Phase 68: knowledge-gap detection. When retrieval came back weak
     # (low top score / few hits / no brain citations at all), log the
     # question so the weekly review can surface it as a study target.

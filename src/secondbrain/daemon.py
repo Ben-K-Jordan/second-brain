@@ -405,6 +405,15 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _email_drafts(conn, cfg),
     ))
 
+    # Phase 87: weekly index snapshots for temporal queries. Runs
+    # hourly but only fires when the last snapshot is > 7d old.
+    from .memory import take_snapshot_if_due
+    sched.register(Job(
+        name="index_snapshot",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: take_snapshot_if_due(cfg, conn),
+    ))
+
     return sched
 
 
