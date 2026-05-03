@@ -2538,6 +2538,354 @@ def gaps_resolve(
     conn.close()
 
 
+# ============================ Phase 86 memory CLI =====================
+
+memory_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 86 cross-conversation memory. Persistent facts the "
+         "chat agent recalls into the system prompt of every "
+         "subsequent conversation.",
+)
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("remember")
+def memory_remember(
+    key: str = typer.Argument(..., help="Short topic anchor."),
+    content: str = typer.Argument(..., help="The fact to persist."),
+    kind: str = typer.Option(
+        "fact", "--kind",
+        help="fact | preference | context",
+    ),
+) -> None:
+    """Pin context the chat should always recall."""
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    try:
+        mid = memory_mod.remember(
+            conn, key=key, content=content, kind=kind, confidence=0.9,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        conn.close()
+        raise typer.Exit(code=1) from None
+    console.print(f"[green]✓[/] Remembered #{mid}: {key}")
+    conn.close()
+
+
+@memory_app.command("forget")
+def memory_forget(
+    key: str = typer.Argument(..., help="Memory key to drop."),
+) -> None:
+    """Delete a memory."""
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if memory_mod.forget(conn, key):
+        console.print(f"[green]✓[/] Forgot {key!r}")
+    else:
+        console.print(f"[yellow]No memory[/] {key!r}")
+    conn.close()
+
+
+@memory_app.command("list")
+def memory_list(
+    kind: str = typer.Option(
+        None, "--kind",
+        help="fact / preference / context to filter.",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """List persisted memories."""
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = memory_mod.list_memories(conn, kind=kind, limit=limit)
+    if not rows:
+        console.print("[dim]No memories yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Memories")
+    table.add_column("key", style="dim")
+    table.add_column("content")
+    table.add_column("kind", style="dim", width=11)
+    table.add_column("uses", justify="right", style="dim")
+    for m in rows:
+        table.add_row(
+            m.key, m.content[:80], m.kind,
+            str(m.reference_count),
+        )
+    console.print(table)
+    conn.close()
+
+
+@memory_app.command("search")
+def memory_search(
+    query: str = typer.Argument(...),
+    limit: int = typer.Option(10, "--limit", "-n"),
+) -> None:
+    """Token-overlap search over memories. Same scoring chat uses."""
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = memory_mod.most_relevant_memories(conn, query, k=limit)
+    if not rows:
+        console.print(f"[yellow]No matches for[/] {query!r}")
+        conn.close()
+        return
+    for m in rows:
+        marker = (
+            "★" if m.kind == "preference"
+            else "◊" if m.kind == "context" else "·"
+        )
+        console.print(f"{marker} [bold]{m.key}[/]: {m.content}")
+    conn.close()
+
+
+# ============================ Phase 83 drafts CLI =====================
+
+drafts_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 83 email reply drafts. Inspect / approve / discard "
+         "drafts the daemon generated for urgent + response emails.",
+)
+app.add_typer(drafts_app, name="drafts")
+
+
+@drafts_app.command("list")
+def drafts_list() -> None:
+    """List unsent drafts awaiting your review."""
+    from . import email_assist
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = email_assist.list_unsent_drafts(conn)
+    if not rows:
+        console.print("[dim]No pending drafts.[/]")
+        conn.close()
+        return
+    for d in rows:
+        when = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(d.generated_at),
+        )
+        console.print(
+            f"[bold]Draft #{d.id}[/] [dim]({when}, file_id={d.file_id})[/]",
+        )
+        console.print(d.draft_text)
+        console.print()
+    conn.close()
+
+
+@drafts_app.command("sent")
+def drafts_mark_sent(
+    draft_id: int = typer.Argument(..., help="Draft id."),
+) -> None:
+    """Mark a draft as sent (you actually sent it from your mail app)."""
+    from . import email_assist
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if email_assist.mark_draft_sent(conn, draft_id):
+        console.print(f"[green]✓[/] Marked #{draft_id} sent")
+    else:
+        console.print(f"[yellow]#{draft_id} not found or already sent[/]")
+    conn.close()
+
+
+@drafts_app.command("discard")
+def drafts_discard(
+    draft_id: int = typer.Argument(..., help="Draft id."),
+) -> None:
+    """Discard an unsent draft (you'll write the reply yourself)."""
+    from . import email_assist
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if email_assist.discard_draft(conn, draft_id):
+        console.print(f"[green]✓[/] Discarded #{draft_id}")
+    else:
+        console.print(
+            f"[yellow]#{draft_id} not found, already sent, "
+            f"or already discarded[/]",
+        )
+    conn.close()
+
+
+# ============================ Phase 87 snapshot CLI ===================
+
+snapshot_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 87 temporal snapshots. Sparse weekly captures of "
+         "which file_ids existed at each moment, so 'what did I "
+         "know N months ago' queries can filter to that view.",
+)
+app.add_typer(snapshot_app, name="snapshot")
+
+
+@snapshot_app.command("take")
+def snapshot_take(
+    label: str = typer.Option(None, "--label", "-l"),
+) -> None:
+    """Capture today's index state. The daemon does this weekly;
+    use this to take an ad-hoc snapshot before a big change."""
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    sid = memory_mod.take_snapshot(conn, label=label)
+    snap = memory_mod.list_snapshots(conn, limit=1)[0]
+    console.print(
+        f"[green]✓[/] Snapshot #{sid} captured "
+        f"({snap.n_files} files)",
+    )
+    conn.close()
+
+
+@snapshot_app.command("list")
+def snapshot_list(
+    limit: int = typer.Option(20, "--limit", "-n"),
+) -> None:
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = memory_mod.list_snapshots(conn, limit=limit)
+    if not rows:
+        console.print("[dim]No snapshots yet.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Index snapshots")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("when", style="dim")
+    table.add_column("files", justify="right")
+    table.add_column("label", style="dim")
+    for s in rows:
+        when = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(s.taken_at),
+        )
+        table.add_row(
+            str(s.id), when, str(s.n_files), s.label or "",
+        )
+    console.print(table)
+    conn.close()
+
+
+# ============================ Phase 84/85 cite + annot CLI ============
+
+cite_app = typer.Typer(
+    no_args_is_help=True,
+    help="Phase 84 + 85 PDF annotations + citation graph. View what "
+         "you highlighted in a PDF or who cites whom.",
+)
+app.add_typer(cite_app, name="cite")
+
+
+@cite_app.command("annotations")
+def cite_annotations(
+    path: str = typer.Argument(..., help="PDF path (or substring)."),
+) -> None:
+    """List highlights / notes you made on a PDF."""
+    from . import pdf_annotations as pa
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    row = conn.execute(
+        "SELECT id FROM files WHERE path = ?", (path,),
+    ).fetchone()
+    if row is None:
+        candidate = conn.execute(
+            "SELECT id, path FROM files WHERE path LIKE ? "
+            "ORDER BY indexed_at DESC LIMIT 1",
+            (f"%{path}%",),
+        ).fetchone()
+        if candidate is None:
+            console.print(f"[yellow]No file matches[/] {path!r}")
+            conn.close()
+            return
+        row = candidate
+        console.print(f"[dim]Matched:[/] {candidate['path']}")
+    annots = pa.get_annotations(conn, int(row["id"]))
+    if not annots:
+        console.print("[dim]No annotations found.[/]")
+        conn.close()
+        return
+    for a in annots:
+        marker = {
+            "highlight": "▌", "underline": "_",
+            "strike": "—", "note": "✎",
+        }.get(a.kind, "·")
+        console.print(
+            f"[dim]p{a.page}[/] {marker} {a.anchor}",
+        )
+        if a.note:
+            console.print(f"   [dim italic]{a.note}[/]")
+    conn.close()
+
+
+@cite_app.command("from")
+def cite_from(
+    path: str = typer.Argument(..., help="Doc path."),
+) -> None:
+    """Show what THIS doc cites (outgoing edges)."""
+    from . import pdf_annotations as pa
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    row = conn.execute(
+        "SELECT id FROM files WHERE path = ?", (path,),
+    ).fetchone()
+    if row is None:
+        console.print(f"[yellow]No file[/] {path!r}")
+        conn.close()
+        return
+    cites = pa.get_citations_from(conn, int(row["id"]))
+    if not cites:
+        console.print("[dim]No outgoing citations.[/]")
+        conn.close()
+        return
+    for c in cites:
+        resolved = " → linked" if c.cited_file_id else " (unresolved)"
+        year = f" ({c.year})" if c.year else ""
+        console.print(f"· {c.cited_text}{year}{resolved}")
+    conn.close()
+
+
+@cite_app.command("to")
+def cite_to(
+    path: str = typer.Argument(..., help="Doc path."),
+) -> None:
+    """Show what cites THIS doc (incoming edges)."""
+    from . import pdf_annotations as pa
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    row = conn.execute(
+        "SELECT id FROM files WHERE path = ?", (path,),
+    ).fetchone()
+    if row is None:
+        console.print(f"[yellow]No file[/] {path!r}")
+        conn.close()
+        return
+    cites = pa.get_citations_to(conn, int(row["id"]))
+    if not cites:
+        console.print("[dim]No incoming citations.[/]")
+        conn.close()
+        return
+    for c in cites:
+        src_path = conn.execute(
+            "SELECT path FROM files WHERE id = ?",
+            (c.src_file_id,),
+        ).fetchone()
+        src = src_path["path"] if src_path else "?"
+        console.print(f"· [{src}] cites: {c.cited_text}")
+    conn.close()
+
+
 people_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 65 people module. De-duped, profile-shaped view of "

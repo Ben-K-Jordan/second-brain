@@ -184,9 +184,12 @@ def extract_candidates_from_text(
 
 def is_voice_path(path: str) -> bool:
     """True for source paths whose content was produced by a voice
-    capture (Phase 41) — those benefit from natural-language pattern
-    extraction since they don't carry Markdown formatting."""
-    return path.startswith("voice://")
+    capture (Phase 41) OR a manual mobile capture (Phase 69). Both
+    benefit from natural-language pattern extraction since they
+    don't carry Markdown formatting — a quick "remind me to email
+    Sarah" share-sheet capture should land as a task even though
+    the user didn't bullet it."""
+    return path.startswith("voice://") or path.startswith("capture://")
 
 
 # ============================ persistence =============================
@@ -399,10 +402,15 @@ def materialize_from_transcripts(
         ...") since voice transcripts don't carry Markdown formatting.
     """
     cutoff = time.time() - lookback_days * 86400
+    # Polish v3: also scan capture:// paths so iOS Shortcut / browser
+    # bookmarklet sends like "remind me to email Sarah" actually
+    # surface as tasks. Closes the mobile-capture loop end-to-end.
     rows = conn.execute(
         "SELECT f.id AS fid, f.path AS path, c.text AS text "
         "FROM chunks c JOIN files f ON f.id = c.file_id "
-        "WHERE (f.path LIKE 'transcript://%' OR f.path LIKE 'voice://%') "
+        "WHERE (f.path LIKE 'transcript://%' "
+        "    OR f.path LIKE 'voice://%' "
+        "    OR f.path LIKE 'capture://%') "
         "  AND f.indexed_at >= ? "
         "ORDER BY f.indexed_at DESC, f.id DESC, c.chunk_index ASC",
         (cutoff,),

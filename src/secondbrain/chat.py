@@ -176,7 +176,17 @@ def _tool_search(
 
 
 def _format_search_result(results: list[SearchResult]) -> str:
-    """Render search results as a tool-result text block for the model."""
+    """Render search results as a tool-result text block for the model.
+
+    Phase 88: snippets are redacted before being handed to the model.
+    Even though the model is "trusted" in the sense that it's the
+    user's own assistant, sensitive content (API keys, SSNs, JWTs)
+    in the prompt can be echoed back in the answer + persisted in
+    chat_messages — both vectors for accidental leak. Redacting at
+    the tool-result boundary plugs the upstream hole.
+    """
+    from .safety import redact_text as _redact
+
     if not results:
         return "No matches found in the brain."
     lines = [f"Found {len(results)} chunk(s):"]
@@ -188,7 +198,7 @@ def _format_search_result(results: list[SearchResult]) -> str:
             f"--- ({i}) chunk_id={r.chunk_id} path={r.file_path} "
             f"chunk_index={r.chunk_index} score={r.score:.3f} ---"
         )
-        lines.append(snippet)
+        lines.append(_redact(snippet))
     return "\n".join(lines)
 
 
@@ -474,12 +484,17 @@ def stream_chat(
                         "is_error": True,
                     })
                     continue
+                # Phase 88: redact at the citation boundary so
+                # sensitive content (SSNs, API keys, JWTs) never
+                # leaves the brain via chat answers. The index keeps
+                # verbatim text so search recall isn't crippled.
+                from .safety import redact_text as _redact
                 for r in results:
                     citations_by_id.setdefault(r.chunk_id, Citation(
                         chunk_id=r.chunk_id,
                         file_path=r.file_path,
                         chunk_index=r.chunk_index,
-                        text=r.text,
+                        text=_redact(r.text),
                         score=r.score,
                     ))
                 yield ChatTurnEvent("results", [

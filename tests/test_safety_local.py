@@ -304,3 +304,47 @@ def test_resolve_model_uses_cfg_when_set():
     class _Cfg:
         local_llm_model = "mistral"
     assert local_llm._resolve_model(_Cfg()) == "mistral"
+
+
+# ============== chat-citation redaction (polish v3) ==================
+
+def test_format_search_result_redacts_chunk_text():
+    """Phase 88 polish — sensitive content in chunks shouldn't leak
+    into the model's tool-result feedback. Plugs the upstream hole."""
+    from dataclasses import dataclass
+
+    from secondbrain.chat import _format_search_result
+
+    @dataclass
+    class _R:
+        chunk_id: int
+        file_path: str
+        chunk_index: int
+        score: float
+        text: str
+
+    rs = [_R(1, "/x.md", 0, 0.5, "SSN 111-22-3333 in here.")]
+    out = _format_search_result(rs)
+    assert "[REDACTED:ssn]" in out
+    assert "111-22-3333" not in out
+
+
+def test_format_search_result_handles_clean_text():
+    """No sensitive content → output unchanged (no false positives
+    on regular prose)."""
+    from dataclasses import dataclass
+
+    from secondbrain.chat import _format_search_result
+
+    @dataclass
+    class _R:
+        chunk_id: int
+        file_path: str
+        chunk_index: int
+        score: float
+        text: str
+
+    rs = [_R(1, "/x.md", 0, 0.5, "This is normal prose.")]
+    out = _format_search_result(rs)
+    assert "REDACTED" not in out
+    assert "normal prose" in out

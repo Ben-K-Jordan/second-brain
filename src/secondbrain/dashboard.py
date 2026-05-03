@@ -1126,6 +1126,138 @@ def _render_health_card(metric: str, summary, points) -> str:
 </div>"""
 
 
+def _render_summary_block(conn, file_id: int) -> str:
+    """Phase 74 — TL;DR + key points card at the top of file view.
+    Empty string when no summary exists yet."""
+    try:
+        from .synthesis import get_summary
+    except ImportError:
+        return ""
+    try:
+        s = get_summary(conn, file_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    if s is None:
+        return ""
+    points_html = ""
+    if s.key_points:
+        points_html = (
+            "<ul style='margin:8px 0 0;'>"
+            + "".join(f"<li>{escape(p)}</li>" for p in s.key_points[:5])
+            + "</ul>"
+        )
+    return (
+        "<div class='card' style='margin-bottom:16px;'>"
+        "<h2>Summary</h2>"
+        f"<p><strong>{escape(s.tldr)}</strong></p>"
+        f"{points_html}"
+        "</div>"
+    )
+
+
+def _render_annotations_block(conn, file_id: int) -> str:
+    """Phase 84 — highlights / notes the user made on a PDF."""
+    try:
+        from .pdf_annotations import get_annotations
+    except ImportError:
+        return ""
+    try:
+        annots = get_annotations(conn, file_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not annots:
+        return ""
+    items: list[str] = []
+    for a in annots[:30]:
+        marker = {
+            "highlight": "▌", "underline": "_",
+            "strike": "—", "note": "✎",
+        }.get(a.kind, "·")
+        note_html = (
+            f"<div class='muted' style='font-style:italic;margin-left:24px;'>"
+            f"{escape(a.note)}</div>"
+            if a.note else ""
+        )
+        items.append(
+            f'<div class="stat">'
+            f'<span><span class="muted">p{a.page}</span> '
+            f'{marker} {escape(a.anchor)}</span></div>'
+            f'{note_html}',
+        )
+    extra = (
+        f'<p class="muted">+{len(annots) - 30} more</p>'
+        if len(annots) > 30 else ""
+    )
+    return (
+        f"<div class='card' style='margin-bottom:16px;'>"
+        f"<h2>Annotations ({len(annots)})</h2>"
+        + "".join(items)
+        + extra
+        + "</div>"
+    )
+
+
+def _render_citations_block(conn, file_id: int) -> str:
+    """Phase 85 — outgoing + incoming citation graph."""
+    try:
+        from .pdf_annotations import get_citations_from, get_citations_to
+    except ImportError:
+        return ""
+    try:
+        outgoing = get_citations_from(conn, file_id)
+        incoming = get_citations_to(conn, file_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not outgoing and not incoming:
+        return ""
+    sections: list[str] = []
+    if outgoing:
+        out_items = []
+        for c in outgoing[:20]:
+            year = f" ({c.year})" if c.year else ""
+            link = ""
+            if c.cited_file_id:
+                p = conn.execute(
+                    "SELECT path FROM files WHERE id = ?",
+                    (c.cited_file_id,),
+                ).fetchone()
+                if p:
+                    link = (
+                        f' → <a href="/file?path='
+                        f'{urllib.parse.quote_plus(p["path"])}">in brain</a>'
+                    )
+            out_items.append(
+                f'<div class="stat">'
+                f'<span>{escape(c.cited_text)}{year}{link}</span></div>',
+            )
+        sections.append(
+            f"<div class='card'><h2>Cites ({len(outgoing)})</h2>"
+            + "".join(out_items)
+            + (f"<p class='muted'>+{len(outgoing) - 20} more</p>"
+               if len(outgoing) > 20 else "")
+            + "</div>",
+        )
+    if incoming:
+        in_items = []
+        for c in incoming[:20]:
+            p = conn.execute(
+                "SELECT path FROM files WHERE id = ?",
+                (c.src_file_id,),
+            ).fetchone()
+            src_path = p["path"] if p else "?"
+            in_items.append(
+                f'<div class="stat">'
+                f'<span><a href="/file?path='
+                f'{urllib.parse.quote_plus(src_path)}">'
+                f'{escape(src_path)}</a></span></div>',
+            )
+        sections.append(
+            f"<div class='card'><h2>Cited by ({len(incoming)})</h2>"
+            + "".join(in_items) + "</div>",
+        )
+    return "".join(sections)
+
+
 def _render_backlinks_block(conn, path: str) -> str:
     """Render the 'See also' panel for a file view. Pulls from
     Phase 52's backlinks table — empty when the doc has no neighbours
@@ -1786,10 +1918,15 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         # Read-only — pure rendering, no mutations.
         cfg, conn, embedder, reranker = get_read_state()
         row = conn.execute(
-            "SELECT path, kind, mtime, size FROM files WHERE path = ?", (path,)
+            "SELECT id, path, kind, mtime, size FROM files WHERE path = ?", (path,)
         ).fetchone()
         if not row:
             return HTMLResponse(_layout(path, f'<h1>{escape(path)}</h1><div class="empty">Not in index.</div>'))
+
+        # Phase 88: redact sensitive content in chunk previews so
+        # API keys / SSNs / tokens stored in the index don't render
+        # to the dashboard.
+        from .safety import redact_text as _redact
 
         chunks = conn.execute(
             "SELECT chunk_index, text FROM chunks WHERE file_id = ("
@@ -1798,13 +1935,25 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         ).fetchall()
         body_chunks = "".join(
             f'<article class="result"><h3>chunk {r["chunk_index"]}</h3>'
-            f'<div class="snippet">{escape(r["text"])}</div></article>'
+            f'<div class="snippet">{escape(_redact(r["text"]))}</div></article>'
             for r in chunks
         )
         kind = row["kind"]
         age = (time.time() - row["mtime"]) / 86400
         is_url = path.startswith("http://") or path.startswith("https://")
         open_link = f'<a href="{escape(path)}" target="_blank">Open ↗</a>' if is_url else ""
+
+        # Phase 74: auto-summary card at the top so users + the chat
+        # agent see the TL;DR before scrolling chunks. Only renders
+        # when a summary actually exists.
+        summary_html = _render_summary_block(conn, int(row["id"]))
+
+        # Phase 84: PDF annotation card — surfaces highlights /
+        # notes the user made in their PDF reader.
+        annotations_html = _render_annotations_block(conn, int(row["id"]))
+
+        # Phase 85: citation graph card.
+        citations_html = _render_citations_block(conn, int(row["id"]))
 
         # Phase 52: surface "see also" backlinks at the bottom so the
         # file view becomes a wayfinding hub, not just a content dump.
@@ -1814,7 +1963,10 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 <h1>File <span class="muted">[{kind}]</span></h1>
 <p class="path">{escape(path)} {open_link}</p>
 <p class="muted">{len(chunks)} chunks · {row["size"] / 1024:.1f} KB · {age:.1f}d ago</p>
+{summary_html}
+{annotations_html}
 {body_chunks}
+{citations_html}
 {backlinks_html}"""
         return HTMLResponse(_layout(Path(path).name or path, body))
 

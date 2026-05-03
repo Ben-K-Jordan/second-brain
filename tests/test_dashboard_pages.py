@@ -290,3 +290,166 @@ def test_file_view_skips_backlinks_when_none(client):
     r = client.get("/file?path=/missing.md")
     assert r.status_code == 200
     assert "See also" not in r.text
+
+
+# ============== polish v3 dashboard pages ============================
+
+def test_people_page_renders_empty(client):
+    r = client.get("/people")
+    assert r.status_code == 200
+    assert "people backfill" in r.text
+
+
+def test_habits_page_renders_empty(client):
+    r = client.get("/habits")
+    assert r.status_code == 200
+    assert "habits add" in r.text
+
+
+def test_journal_page_renders_with_form(client):
+    """Journal page should always render the today-entry form."""
+    r = client.get("/journal")
+    assert r.status_code == 200
+    # The form uses single-quoted attrs in the f-string template;
+    # match either quoting style so we don't lock the renderer.
+    assert "name='mood'" in r.text or 'name="mood"' in r.text
+    assert "name='text'" in r.text or 'name="text"' in r.text
+
+
+def test_journal_add_persists_entry(client):
+    """POSTing the form should land an entry that the GET sees."""
+    r = client.post(
+        "/journal/add",
+        data={"text": "Test entry", "mood": "4"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    r2 = client.get("/journal")
+    assert "Test entry" in r2.text
+
+
+def test_projects_page_renders_empty(client):
+    r = client.get("/projects")
+    assert r.status_code == 200
+    assert "project new" in r.text
+
+
+def test_drafts_page_renders_empty(client):
+    r = client.get("/drafts")
+    assert r.status_code == 200
+    assert "No pending drafts" in r.text
+
+
+def test_habits_checkin_creates_row(monkeypatch, tmp_path, fake_embedder):
+    """POST /habits/<id>/checkin should land a check-in row."""
+    from fastapi.testclient import TestClient
+
+    from secondbrain import personal
+    from secondbrain.dashboard import create_app
+    from secondbrain.db import connect, init_schema
+
+    cfg = _patch_dashboard(monkeypatch, tmp_path, fake_embedder)
+    # Seed a habit through a side connection that shares the DB.
+    seed_conn = connect(cfg.db_path)
+    init_schema(seed_conn, fake_embedder.dim, fake_embedder.name)
+    hid = personal.add_habit(seed_conn, "test-habit")
+    seed_conn.close()
+
+    app = create_app()
+    client_inner = TestClient(app)
+    r = client_inner.post(
+        f"/habits/{hid}/checkin", follow_redirects=False,
+    )
+    assert r.status_code == 303
+    # Verify the check-in landed via a fresh side connection.
+    check_conn = connect(cfg.db_path)
+    n = check_conn.execute(
+        "SELECT COUNT(*) AS n FROM habit_checkins WHERE habit_id = ?",
+        (hid,),
+    ).fetchone()["n"]
+    check_conn.close()
+    assert n == 1
+
+
+def test_file_view_renders_summary_when_present(
+    monkeypatch, tmp_path, fake_embedder,
+):
+    """Phase 74 — TL;DR should render at the top of the file view
+    when one exists."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from secondbrain.dashboard import create_app
+    from secondbrain.db import connect, init_schema
+
+    cfg = _patch_dashboard(monkeypatch, tmp_path, fake_embedder)
+    seed_conn = connect(cfg.db_path)
+    init_schema(seed_conn, fake_embedder.dim, fake_embedder.name)
+    cur = seed_conn.execute(
+        "INSERT INTO files(path, mtime, size, kind, indexed_at) "
+        "VALUES ('/notes/x.md', ?, 1, 'document', ?)",
+        (time.time(), time.time()),
+    )
+    fid = cur.lastrowid
+    seed_conn.execute(
+        "INSERT INTO chunks(file_id, chunk_index, text) "
+        "VALUES (?, 0, '# X\n\nbody')",
+        (fid,),
+    )
+    # Inject a synthesis summary directly (bypass LLM).
+    from secondbrain.synthesis import _ensure_schema
+    _ensure_schema(seed_conn)
+    import json
+    seed_conn.execute(
+        "INSERT INTO doc_summaries"
+        "(file_id, tldr, key_points_json, generated_at, input_chars) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (fid, "Tight TLDR.", json.dumps(["a", "b"]), time.time(), 100),
+    )
+    seed_conn.commit()
+    seed_conn.close()
+
+    app = create_app()
+    client_inner = TestClient(app)
+    r = client_inner.get("/file?path=/notes/x.md")
+    assert r.status_code == 200
+    assert "Summary" in r.text
+    assert "Tight TLDR" in r.text
+
+
+def test_file_view_redacts_sensitive_in_chunks(
+    monkeypatch, tmp_path, fake_embedder,
+):
+    """Phase 88 polish — file view chunk previews go through redact.
+    A doc with an SSN in its body shouldn't render the SSN."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from secondbrain.dashboard import create_app
+    from secondbrain.db import connect, init_schema
+
+    cfg = _patch_dashboard(monkeypatch, tmp_path, fake_embedder)
+    seed_conn = connect(cfg.db_path)
+    init_schema(seed_conn, fake_embedder.dim, fake_embedder.name)
+    cur = seed_conn.execute(
+        "INSERT INTO files(path, mtime, size, kind, indexed_at) "
+        "VALUES ('/notes/secret.md', ?, 1, 'document', ?)",
+        (time.time(), time.time()),
+    )
+    fid = cur.lastrowid
+    seed_conn.execute(
+        "INSERT INTO chunks(file_id, chunk_index, text) "
+        "VALUES (?, 0, ?)",
+        (fid, "Personal info: 123-45-6789, never share."),
+    )
+    seed_conn.commit()
+    seed_conn.close()
+
+    app = create_app()
+    client_inner = TestClient(app)
+    r = client_inner.get("/file?path=/notes/secret.md")
+    assert r.status_code == 200
+    assert "[REDACTED:ssn]" in r.text
+    assert "123-45-6789" not in r.text
