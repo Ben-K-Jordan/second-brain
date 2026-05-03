@@ -2948,6 +2948,105 @@ def thanks_draft(
     conn.close()
 
 
+audit_app = typer.Typer(
+    no_args_is_help=False, invoke_without_command=True,
+    help="Round 10 (#6) — view the AI action audit log. Every LLM "
+         "call (drafts, analyses, classifications, extractions) "
+         "lands in ``ai_actions``. Bare invocation lists the most "
+         "recent rows; ``--kind`` filters; ``rollup`` summarises "
+         "today's activity by feature + cost.",
+)
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.callback(invoke_without_command=True)
+def _audit_root(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit", "-n"),
+    kind: str = typer.Option(None, "--kind"),
+) -> None:
+    """List recent AI actions."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from . import ai_audit
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = ai_audit.recent(conn, limit=limit, kind=kind)
+    if not rows:
+        console.print(
+            "[dim]No AI actions logged yet. Run something that "
+            "calls an LLM (draft, classify, summarise) and re-check.[/]",
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="AI actions")
+    table.add_column("when", style="dim")
+    table.add_column("kind")
+    table.add_column("status", style="dim")
+    table.add_column("model", style="dim")
+    table.add_column("cost", justify="right", style="dim")
+    table.add_column("summary")
+    for r in rows:
+        when = time.strftime("%H:%M:%S", time.localtime(r.ts))
+        cost = (
+            f"${r.cents / 100:.4f}" if r.cents > 0 else "·"
+        )
+        status_color = (
+            "green" if r.status == "success"
+            else "yellow" if r.status == "fallback_local"
+            else "red"
+        )
+        table.add_row(
+            when, r.kind,
+            f"[{status_color}]{r.status}[/]",
+            r.model[:24], cost, r.summary[:60],
+        )
+    console.print(table)
+    conn.close()
+
+
+@audit_app.command("rollup")
+def audit_rollup() -> None:
+    """Per-feature roll-up of cost + count over the last 24h."""
+    from . import ai_audit
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rollup = ai_audit.rollup_today(conn)
+    if not rollup:
+        console.print("[dim]No AI activity in the last 24h.[/]")
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="AI cost rollup (24h)")
+    table.add_column("feature")
+    table.add_column("calls", justify="right")
+    table.add_column("cost", justify="right")
+    table.add_column("prompt chars", justify="right", style="dim")
+    table.add_column("response chars", justify="right", style="dim")
+    total_cents = 0.0
+    total_calls = 0
+    for feat, st in rollup.items():
+        total_cents += st["cents"]
+        total_calls += st["n"]
+        cost = (
+            f"${st['cents'] / 100:.4f}"
+            if st["cents"] > 0 else "·"
+        )
+        table.add_row(
+            feat, str(st["n"]), cost,
+            f"{st['prompt_chars']:,}",
+            f"{st['response_chars']:,}",
+        )
+    table.add_row(
+        "[bold]total[/]", f"[bold]{total_calls}[/]",
+        f"[bold]${total_cents / 100:.4f}[/]",
+        "", "",
+    )
+    console.print(table)
+    conn.close()
+
+
 prep_app = typer.Typer(
     no_args_is_help=False, invoke_without_command=True,
     help="Round 9-A — brain-grounded prep for upcoming external "

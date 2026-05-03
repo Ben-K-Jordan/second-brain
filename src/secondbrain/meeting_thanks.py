@@ -632,15 +632,26 @@ def generate_thanks_draft(
     )
     fewshot_block = email_assist._format_fewshot_block(fewshot)
 
+    # Round 10 (#4) — redact every raw-content field before send.
+    # Meeting transcripts are some of the highest-leak content in
+    # the brain (people often share credentials / numbers verbally
+    # and the notetaker captures them verbatim).
+    safe_context = email_assist._safe_for_prompt(
+        context_text, max_chars=4000,
+    )
+    safe_fewshot = email_assist._safe_for_prompt(
+        fewshot_block, max_chars=8000,
+    )
+
     prompt = _THANKS_PROMPT.format(
         user_name=user_name,
         meeting_title=mt.event_title,
         when_str=when_str,
         attendees_str=attendees_str,
         context_source_label=context_label,
-        meeting_context=context_text,
+        meeting_context=safe_context,
         voice_profile_block=voice_block,
-        fewshot_block=fewshot_block,
+        fewshot_block=safe_fewshot,
     )
 
     # Test injection: pass-in drafter takes the prompt directly. Production
@@ -654,6 +665,9 @@ def generate_thanks_draft(
             model="claude-sonnet-4-6", max_tokens=1000,
             feature="meeting_thanks",
             note=f"thanks/{mt.event_title[:30]}",
+            conn=conn,
+            audit_kind="thanks_draft",
+            audit_summary=f"thanks draft for {mt.event_title[:60]!r}",
         )
     if parsed is None:
         return None
@@ -679,12 +693,19 @@ def generate_thanks_draft(
     if voice_profile is not None and primary:
         critique_text = email_assist.critique_draft_against_voice(
             draft=primary, profile=voice_profile, cfg=cfg,
+            conn=conn,
         )
         if critique_text and critique_text.strip().upper() != "OK":
             log.info("meeting_thanks: critique flagged; regenerating")
+            # Round 10 (#4) — defensive redaction on the prior draft
+            # echo even though it's the LLM's own output (could echo
+            # a TODO placeholder the user filled with a real value).
+            safe_primary = email_assist._safe_for_prompt(
+                primary, max_chars=2500,
+            )
             regen_prompt = (
                 prompt
-                + f"\n\nPRIOR DRAFT (REJECTED)\n==========\n{primary}\n"
+                + f"\n\nPRIOR DRAFT (REJECTED)\n==========\n{safe_primary}\n"
                 + "\nVOICE CRITIQUE — fix every item below\n==========\n"
                 + critique_text
             )
@@ -693,6 +714,9 @@ def generate_thanks_draft(
                 model="claude-sonnet-4-6", max_tokens=1000,
                 feature="meeting_thanks",
                 note=f"thanks_regen/{mt.event_title[:30]}",
+                conn=conn,
+                audit_kind="thanks_regen",
+                audit_summary=f"thanks regen for {mt.event_title[:60]!r}",
             )
             if regen is not None:
                 primary = str(regen.get("primary") or primary).strip()

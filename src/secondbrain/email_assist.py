@@ -64,6 +64,27 @@ _DRAFT_PER_TICK = 5
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
 
 
+def _safe_for_prompt(text: str | None, *, max_chars: int) -> str:
+    """Round 10 (#4) — redact-then-truncate before user content
+    enters an LLM prompt that ships to Anthropic.
+
+    Phase 88's ``redact_text`` previously fired only at *render* time;
+    this is the prompt-assembly companion. Order matters: redact first
+    so we don't truncate mid-redaction-marker, then trim. Idempotent
+    and cheap (regex-only).
+    """
+    if not text:
+        return ""
+    try:
+        from .safety import redact_text
+        clean = redact_text(text)
+    except ImportError:
+        clean = text
+    if len(clean) <= max_chars:
+        return clean
+    return clean[:max_chars] + "…"
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         if conn in _SCHEMA_INITIALIZED:
@@ -329,7 +350,12 @@ def _parse_email_header(body: str) -> tuple[str, str]:
     return from_, subject
 
 
-def _default_classifier(from_, subject, body, cfg) -> dict:
+def _default_classifier(
+    from_, subject, body, cfg,
+    *,
+    conn: sqlite3.Connection | None = None,
+    file_id: int | None = None,
+) -> dict:
     """Real Haiku classifier. Bounded body length to keep cost tight.
 
     Phase 89 wiring: when Anthropic isn't usable, fall back to a
@@ -339,7 +365,12 @@ def _default_classifier(from_, subject, body, cfg) -> dict:
     """
     import os
 
-    body_clip = body if len(body) <= 4000 else body[:4000] + "…"
+    # Round 10 (#4 fix) — redact raw email body before sending to
+    # Anthropic. Phase 88 patterns (API keys, JWTs, SSNs) get masked
+    # at prompt-assembly time, not just at render time. The triage
+    # classifier doesn't need to see secrets — it works on subject /
+    # sender / general tone.
+    body_clip = _safe_for_prompt(body, max_chars=4000)
     prompt = _TRIAGE_PROMPT.format(
         from_=from_ or "(unknown)",
         subject=subject or "(no subject)",
@@ -638,6 +669,8 @@ BRAIN CONTEXT (relevant snippets from {user_name}'s knowledge base)
 
 def analyze_email(
     *, from_: str, subject: str, body: str, cfg,
+    conn: sqlite3.Connection | None = None,
+    file_id: int | None = None,
 ) -> EmailAnalysis | None:
     """Round 6 — structured analysis of an incoming email.
 
@@ -650,7 +683,8 @@ def analyze_email(
     drafter so we never hard-fail on a daemon tick.
     """
 
-    body_clip = body if len(body) <= 4000 else body[:4000] + "…"
+    # Round 10 (#4) — redact before send, same rationale as classifier.
+    body_clip = _safe_for_prompt(body, max_chars=4000)
     prompt = _ANALYZE_PROMPT.format(
         from_=from_ or "(unknown)",
         subject=subject or "(no subject)",
@@ -663,6 +697,10 @@ def analyze_email(
         max_tokens=400,
         feature="email_analyze",
         note=f"analyze/{(from_ or '')[:30]}",
+        conn=conn,
+        audit_kind="analyze",
+        audit_summary=f"analyzed email from {from_[:60]!r}",
+        audit_file_id=file_id,
     )
     if not raw:
         return None
@@ -687,18 +725,30 @@ def analyze_email(
 def _llm_json_call(
     *, prompt: str, cfg, model: str, max_tokens: int,
     feature: str, note: str,
+    conn: sqlite3.Connection | None = None,
+    audit_kind: str = "",
+    audit_summary: str = "",
+    audit_file_id: int | None = None,
+    audit_person_id: int | None = None,
 ) -> dict | None:
     """Shared helper: try Anthropic with budget guard, fall back to
     local Ollama, parse JSON. Returns the parsed dict or None.
 
-    Centralises the try-Anthropic-then-local pattern so the analyzer
-    + drafter share one code path. Strips Markdown fences before
-    parsing because both Claude and small local models occasionally
-    wrap output in ```json``` despite being told not to.
+    Round 10 (#6) — when ``conn`` is given, every call records one
+    row in ``ai_actions`` with status (success / fallback_local /
+    budget_exceeded / api_error / no_provider / parse_error) + cost
+    + chars + model. Audit fields are optional kwargs so existing
+    callers keep working unchanged; daemon-owned + dashboard call
+    sites pass them.
     """
     import os
-
     text = ""
+    used_model = model
+    status = "success"
+    err_msg = ""
+    cents_spent = 0.0
+    response_text = ""
+    final_kind = audit_kind or feature
 
     # ---- Primary: Anthropic ----
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -726,6 +776,16 @@ def _llm_json_call(
                     output_tokens=resp.usage.output_tokens,
                     feature=feature, note=note,
                 )
+                # Approx cost in cents using the budget module's table.
+                try:
+                    from .budget import estimate_cost
+                    cents_spent = estimate_cost(
+                        model,
+                        input_tokens=resp.usage.input_tokens,
+                        output_tokens=resp.usage.output_tokens,
+                    ).cents
+                except Exception:  # noqa: BLE001
+                    cents_spent = 0.0
                 text = "".join(
                     b.text for b in resp.content if b.type == "text"
                 ).strip()
@@ -734,37 +794,113 @@ def _llm_json_call(
                     "email_assist: %s budget exhausted, trying local: %s",
                     feature, e,
                 )
+                status = "budget_exceeded"
+                err_msg = str(e)
             except anthropic.APIError as e:
                 log.info(
                     "email_assist: %s API error, trying local: %s",
                     feature, e,
                 )
+                status = "api_error"
+                err_msg = str(e)
+        else:
+            status = "no_provider"
+    else:
+        status = "no_provider"
 
     # ---- Fallback: local Ollama ----
     if not text:
         try:
             from . import local_llm
         except ImportError:
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status="no_provider", prompt_chars=len(prompt),
+                response_chars=0, cents=cents_spent,
+                summary=audit_summary, error="local_llm import failed",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return None
         if not local_llm.is_available(cfg):
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status=status if status != "success" else "no_provider",
+                prompt_chars=len(prompt), response_chars=0,
+                cents=cents_spent, summary=audit_summary,
+                error=err_msg or "no LLM available",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return None
         out = local_llm.complete(prompt, cfg=cfg, max_tokens=max_tokens)
         if out is None:
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status=status if status != "success" else "api_error",
+                prompt_chars=len(prompt), response_chars=0,
+                cents=cents_spent, summary=audit_summary,
+                error=err_msg or "local llm returned None",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return None
         text = out.text.strip()
+        used_model = out.model
+        status = "fallback_local"
         log.info("email_assist: %s via local LLM (%s)", feature, out.model)
 
+    response_text = text
     if not text:
+        _maybe_audit(
+            conn, kind=final_kind, feature=feature, model=used_model,
+            status="parse_error", prompt_chars=len(prompt),
+            response_chars=0, cents=cents_spent, summary=audit_summary,
+            error="empty response",
+            file_id=audit_file_id, person_id=audit_person_id,
+        )
         return None
     if text.startswith("```"):
         text = re.sub(r"^```\w*\s*", "", text)
         text = re.sub(r"\s*```\s*$", "", text)
     try:
         parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         log.info("email_assist: %s JSON parse failed; raw=%r", feature, text[:200])
+        _maybe_audit(
+            conn, kind=final_kind, feature=feature, model=used_model,
+            status="parse_error", prompt_chars=len(prompt),
+            response_chars=len(response_text), cents=cents_spent,
+            summary=audit_summary, error="JSON parse failed",
+            file_id=audit_file_id, person_id=audit_person_id,
+        )
         return None
+    if not isinstance(parsed, dict):
+        _maybe_audit(
+            conn, kind=final_kind, feature=feature, model=used_model,
+            status="parse_error", prompt_chars=len(prompt),
+            response_chars=len(response_text), cents=cents_spent,
+            summary=audit_summary, error="not a JSON object",
+            file_id=audit_file_id, person_id=audit_person_id,
+        )
+        return None
+    _maybe_audit(
+        conn, kind=final_kind, feature=feature, model=used_model,
+        status=status, prompt_chars=len(prompt),
+        response_chars=len(response_text), cents=cents_spent,
+        summary=audit_summary, error="",
+        file_id=audit_file_id, person_id=audit_person_id,
+    )
+    return parsed
+
+
+def _maybe_audit(conn, **kwargs) -> None:
+    """Log to ai_actions when a conn is available; silent no-op
+    otherwise. Keeps audit logging optional + crash-safe."""
+    if conn is None:
+        return
+    try:
+        from . import ai_audit
+        ai_audit.record_action(conn, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---- Round 6 retrieval helpers ---------------------------------------
@@ -1137,6 +1273,7 @@ def generate_draft(
     # ---- Stage 1: analyze ----
     analysis = analyze_email(
         from_=from_, subject=subject, body=body, cfg=cfg,
+        conn=conn, file_id=file_id,
     )
     # ---- Stage 2: targeted retrieval (round 6 + 7) ----
     sender_email = _extract_email_address(from_)
@@ -1175,6 +1312,8 @@ def generate_draft(
         brain_context=brain_block,
         voice_profile=voice_profile,
         fewshot_pairs=fewshot,
+        conn=conn,
+        file_id=file_id,
     )
     if output is None or not (output.primary or output.alternative).strip():
         return None
@@ -1187,6 +1326,7 @@ def generate_draft(
     if voice_profile is not None and output.primary.strip():
         critique_text = critique_draft_against_voice(
             draft=output.primary, profile=voice_profile, cfg=cfg,
+            conn=conn, file_id=file_id,
         )
         if critique_text and critique_text.strip().upper() != "OK":
             log.info(
@@ -1295,6 +1435,8 @@ def _default_drafter(
     brain_context: str = "",
     voice_profile: VoiceProfile | None = None,
     fewshot_pairs: list[tuple[str, str]] | None = None,
+    conn: sqlite3.Connection | None = None,
+    file_id: int | None = None,
 ) -> DraftOutput | None:
     """Round 6 + 7 — structured drafter via Claude Sonnet.
 
@@ -1315,21 +1457,41 @@ def _default_drafter(
     Returns None when both paths fail or the JSON is unparseable —
     caller handles by skipping the persist.
     """
-    body_clip = body if len(body) <= 6000 else body[:6000] + "…"
+    # Round 10 (#4) — redact every raw-content field before send.
+    # The drafter prompt is the most data-heavy LLM call in the
+    # codebase (incoming email + thread history + sender history +
+    # user's sent-mail style samples + brain search hits) so this
+    # is where prompt-side redaction matters most.
+    body_clip = _safe_for_prompt(body, max_chars=6000)
     analysis_block = (
         _format_analysis_block(analysis) if analysis is not None
         else "(analyzer unavailable; infer from email body)"
     )
-    thread_block = _format_history_block(thread_history or [])
-    sender_block = _format_history_block(sender_history or [])
-    brain_block = brain_context or "(no relevant brain context found)"
+    thread_block = _safe_for_prompt(
+        _format_history_block(thread_history or []), max_chars=8000,
+    )
+    sender_block = _safe_for_prompt(
+        _format_history_block(sender_history or []), max_chars=8000,
+    )
+    brain_block = _safe_for_prompt(
+        brain_context or "(no relevant brain context found)",
+        max_chars=4000,
+    )
     voice_block = (
         _format_voice_profile_block(voice_profile)
         if voice_profile is not None
         else "(no voice profile yet — fall back to general rules: be "
         "concrete, match the inferred tone, avoid generic LLM phrases)"
     )
-    fewshot_block = _format_fewshot_block(fewshot_pairs or [])
+    # Style samples + few-shot pairs are user-authored sent mail,
+    # which is the highest-signal but also highest-risk content.
+    # Redact while preserving voice patterns (Phase 88 only masks
+    # secret-shaped substrings — sentence rhythm + sign-offs survive).
+    style_samples_clean = _safe_for_prompt(style_samples, max_chars=6000)
+    fewshot_block = _safe_for_prompt(
+        _format_fewshot_block(fewshot_pairs or []),
+        max_chars=8000,
+    )
 
     prompt = _DRAFT_PROMPT_V2.format(
         user_name=user_name,
@@ -1339,7 +1501,7 @@ def _default_drafter(
         analysis_block=analysis_block,
         thread_block=thread_block,
         sender_block=sender_block,
-        style_samples=style_samples,
+        style_samples=style_samples_clean,
         brain_block=brain_block,
         voice_profile_block=voice_block,
         fewshot_block=fewshot_block,
@@ -1352,6 +1514,10 @@ def _default_drafter(
         max_tokens=1200,
         feature="email_draft",
         note=f"email_draft/{(from_ or '')[:30]}",
+        conn=conn,
+        audit_kind="draft",
+        audit_summary=f"drafted reply to {from_[:60]!r}",
+        audit_file_id=file_id,
     )
     if parsed is None:
         return None
@@ -2041,8 +2207,15 @@ EMAILS
 
 def _voice_register_notes(bodies: list[str], cfg) -> str:
     """One Haiku call — qualitative voice summary. Failure returns
-    empty string; the drafter falls back to the structural patterns."""
-    sample_block = "\n\n---\n\n".join(b[:800] for b in bodies[:10])
+    empty string; the drafter falls back to the structural patterns.
+
+    Round 10 (#4) — sent-mail samples get redacted before they hit
+    the prompt. Voice patterns (sentence rhythm, sign-offs) survive
+    Phase 88 masking because it only catches secret-shaped substrings.
+    """
+    sample_block = "\n\n---\n\n".join(
+        _safe_for_prompt(b, max_chars=800) for b in bodies[:10]
+    )
     if not sample_block.strip():
         return ""
     parsed = _llm_text_call(
@@ -2059,10 +2232,22 @@ def _voice_register_notes(bodies: list[str], cfg) -> str:
 def _llm_text_call(
     *, prompt: str, cfg, model: str, max_tokens: int,
     feature: str, note: str,
+    conn: sqlite3.Connection | None = None,
+    audit_kind: str = "",
+    audit_summary: str = "",
+    audit_file_id: int | None = None,
+    audit_person_id: int | None = None,
 ) -> str:
     """Like _llm_json_call but for plain-text output (voice notes,
-    critique). Same try-Anthropic-then-local pattern."""
+    critique). Same try-Anthropic-then-local pattern. Same round-10
+    audit hooks (optional ``conn`` enables ai_actions logging)."""
     text = ""
+    used_model = model
+    status = "success"
+    err_msg = ""
+    cents_spent = 0.0
+    final_kind = audit_kind or feature
+
     if os.environ.get("ANTHROPIC_API_KEY"):
         try:
             import anthropic
@@ -2072,6 +2257,7 @@ def _llm_text_call(
             from .budget import (
                 BudgetExceededError,
                 check_budget,
+                estimate_cost,
                 record_usage,
             )
             try:
@@ -2088,24 +2274,71 @@ def _llm_text_call(
                     output_tokens=resp.usage.output_tokens,
                     feature=feature, note=note,
                 )
+                try:
+                    cents_spent = estimate_cost(
+                        model,
+                        input_tokens=resp.usage.input_tokens,
+                        output_tokens=resp.usage.output_tokens,
+                    ).cents
+                except Exception:  # noqa: BLE001
+                    cents_spent = 0.0
                 text = "".join(
                     b.text for b in resp.content if b.type == "text"
                 ).strip()
             except BudgetExceededError as e:
                 log.info("email_assist: %s budget exhausted: %s", feature, e)
+                status = "budget_exceeded"
+                err_msg = str(e)
             except anthropic.APIError as e:
                 log.info("email_assist: %s API error: %s", feature, e)
+                status = "api_error"
+                err_msg = str(e)
+        else:
+            status = "no_provider"
+    else:
+        status = "no_provider"
     if not text:
         try:
             from . import local_llm
         except ImportError:
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status=status, prompt_chars=len(prompt),
+                response_chars=0, cents=cents_spent,
+                summary=audit_summary, error=err_msg or "no LLM available",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return ""
         if not local_llm.is_available(cfg):
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status=status, prompt_chars=len(prompt),
+                response_chars=0, cents=cents_spent,
+                summary=audit_summary, error=err_msg or "no LLM available",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return ""
         out = local_llm.complete(prompt, cfg=cfg, max_tokens=max_tokens)
         if out is None:
+            _maybe_audit(
+                conn, kind=final_kind, feature=feature, model=used_model,
+                status="api_error", prompt_chars=len(prompt),
+                response_chars=0, cents=cents_spent,
+                summary=audit_summary,
+                error=err_msg or "local llm returned None",
+                file_id=audit_file_id, person_id=audit_person_id,
+            )
             return ""
         text = out.text.strip()
+        used_model = out.model
+        status = "fallback_local"
+    _maybe_audit(
+        conn, kind=final_kind, feature=feature, model=used_model,
+        status=status, prompt_chars=len(prompt),
+        response_chars=len(text), cents=cents_spent,
+        summary=audit_summary, error="",
+        file_id=audit_file_id, person_id=audit_person_id,
+    )
     return text
 
 
@@ -2348,20 +2581,30 @@ DRAFT
 
 def critique_draft_against_voice(
     *, draft: str, profile: VoiceProfile, cfg,
+    conn: sqlite3.Connection | None = None,
+    file_id: int | None = None,
 ) -> str:
     """Round 7 — Haiku call comparing the draft to the voice profile.
     Returns "OK" when the draft passes, otherwise a bullet list of
-    mismatches. Caller decides whether to regenerate."""
+    mismatches. Caller decides whether to regenerate.
+
+    Round 10 (#4) — defensive redaction on the draft. The draft is
+    the LLM's own output so secrets shouldn't be there, but if the
+    user typed a real value into a ``<TODO: ...>`` placeholder the
+    drafter may have echoed it; mask before re-sending."""
     if not draft.strip():
         return "OK"
     prompt = _VOICE_CRITIQUE_PROMPT.format(
         profile_block=_format_voice_profile_block(profile),
-        draft=draft.strip(),
+        draft=_safe_for_prompt(draft.strip(), max_chars=4000),
     )
     txt = _llm_text_call(
         prompt=prompt, cfg=cfg,
         model="claude-haiku-4-5", max_tokens=200,
         feature="voice_critique", note="critique",
+        conn=conn, audit_kind="voice_critique",
+        audit_summary="critiqued draft against voice profile",
+        audit_file_id=file_id,
     )
     return (txt or "").strip() or "OK"
 

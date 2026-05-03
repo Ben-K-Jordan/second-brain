@@ -76,6 +76,15 @@ def generate_tags(
     except ImportError:
         return []
 
+    # Round 10 (#4) — redact secret-shaped tokens before send. Tags
+    # are about topic / theme, not literal contents — masking doesn't
+    # hurt tag quality and prevents API keys from leaking via the
+    # auto-tagger pipeline.
+    try:
+        from .safety import redact_text
+        chunk_text = redact_text(chunk_text)
+    except ImportError:
+        pass
     snippet = chunk_text if len(chunk_text) <= 1500 else chunk_text[:1500] + "..."
     model = model or cfg.tag_model
     try:

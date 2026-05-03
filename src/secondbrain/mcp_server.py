@@ -1351,6 +1351,40 @@ def local_llm_status() -> str:
     )
 
 
+@mcp.tool()
+def list_ai_actions(
+    limit: int = 20, kind: str = "",
+) -> str:
+    """Round 10 (#6) — list the most-recent AI actions logged in
+    ``ai_actions``. Use to answer 'what has the assistant done
+    recently?' / 'why was that draft generated?' style questions.
+
+    ``kind`` filters by action type ('draft', 'analyze',
+    'thanks_draft', 'voice_critique', 'extract_promise', etc).
+    Empty string returns all kinds."""
+    from . import ai_audit
+
+    cfg, conn, _, _ = _get_read_state()
+    rows = ai_audit.recent(
+        conn, limit=limit,
+        kind=(kind or None) if kind else None,
+    )
+    if not rows:
+        return "No AI actions logged yet."
+    lines = [f"Recent AI actions ({len(rows)}):"]
+    for r in rows:
+        when = time.strftime("%m-%d %H:%M", time.localtime(r.ts))
+        cost = (
+            f" ${r.cents / 100:.4f}" if r.cents > 0 else ""
+        )
+        err = f" ERROR: {r.error}" if r.error else ""
+        lines.append(
+            f"  · {when} [{r.kind}] {r.status} ({r.model}){cost}"
+            f" — {_safe(r.summary)}{err}",
+        )
+    return "\n".join(lines)
+
+
 def run() -> None:
     """Run the MCP server over stdio. Used by `secondbrain serve`."""
     _get_state()  # warm caches before we start serving

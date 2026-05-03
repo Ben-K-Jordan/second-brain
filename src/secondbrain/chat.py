@@ -683,18 +683,27 @@ def _ask_brain_local_fallback(
         log.warning("local fallback: search failed: %s", e)
         results = []
 
+    # Round 10 (#4) — redact every snippet before it lands in the
+    # prompt, even though this fallback path goes to a local model
+    # by default. The user can configure local_llm_host to point at
+    # a remote Ollama, and we shouldn't assume "local" means safe.
+    try:
+        from .safety import redact_text as _redact_chunk
+    except ImportError:
+        def _redact_chunk(s):
+            return s
     citations: list[Citation] = []
     context_blocks: list[str] = []
     for r in results[:6]:
         snippet = r.text if len(r.text) <= 600 else r.text[:600] + "…"
         context_blocks.append(
-            f"[{r.file_path}]\n{snippet}",
+            f"[{r.file_path}]\n{_redact_chunk(snippet)}",
         )
         citations.append(Citation(
             chunk_id=r.chunk_id,
             chunk_index=r.chunk_index,
             file_path=r.file_path,
-            text=snippet,
+            text=_redact_chunk(snippet),
             score=r.score,
             kind="brain",
         ))

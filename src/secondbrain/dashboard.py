@@ -918,6 +918,7 @@ PALETTE_JS = r"""
         {kind: 'page', icon: '☼', label: 'Briefings',  href: '/briefings',     meta: 'pre-meeting'},
         {kind: 'page', icon: '☼', label: 'Daily',      href: '/briefing',      meta: 'briefing'},
         {kind: 'page', icon: '#', label: 'Queries',    href: '/queries',       meta: 'history'},
+        {kind: 'page', icon: '⊕', label: 'Audit',      href: '/audit',         meta: 'AI actions log'},
         {kind: 'page', icon: '+', label: 'Ingest URL', href: '/ingest',        meta: ''},
     ];
 
@@ -1113,6 +1114,7 @@ _NAV_GROUPS = [
     ]),
     ("System", [
         ("Overview",  "/"),
+        ("Audit",     "/audit"),
         ("Folders",   "/folders"),
         ("Queries",   "/queries"),
         ("Ingest",    "/ingest"),
@@ -4707,6 +4709,107 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         cfg, conn, _, _ = get_state()
         meeting_thanks.generate_thanks_draft(conn, cfg, mt_id)
         return RedirectResponse(url="/drafts", status_code=303)
+
+    # --- Round 10 (#6): AI audit log ----------------------------------
+
+    @app.get("/audit", response_class=HTMLResponse)
+    def audit_view():
+        """Round 10 (#6) — list every AI action with cost / status /
+        summary. Lets the user answer "why did the AI do X?" without
+        reading source code."""
+        from . import ai_audit
+
+        cfg, conn, _, _ = get_read_state()
+        rows = ai_audit.recent(conn, limit=200)
+        if not rows:
+            body = (
+                "<h1>AI audit log</h1>"
+                "<div class='card'><p class='muted'>"
+                "No AI actions logged yet. Generate a draft, run "
+                "summarisation, or trigger a thank-you and the "
+                "events will land here."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Audit", body, "audit"))
+        kind_counts = ai_audit.by_kind(conn, days=7)
+        rollup = ai_audit.rollup_today(conn)
+        total_cents = sum(s["cents"] for s in rollup.values())
+        total_calls = sum(s["n"] for s in rollup.values())
+
+        # Top: 24h summary card with per-feature breakdown.
+        rollup_rows = "".join(
+            f"<div class='stat'>"
+            f"<span><strong>{escape(feat)}</strong> "
+            f"<span class='muted'>{stats['n']} call(s)</span></span>"
+            f"<span class='v'>${stats['cents'] / 100:.4f}</span>"
+            f"</div>"
+            for feat, stats in rollup.items()
+        )
+        rollup_html = (
+            "<div class='card' style='margin-bottom:16px;'>"
+            f"<h2>Last 24h — ${total_cents / 100:.4f} across "
+            f"{total_calls} call(s)</h2>"
+            f"{rollup_rows or '<p class=muted>(no spend recorded)</p>'}"
+            "</div>"
+        )
+
+        # Kind chips for the last 7 days.
+        chips_html = ""
+        if kind_counts:
+            chip_items = " ".join(
+                f"<span class='kbd' style='margin:2px;'>"
+                f"{escape(k)}: {n}</span>"
+                for k, n in kind_counts.items()
+            )
+            chips_html = (
+                f"<div class='card' style='margin-bottom:16px;'>"
+                f"<h2>Last 7 days by kind</h2>{chip_items}</div>"
+            )
+
+        # Action table.
+        items = []
+        for r in rows:
+            when = time.strftime(
+                "%a %b %d %H:%M:%S", time.localtime(r.ts),
+            )
+            cost = (
+                f"${r.cents / 100:.4f}"
+                if r.cents > 0 else "·"
+            )
+            status_class = (
+                "good" if r.status == "success"
+                else "warn" if r.status == "fallback_local"
+                else "bad"
+            )
+            err_html = (
+                f"<div class='muted' style='font-size:11px;"
+                f"color:var(--bad);'>{escape(r.error)}</div>"
+                if r.error else ""
+            )
+            items.append(
+                f"<div class='stat' style='align-items:flex-start;'>"
+                f"<span style='flex:1;'>"
+                f"<span class='muted' style='font-size:11px;'>{when}</span> "
+                f"<strong>{escape(r.kind)}</strong> "
+                f"<span class='muted'>{escape(r.model[:24])}</span>"
+                f"<div style='margin-top:2px;'>"
+                f"{escape(r.summary)}</div>"
+                f"{err_html}"
+                f"</span>"
+                f"<span class='v {status_class}'>"
+                f"<div>{escape(r.status)}</div>"
+                f"<div class='muted' style='font-size:11px;'>{cost}</div>"
+                f"</span></div>"
+            )
+        body = (
+            f"<h1>AI audit log</h1>"
+            f"{rollup_html}"
+            f"{chips_html}"
+            f"<div class='card'><h2>Recent actions ({len(rows)})</h2>"
+            + "".join(items)
+            + "</div>"
+        )
+        return HTMLResponse(_layout("Audit", body, "audit"))
 
     # --- Round 9-A: meeting prep page ---------------------------------
 

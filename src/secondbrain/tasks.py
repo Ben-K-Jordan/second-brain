@@ -555,6 +555,9 @@ TRANSCRIPT
 
 def extract_promises_from_text(
     text: str, cfg=None,
+    *,
+    conn: sqlite3.Connection | None = None,
+    file_id: int | None = None,
 ) -> list[dict]:
     """Round 9-C — one structured extraction call per chunk.
 
@@ -568,12 +571,16 @@ def extract_promises_from_text(
     body = (text or "").strip()
     if len(body) < 50:
         return []
-    if len(body) > 6000:
-        body = body[:6000] + "…"
     try:
-        from .email_assist import _llm_json_call
+        from .email_assist import _llm_json_call, _safe_for_prompt
     except ImportError:
         return []
+    # Round 10 (#4) — redact transcript before sending to Anthropic.
+    # Transcripts are the highest-leak content: people often dictate
+    # numbers / credentials / passwords that the notetaker captures
+    # verbatim. Promise extraction works on prose structure ("I'll
+    # send you X") so masking secret-shaped tokens doesn't hurt recall.
+    body = _safe_for_prompt(body, max_chars=6000)
     parsed = _llm_json_call(
         prompt=_PROMISE_PROMPT.format(body=body),
         cfg=cfg,
@@ -581,6 +588,10 @@ def extract_promises_from_text(
         max_tokens=600,
         feature="task_promises",
         note="extract_promises",
+        conn=conn,
+        audit_kind="extract_promise",
+        audit_summary="extracted promises from transcript",
+        audit_file_id=file_id,
     )
     if parsed is None:
         return []
@@ -674,7 +685,9 @@ def materialize_promises_from_transcripts(
         ).fetchall()
         body = "\n\n".join((br["text"] or "") for br in body_rows)
         title = _doc_title(conn, fid, path)
-        promises = extract_promises_from_text(body, cfg)
+        promises = extract_promises_from_text(
+            body, cfg, conn=conn, file_id=fid,
+        )
         n_for_doc = 0
         for p in promises:
             text = p["text"]

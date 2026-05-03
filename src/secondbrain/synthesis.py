@@ -270,10 +270,19 @@ def _default_summary_generator(title: str, body: str, cfg) -> dict:
     """
     import os
 
-    body_clip = (
-        body if len(body) <= _AUTO_SUMMARY_INPUT_CAP
-        else body[:_AUTO_SUMMARY_INPUT_CAP] + "…"
-    )
+    # Round 10 (#4) — redact-then-truncate before send. Doc bodies
+    # can be anything: notes, emails, code snippets — possibly with
+    # API keys or other secrets. Phase 88 patterns get masked here
+    # so they never leave the local machine via Anthropic. TL;DR
+    # generation only needs prose structure, not literal secrets.
+    try:
+        from .email_assist import _safe_for_prompt
+        body_clip = _safe_for_prompt(body, max_chars=_AUTO_SUMMARY_INPUT_CAP)
+    except ImportError:
+        body_clip = (
+            body if len(body) <= _AUTO_SUMMARY_INPUT_CAP
+            else body[:_AUTO_SUMMARY_INPUT_CAP] + "…"
+        )
     prompt = _TLDR_PROMPT.format(title=title, body=body_clip)
 
     # ---- Primary: Anthropic ----

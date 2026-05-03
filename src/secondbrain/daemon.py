@@ -519,6 +519,14 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _extract_promises(conn, cfg),
     ))
 
+    # Round 10 (#6) — nightly trim of the AI audit log (30d retention).
+    from .ai_audit import trim_old as _ai_trim
+    sched.register(Job(
+        name="ai_audit_trim",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=24),
+        fn=lambda conn: _ai_trim(conn),
+    ))
+
     return sched
 
 

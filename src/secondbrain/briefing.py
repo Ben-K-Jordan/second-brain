@@ -148,9 +148,19 @@ def _format_digest_for_llm(d: BriefingDigest) -> str:
         lines.append("")
 
     if d.sample_chunks:
+        # Round 10 (#4) — redact chunk text before it lands in the
+        # LLM prompt that ships to Anthropic. The briefing's whole
+        # point is "what entered the brain"; secrets in the brain
+        # don't need to be shipped to the API to summarise it.
+        try:
+            from .safety import redact_text as _redact
+        except ImportError:
+            def _redact(s):
+                return s
         lines.append("## Sample chunks (for flavor — not exhaustive)")
         for path, idx, text in d.sample_chunks:
-            snippet = text if len(text) <= 600 else text[:600] + "..."
+            clean = _redact(text)
+            snippet = clean if len(clean) <= 600 else clean[:600] + "..."
             lines.append(f"### {path} (chunk {idx})")
             lines.append(snippet)
             lines.append("")

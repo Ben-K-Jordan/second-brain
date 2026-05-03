@@ -506,7 +506,7 @@ def test_drafter_includes_voice_blocks_in_prompt(tmp_cfg):
     )
     captured: dict = {}
 
-    def _capture(*, prompt, cfg, model, max_tokens, feature, note):
+    def _capture(*, prompt, cfg, model, max_tokens, feature, note, **_kw):
         captured["prompt"] = prompt
         return {
             "primary": "ok",
