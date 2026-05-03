@@ -252,6 +252,12 @@ class Config:
     # the connector. Window controls how far back to pull each sync.
     readwise_window_days: int = 365
 
+    # Phase 89 — local LLM fallback (Ollama). When the primary chat
+    # fails (offline / budget exhausted), fall back to a local model.
+    # Empty host disables the fallback entirely.
+    local_llm_host: str = "http://localhost:11434"
+    local_llm_model: str = "llama3.1"
+
     # Resume-fit scoring. Drop one or many resumes (PM-flavoured, eng-
     # flavoured, etc.) here; the watchlist runner embeds them and scores
     # job postings against them so "great fit" / "stretch" labels appear
@@ -617,6 +623,10 @@ def load_config(path: Path | None = None) -> Config:
             cfg.oura_window_days = int(data["oura_window_days"])
         if "readwise_window_days" in data:
             cfg.readwise_window_days = int(data["readwise_window_days"])
+        if "local_llm_host" in data:
+            cfg.local_llm_host = str(data["local_llm_host"])
+        if "local_llm_model" in data:
+            cfg.local_llm_model = str(data["local_llm_model"])
         if "capture_imap_folders" in data:
             cfg.capture_imap_folders = tuple(data["capture_imap_folders"])
         if "photo_capture_folder" in data:

@@ -127,13 +127,18 @@ def _matching_entity_keys(conn, query: str, fuzzy: bool) -> list[str]:
 def _format_results(results, header: str) -> str:
     if not results:
         return f"{header}\n\n(no matches)"
+    # Phase 88: redact sensitive content before surfacing to chat /
+    # MCP responses. Indexes still hold the verbatim text — we redact
+    # only at the render boundary so search recall isn't crippled.
+    from .safety import redact_text
+
     lines = [header, ""]
     for i, r in enumerate(results, 1):
         sources = "+".join(r.sources)
         tag = "reranked" if r.reranked else sources
         lines.append(f"### {i}. {r.file_path} (chunk {r.chunk_index}, via {tag}, score={r.score:.4f})")
         snippet = r.text if len(r.text) <= 1200 else r.text[:1200] + "..."
-        lines.append(snippet)
+        lines.append(redact_text(snippet))
         lines.append("")
     return "\n".join(lines)
 
