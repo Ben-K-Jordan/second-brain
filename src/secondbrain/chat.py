@@ -272,7 +272,11 @@ def stream_chat(
         return
 
     try:
-        check_budget(cfg, "anthropic")
+        # Round 15 (audit-found gap A2) — pass feature= so the
+        # per-feature 'chat' bucket in cfg.feature_budget_cents is
+        # actually consulted; before this only the global provider
+        # cap could fire.
+        check_budget(cfg, "anthropic", feature="chat")
     except BudgetExceededError as e:
         yield ChatTurnEvent("error", f"Daily Anthropic budget exceeded: {e}")
         return
@@ -421,6 +425,9 @@ def stream_chat(
                 input_tokens=getattr(response.usage, "input_tokens", 0),
                 output_tokens=getattr(response.usage, "output_tokens", 0),
                 note=f"chat:iter{iteration}",
+                # Round 15 (audit-found gap A2) — explicit feature so
+                # per-feature budget bucket gets credited.
+                feature="chat",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("chat usage recording failed: %s", e)
@@ -488,6 +495,7 @@ def stream_chat(
                     cfg, "anthropic", "anthropic-web-search",
                     input_tokens=web_search_requests,
                     note=f"web_search:iter{iteration}",
+                    feature="chat",
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("web_search usage recording failed: %s", e)

@@ -198,7 +198,9 @@ def generate_briefing(
     user_content = _format_digest_for_llm(digest)
 
     try:
-        check_budget(cfg, "anthropic")
+        # Round 15 (audit-found gap A2) — explicit feature so the
+        # 'briefing' bucket in cfg.feature_budget_cents is consulted.
+        check_budget(cfg, "anthropic", feature="briefing")
     except BudgetExceededError as e:
         return f"(briefing skipped: {e})"
 
@@ -224,6 +226,7 @@ def generate_briefing(
         input_tokens=response.usage.input_tokens + response.usage.cache_read_input_tokens,
         output_tokens=response.usage.output_tokens,
         note=f"briefing/{digest.hours}h",
+        feature="briefing",
     )
 
     text_parts: list[str] = []

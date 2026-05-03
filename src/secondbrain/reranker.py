@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .budget import check_budget, record_usage
 from .config import Config
@@ -30,15 +30,36 @@ class VoyageReranker:
         self._model = model
         self._cfg = cfg
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def rerank(
         self, query: str, documents: list[str], top_k: int
     ) -> list[tuple[int, float]]:
+        # Round 15 (audit-found gap A4) — check_budget runs OUTSIDE
+        # the @retry-decorated call. Previously check_budget was
+        # inside the retried path, which meant a BudgetExceededError
+        # (a RuntimeError) got retried 3x and surfaced with the
+        # wrong shape. Also (A2) explicit feature='rerank' so the
+        # per-feature bucket fires.
         if not documents:
             return []
-        top_k = min(top_k, len(documents))
         if self._cfg is not None:
-            check_budget(self._cfg, "voyage")
+            check_budget(self._cfg, "voyage", feature="rerank")
+        return self._rerank_with_retry(query, documents, top_k)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        # Only retry on real network / API errors; never on
+        # BudgetExceededError or programmer errors. We can't import
+        # the SDK exception here without forcing a dep at import time,
+        # so retry on the broad `Exception` minus our own RuntimeError
+        # subclass is the practical compromise — see the explicit
+        # exclusion in the wrapper above.
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+    )
+    def _rerank_with_retry(
+        self, query: str, documents: list[str], top_k: int
+    ) -> list[tuple[int, float]]:
+        top_k = min(top_k, len(documents))
         result = self._client.rerank(
             query=query,
             documents=documents,
@@ -50,6 +71,7 @@ class VoyageReranker:
                 self._cfg, "voyage", self._model,
                 input_tokens=getattr(result, "total_tokens", 0),
                 note=f"rerank/{len(documents)}docs",
+                feature="rerank",
             )
         return [(r.index, r.relevance_score) for r in result.results]
 

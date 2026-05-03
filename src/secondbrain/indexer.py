@@ -381,37 +381,50 @@ def index_file(
                 log.warning("embedding failed for %s: %s", path, e)
                 return IndexResult(path, "error", reason=f"embedding: {e}")
 
-    file_id = upsert_file(
-        conn,
-        path=str(path),
-        mtime=st.st_mtime,
-        size=st.st_size,
-        kind=kind,
-        content_hash=chash,
-    )
-    chunk_ids: list[int] = []
-    if chunk_texts:
-        chunk_ids = replace_chunks(
-            conn, file_id,
-            list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
-        )
-
-    if will_embed_image:
-        try:
-            img_emb = image_embedder.embed_image(path)
-            upsert_image_embedding(
-                conn, file_id, image_embedder.name, image_embedder.dim, img_emb
+    # Round 15 (audit-found gap C2) — single atomic transaction
+    # over upsert_file → replace_chunks → entity extraction → links.
+    # Without this, an exception between upsert_file and conn.commit()
+    # leaves an orphaned `files` row in the open implicit transaction
+    # that gets committed alongside the next file's writes — search
+    # then returns the orphan with zero hits and no signal it needs
+    # re-indexing. ``with conn:`` rolls back on exception.
+    try:
+        with conn:
+            file_id = upsert_file(
+                conn,
+                path=str(path),
+                mtime=st.st_mtime,
+                size=st.st_size,
+                kind=kind,
+                content_hash=chash,
             )
-        except Exception as e:
-            # Don't fail the whole file - OCR (if any) is already stored.
-            log.warning("image embedding failed for %s: %s", path, e)
+            chunk_ids: list[int] = []
+            if chunk_texts:
+                chunk_ids = replace_chunks(
+                    conn, file_id,
+                    list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
+                )
 
-    _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=str(path))
+            if will_embed_image:
+                try:
+                    img_emb = image_embedder.embed_image(path)
+                    upsert_image_embedding(
+                        conn, file_id, image_embedder.name,
+                        image_embedder.dim, img_emb,
+                    )
+                except Exception as e:
+                    # Don't fail the whole file - OCR (if any) is already stored.
+                    log.warning("image embedding failed for %s: %s", path, e)
 
-    if chunk_ids:
-        _link_after_index(conn, file_id)
+            _run_entity_extraction(
+                conn, chunk_ids, chunk_texts, entity_extractor, label=str(path),
+            )
 
-    conn.commit()
+            if chunk_ids:
+                _link_after_index(conn, file_id)
+    except Exception as e:
+        log.warning("indexer write transaction rolled back for %s: %s", path, e)
+        return IndexResult(path, "error", reason=f"transaction: {e}")
     return IndexResult(path, "indexed", chunks=len(chunk_texts))
 
 
@@ -468,6 +481,18 @@ def dedupe_existing(
         "GROUP BY content_hash HAVING n > 1"
     ).fetchall()
 
+    # Round 15 (audit-found gap F1) — pre-compute per-file chunk
+    # counts in ONE grouped query instead of issuing
+    # SELECT COUNT(*) FROM chunks WHERE file_id = ? per duplicate.
+    # At ~10k files the per-row count is fine; at 100k it hammers
+    # the DB. One grouped query is constant in number of round-trips.
+    chunk_counts: dict[int, int] = {}
+    if rows:
+        for cc_row in conn.execute(
+            "SELECT file_id, COUNT(*) AS c FROM chunks GROUP BY file_id"
+        ).fetchall():
+            chunk_counts[cc_row["file_id"]] = cc_row["c"]
+
     converted = 0
     chunks_freed = 0
     aliased: list[tuple[str, str]] = []
@@ -484,10 +509,7 @@ def dedupe_existing(
         canonical_id = canonical["id"]
         for dup in members[1:]:
             dup_id = dup["id"]
-            chunk_count = conn.execute(
-                "SELECT COUNT(*) AS c FROM chunks WHERE file_id = ?", (dup_id,)
-            ).fetchone()["c"]
-            chunks_freed += chunk_count
+            chunks_freed += chunk_counts.get(dup_id, 0)
             aliased.append((canonical["path"], dup["path"]))
             if dry_run:
                 converted += 1
@@ -770,27 +792,35 @@ def index_text(
         log.warning("embedding failed for %s: %s", virtual_path, e)
         return IndexResult(label_path, "error", reason=f"embedding: {e}")
 
-    file_id = upsert_file(
-        conn,
-        path=virtual_path,
-        mtime=mtime,
-        size=len(text.encode("utf-8", errors="replace")),
-        kind=kind,
-        content_hash=chash,
-    )
-    chunk_ids = replace_chunks(
-        conn, file_id,
-        list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
-    )
+    # Round 15 (C2) — atomic transaction; see index_file comment.
+    try:
+        with conn:
+            file_id = upsert_file(
+                conn,
+                path=virtual_path,
+                mtime=mtime,
+                size=len(text.encode("utf-8", errors="replace")),
+                kind=kind,
+                content_hash=chash,
+            )
+            chunk_ids = replace_chunks(
+                conn, file_id,
+                list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
+            )
 
-    _run_entity_extraction(
-        conn, chunk_ids, chunk_texts, entity_extractor, label=virtual_path
-    )
+            _run_entity_extraction(
+                conn, chunk_ids, chunk_texts, entity_extractor,
+                label=virtual_path,
+            )
 
-    if chunk_ids:
-        _link_after_index(conn, file_id)
-
-    conn.commit()
+            if chunk_ids:
+                _link_after_index(conn, file_id)
+    except Exception as e:
+        log.warning(
+            "indexer write transaction rolled back for %s: %s",
+            virtual_path, e,
+        )
+        return IndexResult(label_path, "error", reason=f"transaction: {e}")
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
 
 
@@ -869,25 +899,33 @@ def index_url(
         log.warning("embedding failed for url %s: %s", url, e)
         return IndexResult(label_path, "error", reason=f"embedding: {e}")
 
-    file_id = upsert_file(
-        conn,
-        path=url,
-        mtime=time.time(),
-        size=len(text.encode("utf-8", errors="replace")),
-        kind="url",
-        content_hash=chash,
-    )
-    chunk_ids = replace_chunks(
-        conn, file_id,
-        list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
-    )
+    # Round 15 (C2) — atomic transaction; see index_file comment.
+    try:
+        with conn:
+            file_id = upsert_file(
+                conn,
+                path=url,
+                mtime=time.time(),
+                size=len(text.encode("utf-8", errors="replace")),
+                kind="url",
+                content_hash=chash,
+            )
+            chunk_ids = replace_chunks(
+                conn, file_id,
+                list(zip(chunk_texts, embeddings, chunk_offsets, strict=True)),
+            )
 
-    _run_entity_extraction(conn, chunk_ids, chunk_texts, entity_extractor, label=url)
+            _run_entity_extraction(
+                conn, chunk_ids, chunk_texts, entity_extractor, label=url,
+            )
 
-    if chunk_ids:
-        _link_after_index(conn, file_id)
-
-    conn.commit()
+            if chunk_ids:
+                _link_after_index(conn, file_id)
+    except Exception as e:
+        log.warning(
+            "indexer write transaction rolled back for url %s: %s", url, e,
+        )
+        return IndexResult(label_path, "error", reason=f"transaction: {e}")
     return IndexResult(label_path, "indexed", chunks=len(chunk_texts))
 
 

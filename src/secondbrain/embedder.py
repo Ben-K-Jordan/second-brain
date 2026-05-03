@@ -60,23 +60,30 @@ class VoyageEmbedder:
     def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         if not texts:
             return []
-        if self._cfg is not None:
-            check_budget(self._cfg, "voyage")
 
         out: list[list[float]] = []
         total_tokens = 0
+        # Round 15 (audit-found gap A3) — gate AND record per batch
+        # so a 50k-chunk bulk index that crosses the cap mid-stream
+        # actually halts (instead of running to completion silently
+        # past the cap). Also keeps the dashboard spend graph
+        # accurate during long-running indexes instead of showing
+        # $0 until the very last batch lands. A2: explicit
+        # feature='embed' so the per-feature bucket fires.
         for start in range(0, len(texts), _VOYAGE_BATCH_SIZE):
+            if self._cfg is not None:
+                check_budget(self._cfg, "voyage", feature="embed")
             chunk = texts[start:start + _VOYAGE_BATCH_SIZE]
             embeddings, tokens = self._embed_batch(chunk, input_type)
             out.extend(embeddings)
             total_tokens += tokens
-
-        if self._cfg is not None:
-            record_usage(
-                self._cfg, "voyage", self.name,
-                input_tokens=total_tokens,
-                note=f"embed/{input_type}/{len(texts)}",
-            )
+            if self._cfg is not None:
+                record_usage(
+                    self._cfg, "voyage", self.name,
+                    input_tokens=tokens,
+                    note=f"embed/{input_type}/batch",
+                    feature="embed",
+                )
         return out
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:

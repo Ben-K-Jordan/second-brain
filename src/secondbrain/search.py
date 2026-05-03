@@ -68,7 +68,9 @@ def hyde_rewrite(
         return query
 
     try:
-        check_budget(cfg, "anthropic")
+        # Round 15 (audit-found gap A2) — feature= so per-feature
+        # 'hyde' bucket actually fires before the global cap.
+        check_budget(cfg, "anthropic", feature="hyde")
     except BudgetExceededError as e:
         log.warning("HyDE skipped: %s", e)
         return query
@@ -88,6 +90,7 @@ def hyde_rewrite(
                 input_tokens=getattr(response.usage, "input_tokens", 0),
                 output_tokens=getattr(response.usage, "output_tokens", 0),
                 note="hyde",
+                feature="hyde",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("HyDE usage recording failed: %s", e)

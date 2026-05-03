@@ -20,6 +20,13 @@ dependencies = [
     "platformdirs>=4.0",
     "rich>=13.0",
     "tenacity>=9.0",
+    # Round 15 (audit-found gap J1) — both were imported at module
+    # level by chat.py / briefing.py / email_assist.py / every
+    # connector but missing from declared deps. A clean
+    # `pip install second-brain` would ImportError on the first
+    # chat call.
+    "anthropic>=0.40",
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]

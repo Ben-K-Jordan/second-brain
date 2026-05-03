@@ -225,9 +225,22 @@ def run_daemon(cfg: Config, log_path: Path | None = None) -> None:
     try:
         while True:
             time.sleep(1)
-            sched.tick(
-                cfg=cfg, conn=conn, embedder=embedder, reranker=reranker,
-            )
+            # Round 15 (audit-found gap B1) — wrap each tick in
+            # try/except so a transient sqlite3.OperationalError
+            # (lock contention, disk full, schema-init race) inside
+            # Scheduler.tick can't kill the daemon. Per-job errors
+            # are already swallowed inside Scheduler.tick itself,
+            # but its own bookkeeping queries weren't covered.
+            try:
+                sched.tick(
+                    cfg=cfg, conn=conn,
+                    embedder=embedder, reranker=reranker,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "scheduler tick crashed; continuing in 5s",
+                )
+                time.sleep(5)
     except KeyboardInterrupt:
         log.info("stopping...")
     finally:
@@ -595,11 +608,19 @@ def run_tray(cfg: Config) -> None:
     )
 
     def bootstrap_async():
-        _bootstrap(
-            cfg, conn, embedder, transcriber, ocr_engine, entity_extractor,
-            image_embedder, folders, stats,
-        )
-        log.info("bootstrap done")
+        # Round 15 (audit-found gap B2) — wrap in try/except so a
+        # transient permission error / disk error on a watched folder
+        # doesn't kill the bootstrap thread silently. Without this,
+        # the tray shows "running" while nothing is actually being
+        # indexed and the user has no signal anything went wrong.
+        try:
+            _bootstrap(
+                cfg, conn, embedder, transcriber, ocr_engine,
+                entity_extractor, image_embedder, folders, stats,
+            )
+            log.info("bootstrap done")
+        except Exception:  # noqa: BLE001
+            log.exception("bootstrap thread crashed")
 
     threading.Thread(target=bootstrap_async, name="sb-bootstrap", daemon=True).start()
     watcher.start(folders)

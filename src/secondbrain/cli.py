@@ -1338,9 +1338,27 @@ def briefing(
 @app.command()
 def serve() -> None:
     """Start the MCP server over stdio (for Claude Desktop / Claude Code / Cursor)."""
-    from .mcp_server import run
-
-    run()
+    # Round 15 (audit-found gap K1) — friendly error rendering. The
+    # MCP server crashes here surface as raw Python tracebacks (no
+    # remediation hint) which is hostile when MCP is the only
+    # bridge between Claude Desktop and the brain. Common causes:
+    # missing config file, sqlite-vec failed to load, bad data dir
+    # permissions. Render via console + non-zero exit so the host
+    # knows something failed.
+    try:
+        from .mcp_server import run
+        run()
+    except KeyboardInterrupt:
+        # Clean shutdown — not an error.
+        pass
+    except Exception as e:  # noqa: BLE001
+        console.print(
+            f"[red]MCP server failed to start:[/] {e}\n"
+            f"[yellow]Try:[/] "
+            f"[cyan]secondbrain doctor[/] to see which integration is broken, "
+            f"or [cyan]secondbrain init[/] if this is a fresh install.",
+        )
+        raise typer.Exit(code=1) from e
 
 
 @app.command()
@@ -3007,6 +3025,51 @@ def doctor(
     # in any wrapper that expected a real exit-code signal.
     if n_failing:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def backup(
+    out: Path = typer.Argument(
+        ...,
+        help="Destination file for the backup (e.g. ~/Backups/sb-2025-01.db). "
+             "Parent directory must exist; the file is created if absent and "
+             "overwritten if present.",
+    ),
+) -> None:
+    """Round 15 (audit-found gap C1) — back up the SQLite index safely.
+
+    The DB runs in WAL mode, so naive ``cp index.db dest.db`` skips
+    the uncommitted WAL pages and gives a corrupt restore. This
+    command uses ``sqlite3.Connection.backup()`` which is online-safe
+    (works while the daemon is running) and WAL-aware.
+
+    Restore by copying the backup file back to ``<data_dir>/index.db``
+    while the daemon is stopped.
+    """
+    import sqlite3
+
+    cfg = load_config()
+    src_path = cfg.db_path
+    if not src_path.exists():
+        console.print(f"[red]No DB at {src_path} — nothing to back up.[/]")
+        raise typer.Exit(code=1)
+    out = out.expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    console.print(
+        f"[cyan]Backing up {src_path} → {out}[/]",
+    )
+    src = sqlite3.connect(str(src_path))
+    dest = sqlite3.connect(str(out))
+    try:
+        with dest:
+            src.backup(dest)
+    finally:
+        dest.close()
+        src.close()
+    size_mb = out.stat().st_size / (1024 * 1024)
+    console.print(
+        f"[green]✓[/] Backup written: {out} ({size_mb:.1f} MB)",
+    )
 
 
 audit_app = typer.Typer(

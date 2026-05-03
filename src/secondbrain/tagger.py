@@ -102,6 +102,21 @@ def generate_tags(
     except ImportError:
         _audit("no_provider", error="anthropic SDK missing")
         return []
+    # Round 15 (audit-found gap A1) — gate on the per-feature
+    # 'tag' bucket. Tagging runs in a tight loop during bulk index
+    # (one call per chunk), so without this an unbounded auto-tag
+    # pass on a fresh import could blow past the daily Anthropic
+    # cap before the user notices.
+    try:
+        from .budget import BudgetExceededError, check_budget
+        check_budget(cfg, "anthropic", feature="tag")
+    except BudgetExceededError as e:
+        log.warning("tag: budget exceeded, skipping: %s", e)
+        _audit("budget_exceeded", error=str(e)[:200])
+        return []
+    except ImportError:
+        # budget module unavailable — fail open (best-effort tagging).
+        pass
 
     # Round 10 (#4) — redact secret-shaped tokens before send. Tags
     # are about topic / theme, not literal contents — masking doesn't
