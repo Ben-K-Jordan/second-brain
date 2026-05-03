@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -118,6 +119,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         # leaves the schema untouched (fresh DBs hit the CREATE path).
         if "duplicate column" not in str(e).lower():
             log.debug("email_assist: ALTER add metadata_json skipped: %s", e)
+    # Round 7 — voice profile + reply pairs. The profile is a single
+    # JSON blob refreshed weekly; reply pairs link a Sent message to
+    # the email it replied to so few-shot retrieval can surface real
+    # (incoming, user_reply) examples to the drafter.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS email_style_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            profile_json TEXT NOT NULL,
+            sent_count INTEGER NOT NULL,    -- how many sent items fed the profile
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS email_reply_pairs (
+            -- One row per (incoming_email, user_reply) pair detected in
+            -- the index. UNIQUE on the reply so we don't double-link a
+            -- single Sent message.
+            reply_file_id INTEGER PRIMARY KEY
+                REFERENCES files(id) ON DELETE CASCADE,
+            incoming_file_id INTEGER NOT NULL
+                REFERENCES files(id) ON DELETE CASCADE,
+            link_method TEXT NOT NULL,      -- 'in-reply-to' | 'thread' | 'subject'
+            indexed_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reply_pairs_incoming
+            ON email_reply_pairs(incoming_file_id);
+    """)
     conn.commit()
     try:
         _SCHEMA_INITIALIZED.add(conn)
@@ -546,8 +572,20 @@ ONE JSON object — no prose, no Markdown fences:
   "open_questions": ["<filtered list of decisions the user must fill in>"]
 }}
 
-DRAFTING RULES
+DRAFTING RULES — VOICE FIDELITY IS THE PRIMARY GOAL
 ==============
+- {user_name}'s voice profile (computed from their actual sent
+  emails) is the source of truth. Match it concretely:
+    · Open with one of the observed greeting patterns.
+    · Close with one of the observed sign-off patterns.
+    · Use contractions at the observed rate.
+    · Match observed sentence length within +/- 30%.
+    · NEVER use any phrase listed in "avoid these phrases" — those
+      were checked against the user's corpus and they don't use them.
+- The FEW-SHOT EXAMPLES below are real (incoming, user_reply) pairs.
+  Mimic the structural pattern of the closest example: how {user_name}
+  opened, how long they replied, where they put commitments, how they
+  signed off. Don't copy facts — just structure + voice.
 - The PRIMARY draft uses the analyzer's ``length_target`` and
   ``tone_signals``. The ALTERNATIVE flips the tone register
   (formal ↔ casual) so the user can pick.
@@ -555,17 +593,19 @@ DRAFTING RULES
   inline (e.g. ``Tuesday at <TODO: pick a time> works for me``).
 - DO NOT invent commitments, dates, prices, or facts. When unsure,
   use a TODO placeholder.
-- Match {user_name}'s sign-off pattern from the style samples —
-  don't pick a generic "Best regards" if their samples show "thanks,".
-- AVOID generic LLM opener phrases: "I hope this email finds you
-  well", "Thank you for reaching out", "Please let me know if you
-  have any further questions". If {user_name}'s style samples use
-  similar openers, fine; otherwise skip them.
 - If the email is purely informational and doesn't need a reply,
   set primary to "" and confidence to 0.0.
 - Reference the prior thread + sender history when natural ("re your
   earlier point about X", "as we discussed last week") — but only
   when the prior actually supports it.
+
+VOICE PROFILE — match these patterns
+==============
+{voice_profile_block}
+
+FEW-SHOT EXAMPLES — how {user_name} actually replied to similar emails
+==============
+{fewshot_block}
 
 ANALYSIS (from upstream analyzer)
 ==============
@@ -586,7 +626,7 @@ SENDER HISTORY ({user_name} ↔ this person, recent first)
 ==============
 {sender_block}
 
-STYLE REFERENCE — recent replies {user_name} has actually sent
+STYLE REFERENCE — extra raw sent-message context
 ==============
 {style_samples}
 
@@ -1098,7 +1138,7 @@ def generate_draft(
     analysis = analyze_email(
         from_=from_, subject=subject, body=body, cfg=cfg,
     )
-    # ---- Stage 2: targeted retrieval ----
+    # ---- Stage 2: targeted retrieval (round 6 + 7) ----
     sender_email = _extract_email_address(from_)
     relationship = analysis.sender_relationship if analysis else "unknown"
     key_points = analysis.key_points if analysis else []
@@ -1112,6 +1152,17 @@ def generate_draft(
         conn, sender_email=sender_email, relationship=relationship,
     )
     brain_block = _brain_context_for_topics(conn, cfg, key_points)
+    # Round 7 — voice fidelity inputs.
+    voice_profile = get_voice_profile(conn)
+    embedder = None
+    try:
+        from .embedder import make_embedder
+        embedder = make_embedder(cfg)
+    except Exception:  # noqa: BLE001
+        embedder = None
+    fewshot = fewshot_reply_pairs(
+        conn, incoming_text=body, embedder=embedder,
+    )
 
     # ---- Stage 3: draft ----
     output = _default_drafter(
@@ -1122,9 +1173,41 @@ def generate_draft(
         thread_history=thread_hist,
         sender_history=sender_hist,
         brain_context=brain_block,
+        voice_profile=voice_profile,
+        fewshot_pairs=fewshot,
     )
     if output is None or not (output.primary or output.alternative).strip():
         return None
+
+    # ---- Stage 4: voice critique + at-most-one regenerate ----
+    # Only runs when we have a profile to critique against. The
+    # regenerate path passes the critique back as a do-not-do list
+    # so the second draft addresses the specific mismatches.
+    critique_text = ""
+    if voice_profile is not None and output.primary.strip():
+        critique_text = critique_draft_against_voice(
+            draft=output.primary, profile=voice_profile, cfg=cfg,
+        )
+        if critique_text and critique_text.strip().upper() != "OK":
+            log.info(
+                "email_assist: voice critique flagged mismatches; "
+                "regenerating once",
+            )
+            output2 = _regenerate_with_critique(
+                from_=from_, subject=subject, body=body,
+                style_samples=style_samples,
+                user_name=user_name, cfg=cfg,
+                analysis=analysis,
+                thread_history=thread_hist,
+                sender_history=sender_hist,
+                brain_context=brain_block,
+                voice_profile=voice_profile,
+                fewshot_pairs=fewshot,
+                prior_draft=output.primary,
+                critique=critique_text,
+            )
+            if output2 is not None and output2.primary.strip():
+                output = output2
 
     metadata_json = json.dumps({
         "analysis": (
@@ -1144,7 +1227,13 @@ def generate_draft(
         "sender_email": sender_email,
         "thread_messages": len(thread_hist),
         "sender_messages": len(sender_hist),
-        "schema_version": 2,
+        # Round 7 — voice-fidelity fields.
+        "voice_profile_n_samples": (
+            voice_profile.n_samples if voice_profile else 0
+        ),
+        "fewshot_pairs": len(fewshot),
+        "voice_critique": critique_text or "",
+        "schema_version": 3,
     })
     cur = conn.execute(
         "INSERT INTO email_drafts"
@@ -1204,12 +1293,19 @@ def _default_drafter(
     thread_history: list[tuple[str, str]] | None = None,
     sender_history: list[tuple[str, str]] | None = None,
     brain_context: str = "",
+    voice_profile: VoiceProfile | None = None,
+    fewshot_pairs: list[tuple[str, str]] | None = None,
 ) -> DraftOutput | None:
-    """Round 6 — structured drafter via Claude Sonnet.
+    """Round 6 + 7 — structured drafter via Claude Sonnet.
 
-    Takes the analyzer's plan + retrieval bundle and asks Sonnet for
-    a JSON-shaped output: primary draft + alternative-tone version
+    Takes the analyzer's plan + retrieval bundle + the user's
+    extracted voice profile + few-shot reply pairs, and asks Sonnet
+    for JSON-shaped output: primary draft + alternative-tone version
     + reasoning + confidence + filtered open_questions.
+
+    Voice profile + few-shot pairs are the round-7 additions that
+    make drafts actually sound like the user. Without them the
+    drafter falls back to default voice rules.
 
     Falls back to local Ollama for the same prompt when Anthropic
     is unavailable. Local models are mediocre at structured-JSON
@@ -1227,6 +1323,13 @@ def _default_drafter(
     thread_block = _format_history_block(thread_history or [])
     sender_block = _format_history_block(sender_history or [])
     brain_block = brain_context or "(no relevant brain context found)"
+    voice_block = (
+        _format_voice_profile_block(voice_profile)
+        if voice_profile is not None
+        else "(no voice profile yet — fall back to general rules: be "
+        "concrete, match the inferred tone, avoid generic LLM phrases)"
+    )
+    fewshot_block = _format_fewshot_block(fewshot_pairs or [])
 
     prompt = _DRAFT_PROMPT_V2.format(
         user_name=user_name,
@@ -1238,6 +1341,8 @@ def _default_drafter(
         sender_block=sender_block,
         style_samples=style_samples,
         brain_block=brain_block,
+        voice_profile_block=voice_block,
+        fewshot_block=fewshot_block,
     )
 
     parsed = _llm_json_call(
@@ -1401,3 +1506,965 @@ def generate_drafts_due(
     if n:
         log.info("email_assist: generated %d draft(s)", n)
     return n
+
+
+# ============================================================
+# Round 7 — voice fidelity. Three pieces:
+#   1. Reply-pair indexer: links each Sent email to the email it
+#      replied to, persisted in email_reply_pairs.
+#   2. Voice-profile extractor: scans Sent items, extracts structural
+#      patterns (greeting / sign-off / sentence length / opener &
+#      closer phrases / tone register) into one JSON blob.
+#   3. Few-shot retrieval at draft time: semantic search over linked
+#      parent emails to pull the (incoming, user_reply) pairs most
+#      similar to the current incoming email — so the drafter sees
+#      real examples of how the user replies to similar messages.
+# ============================================================
+
+# How many Sent items to scan when extracting the voice profile.
+# More gives better stats, but the qualitative LLM pass costs more
+# tokens. 50 is a sweet spot for typical inboxes.
+_VOICE_PROFILE_MAX_SAMPLES = 50
+# Refresh cadence — daemon hook re-runs at most once a week.
+_VOICE_PROFILE_REFRESH_DAYS = 7
+# Few-shot pairs to feed the drafter. Three is enough variation
+# without ballooning the prompt; each pair clips at ~1200 chars.
+_FEWSHOT_PAIR_K = 3
+_FEWSHOT_PAIR_CHARS = 1200
+# In-Reply-To / References parsing — emails embed these as headers
+# the IMAP connector renders into the message body. We grep for them
+# rather than re-parse the raw email so this works on whatever the
+# connector materialised.
+_INREPLYTO_RE = re.compile(
+    r"^In-Reply-To:\s*<?([^>\s]+)>?", re.MULTILINE | re.IGNORECASE,
+)
+_MSGID_LINE_RE = re.compile(
+    r"^Message-ID:\s*<?([^>\s]+)>?", re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _is_sent_item(text: str) -> bool:
+    """Sent items have 'Folder: Sent' or '/Sent' in their first chunk —
+    that's how the IMAP / Gmail connectors mark outbound mail."""
+    if not text:
+        return False
+    head = text[:2000].lower()
+    return ("folder: sent" in head
+            or "labels: sent" in head
+            or "/sent" in head)
+
+
+def _msgid_for_file(conn: sqlite3.Connection, file_id: int) -> str:
+    """Pull the Message-ID rendered into the email body. Returns ""
+    when the email pre-dates the connector that emits the header
+    (legacy IMAP rows) — that just means we fall back to subject-
+    based linking."""
+    row = conn.execute(
+        "SELECT text FROM chunks WHERE file_id = ? "
+        "ORDER BY chunk_index ASC LIMIT 1",
+        (file_id,),
+    ).fetchone()
+    if row is None:
+        return ""
+    text = row["text"] or ""
+    m = _MSGID_LINE_RE.search(text)
+    return (m.group(1) if m else "").strip()
+
+
+def _inreplyto_for_file(conn: sqlite3.Connection, file_id: int) -> str:
+    """Pull the In-Reply-To header value if rendered in the body."""
+    row = conn.execute(
+        "SELECT text FROM chunks WHERE file_id = ? "
+        "ORDER BY chunk_index ASC LIMIT 1",
+        (file_id,),
+    ).fetchone()
+    if row is None:
+        return ""
+    text = row["text"] or ""
+    m = _INREPLYTO_RE.search(text)
+    return (m.group(1) if m else "").strip()
+
+
+def _find_parent_for_reply(
+    conn: sqlite3.Connection, *, reply_file_id: int, subject: str,
+) -> tuple[int | None, str]:
+    """Locate the email a Sent message is replying to.
+
+    Tries three strategies in order — first match wins:
+      1. ``In-Reply-To`` header in body → exact lookup by Message-ID
+         line in the candidate parent.
+      2. Gmail thread_id sibling: the most recent non-Sent message
+         in the same gmail://thread/<tid>/.
+      3. Subject heuristic: most recent non-Sent message whose H1
+         normalises to the same root subject.
+
+    Returns ``(parent_file_id_or_None, link_method)``.
+    """
+    # ---- Strategy 1: In-Reply-To ----
+    irt = _inreplyto_for_file(conn, reply_file_id)
+    if irt:
+        # Look for any file whose body has Message-ID: <irt>.
+        cand = conn.execute(
+            "SELECT f.id FROM files f JOIN chunks c ON c.file_id = f.id "
+            "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+            "  AND c.chunk_index = 0 "
+            "  AND c.text LIKE ? "
+            "  AND f.id != ? "
+            "LIMIT 1",
+            (f"%Message-ID:%{irt}%", reply_file_id),
+        ).fetchone()
+        if cand:
+            return int(cand["id"]), "in-reply-to"
+    # ---- Strategy 2: Gmail thread sibling ----
+    src_path_row = conn.execute(
+        "SELECT path FROM files WHERE id = ?", (reply_file_id,),
+    ).fetchone()
+    src_path = src_path_row["path"] if src_path_row else ""
+    tid = _gmail_thread_id_from_path(src_path or "")
+    if tid:
+        cand = conn.execute(
+            "SELECT f.id, c.text FROM files f "
+            "JOIN chunks c ON c.file_id = f.id "
+            "WHERE f.path LIKE ? AND f.id != ? AND c.chunk_index = 0 "
+            "ORDER BY f.mtime DESC LIMIT 5",
+            (f"gmail://thread/{tid}/%", reply_file_id),
+        ).fetchall()
+        # Skip other Sent items in the thread — we want incoming.
+        for r in cand:
+            if not _is_sent_item(r["text"] or ""):
+                return int(r["id"]), "thread"
+    # ---- Strategy 3: subject heuristic ----
+    norm = _normalize_subject(subject)
+    if not norm:
+        return None, "none"
+    cand = conn.execute(
+        "SELECT f.id, c.text FROM files f "
+        "JOIN chunks c ON c.file_id = f.id "
+        "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+        "  AND c.chunk_index = 0 "
+        "  AND f.id != ? "
+        "  AND LOWER(c.text) LIKE ? "
+        "ORDER BY f.mtime DESC LIMIT 5",
+        (reply_file_id, f"%# %{norm}%"),
+    ).fetchall()
+    for r in cand:
+        if not _is_sent_item(r["text"] or ""):
+            return int(r["id"]), "subject"
+    return None, "none"
+
+
+def index_reply_pairs(
+    conn: sqlite3.Connection, *, max_per_run: int = 200,
+) -> int:
+    """Round 7 — link each new Sent email to the email it replied to.
+
+    Walks unlinked Sent items (newest first) and writes one row per
+    pair into ``email_reply_pairs``. Bounded by ``max_per_run`` so a
+    huge initial backlog doesn't block a daemon tick. Returns the
+    number of new pairs created.
+    """
+    _ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT f.id, c.text FROM files f "
+        "JOIN chunks c ON c.file_id = f.id "
+        "LEFT JOIN email_reply_pairs p ON p.reply_file_id = f.id "
+        "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+        "  AND c.chunk_index = 0 "
+        "  AND p.reply_file_id IS NULL "
+        "ORDER BY f.mtime DESC LIMIT ?",
+        (max_per_run * 3,),  # over-fetch since many won't be Sent
+    ).fetchall()
+    n_new = 0
+    for r in rows:
+        if not _is_sent_item(r["text"] or ""):
+            continue
+        fid = int(r["id"])
+        # Pull subject from the chunk text's H1.
+        subject = ""
+        for ln in (r["text"] or "").splitlines()[:5]:
+            s = ln.strip()
+            if s.startswith("# "):
+                subject = s[2:].strip()
+                break
+        parent_id, method = _find_parent_for_reply(
+            conn, reply_file_id=fid, subject=subject,
+        )
+        if parent_id is None:
+            continue
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO email_reply_pairs"
+                "(reply_file_id, incoming_file_id, link_method, indexed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (fid, parent_id, method, time.time()),
+            )
+            n_new += 1
+        except sqlite3.IntegrityError:
+            # Race / dup — the UNIQUE on reply_file_id covers it.
+            pass
+        if n_new >= max_per_run:
+            break
+    if n_new:
+        conn.commit()
+        log.info("email_assist: indexed %d reply pair(s)", n_new)
+    return n_new
+
+
+# ---- Voice profile extraction ----------------------------------------
+
+@dataclass
+class VoiceProfile:
+    """Round 7 — structured snapshot of how the user actually writes
+    email replies. Stored as a single JSON blob, refreshed weekly.
+
+    The fields are deliberately concrete + checkable. The drafter
+    prompt renders these as bullet points and the critique pass
+    flags drafts that violate them."""
+    greetings: list[str]          # eg ['hi {name},', '{name},', '(no greeting)']
+    sign_offs: list[str]          # eg ['—Ben', 'thanks,\nBen', 'Ben']
+    avg_sentence_words: float     # mean across all sentences
+    avg_reply_chars: int          # mean reply length
+    contraction_rate: float       # fraction of "I'd" vs "I would" etc
+    exclamation_rate: float       # exclamations per reply
+    emoji_rate: float             # emojis per reply
+    common_openers: list[str]     # frequent first sentences / phrases
+    common_closers: list[str]     # frequent final sentences
+    avoided_phrases: list[str]    # generic LLM-isms the user *never* uses
+    register_notes: str           # qualitative LLM summary of voice
+    n_samples: int                # how many sent items fed this profile
+
+
+# Generic LLM-isms that get auto-banned unless we observe them in
+# the user's actual sent mail. The voice extractor checks each one
+# against the corpus and only adds it to ``avoided_phrases`` when
+# the user genuinely doesn't use it.
+_LLM_ISMS_TO_AUDIT = (
+    "I hope this email finds you well",
+    "I hope this finds you well",
+    "Thank you for reaching out",
+    "Please don't hesitate to",
+    "Please let me know if you have any further questions",
+    "I look forward to hearing from you",
+    "Best regards,",
+    "Warm regards,",
+    "I wanted to reach out",
+    "I am writing to",
+)
+
+
+def extract_voice_profile(
+    conn: sqlite3.Connection, cfg=None,
+    *, max_samples: int = _VOICE_PROFILE_MAX_SAMPLES,
+) -> VoiceProfile | None:
+    """Round 7 — scan the user's recent Sent items and extract a
+    structured voice profile.
+
+    Hybrid: deterministic stats (greeting / sign-off / sentence
+    length / contractions) + one Haiku call for the qualitative
+    register notes. Returns None when there are no Sent items to
+    learn from — the drafter falls back to its default voice rules.
+    """
+    _ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT c.text FROM chunks c JOIN files f ON f.id = c.file_id "
+        "WHERE c.chunk_index = 0 "
+        "  AND (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+        "  AND LOWER(c.text) LIKE '%folder: sent%' "
+        "ORDER BY f.indexed_at DESC LIMIT ?",
+        (max_samples,),
+    ).fetchall()
+    bodies = [_strip_email_headers(r["text"] or "") for r in rows]
+    bodies = [b for b in bodies if len(b) >= 30]  # drop near-empty
+    if not bodies:
+        return None
+    greetings = _extract_greeting_patterns(bodies)
+    sign_offs = _extract_signoff_patterns(bodies)
+    avg_words = _avg_sentence_words(bodies)
+    avg_chars = int(sum(len(b) for b in bodies) / len(bodies))
+    contraction_rate = _contraction_rate(bodies)
+    excl_rate = sum(b.count("!") for b in bodies) / len(bodies)
+    emoji_rate = _emoji_rate(bodies)
+    openers = _common_first_phrases(bodies)
+    closers = _common_last_phrases(bodies)
+    avoided = _audit_llm_isms(bodies)
+
+    # Qualitative LLM pass — short Haiku call summarising voice.
+    register_notes = _voice_register_notes(bodies, cfg) if cfg else ""
+
+    profile = VoiceProfile(
+        greetings=greetings,
+        sign_offs=sign_offs,
+        avg_sentence_words=round(avg_words, 1),
+        avg_reply_chars=avg_chars,
+        contraction_rate=round(contraction_rate, 2),
+        exclamation_rate=round(excl_rate, 2),
+        emoji_rate=round(emoji_rate, 2),
+        common_openers=openers,
+        common_closers=closers,
+        avoided_phrases=avoided,
+        register_notes=register_notes,
+        n_samples=len(bodies),
+    )
+    _save_voice_profile(conn, profile)
+    return profile
+
+
+def _strip_email_headers(text: str) -> str:
+    """Remove the 'From:/To:/Subject:/Folder:' header lines the
+    connectors prepend, leaving just the actual reply body."""
+    lines = text.splitlines()
+    body_start = 0
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            body_start = i + 1
+            continue
+        # H1 + From/To/Date/Folder lines all live in the prefix.
+        if (s.startswith("# ") or s.lower().startswith(
+            ("from:", "to:", "cc:", "bcc:", "date:", "folder:",
+             "labels:", "message-id:", "in-reply-to:", "references:"),
+        )):
+            body_start = i + 1
+            continue
+        break
+    body = "\n".join(lines[body_start:]).strip()
+    # Quoted-reply blocks ("On ... wrote:" / "> ...") inflate stats
+    # and aren't the user's voice; drop them.
+    body = _strip_quoted_reply(body)
+    return body
+
+
+_QUOTED_REPLY_RE = re.compile(
+    r"\n\s*(On .+ wrote:|From:.+|-----Original Message-----).*",
+    re.DOTALL,
+)
+
+
+def _strip_quoted_reply(body: str) -> str:
+    """Trim quoted-reply blocks from a sent-message body."""
+    body = _QUOTED_REPLY_RE.sub("", body)
+    # Bare ">" quote lines — keep the first occurrence's preceding
+    # text only.
+    out_lines = []
+    for ln in body.splitlines():
+        if ln.lstrip().startswith(">"):
+            break
+        out_lines.append(ln)
+    return "\n".join(out_lines).strip()
+
+
+def _extract_greeting_patterns(bodies: list[str]) -> list[str]:
+    """Pull the first non-empty line of each body, normalise
+    addressed-name to ``{name}``, return the most-common patterns
+    (≥ 2 occurrences)."""
+    from collections import Counter
+
+    pats: list[str] = []
+    for b in bodies:
+        first = ""
+        for ln in b.splitlines():
+            s = ln.strip()
+            if s:
+                first = s
+                break
+        if not first:
+            continue
+        # Cap so a long opener doesn't masquerade as a greeting.
+        if len(first) > 60:
+            continue
+        # Normalise common name patterns: "Hi Sarah," → "hi {name},"
+        # IGNORECASE so leading "Hi"/"Hey"/"Hello"/"Dear" match.
+        norm = re.sub(
+            r"\b(hi|hey|hello|dear)\s+[A-Z][a-z]+",
+            lambda m: m.group(1).lower() + " {name}",
+            first, count=1, flags=re.IGNORECASE,
+        )
+        # "Sarah," at start → "{name},"
+        norm = re.sub(
+            r"^[A-Z][a-z]+(,)", r"{name}\1", norm,
+        )
+        norm = norm.strip().lower()
+        if norm:
+            pats.append(norm)
+    return [p for p, _n in Counter(pats).most_common(5) if _n >= 2]
+
+
+def _extract_signoff_patterns(bodies: list[str]) -> list[str]:
+    """Pull the last 1-2 non-empty lines of each body and surface
+    the most-common sign-off shapes."""
+    from collections import Counter
+
+    pats: list[str] = []
+    for b in bodies:
+        lines = [ln for ln in b.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        tail = lines[-2:] if len(lines) >= 2 else lines[-1:]
+        joined = "\n".join(s.strip() for s in tail)
+        if len(joined) > 80:
+            joined = lines[-1].strip()
+        # Replace user's name (any single capitalised word at the
+        # end) with {name} so different signers fold together if
+        # this corpus mixes accounts.
+        norm = re.sub(r"\b[A-Z][a-z]+$", "{name}", joined)
+        norm = norm.lower().strip()
+        if norm:
+            pats.append(norm)
+    return [p for p, _n in Counter(pats).most_common(5) if _n >= 2]
+
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _avg_sentence_words(bodies: list[str]) -> float:
+    """Mean sentence length in words across all bodies. Cheap proxy
+    for "do they write short or long sentences."""
+    total_w = 0
+    total_s = 0
+    for b in bodies:
+        for s in _SENT_SPLIT_RE.split(b):
+            words = s.split()
+            if not words:
+                continue
+            total_w += len(words)
+            total_s += 1
+    return total_w / total_s if total_s else 0.0
+
+
+_CONTRACTION_PAIRS = (
+    (r"\bI(?:'|’)d\b", r"\bI would\b"),
+    (r"\bI(?:'|’)ll\b", r"\bI will\b"),
+    (r"\bI(?:'|’)m\b", r"\bI am\b"),
+    (r"\bdon(?:'|’)t\b", r"\bdo not\b"),
+    (r"\bcan(?:'|’)t\b", r"\bcannot\b"),
+    (r"\bit(?:'|’)s\b", r"\bit is\b"),
+    (r"\bthat(?:'|’)s\b", r"\bthat is\b"),
+    (r"\bwon(?:'|’)t\b", r"\bwill not\b"),
+)
+
+
+def _contraction_rate(bodies: list[str]) -> float:
+    """Fraction of (contracted | uncontracted) pairs that the user
+    actually contracted. 1.0 = always contracts, 0.0 = always formal."""
+    contracted = 0
+    expanded = 0
+    text = " ".join(bodies)
+    for c, e in _CONTRACTION_PAIRS:
+        contracted += len(re.findall(c, text, re.IGNORECASE))
+        expanded += len(re.findall(e, text, re.IGNORECASE))
+    total = contracted + expanded
+    return contracted / total if total else 0.5
+
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F6FF"   # emoji blocks
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "]",
+)
+
+
+def _emoji_rate(bodies: list[str]) -> float:
+    return sum(len(_EMOJI_RE.findall(b)) for b in bodies) / len(bodies)
+
+
+def _common_first_phrases(bodies: list[str]) -> list[str]:
+    """First non-greeting sentence across replies; surface frequent
+    opener phrases (≥ 2 occurrences). Useful so the drafter knows
+    'this user always opens with X' patterns."""
+    from collections import Counter
+
+    phrases: list[str] = []
+    for b in bodies:
+        sentences = _SENT_SPLIT_RE.split(b)
+        # Skip the first sentence if it's just a greeting ("Hi Sarah,")
+        for s in sentences:
+            cleaned = s.strip()
+            if not cleaned:
+                continue
+            if cleaned.lower().startswith(("hi ", "hey ", "hello ", "dear ")):
+                continue
+            # Take just the first 8 words as a phrase signature.
+            words = cleaned.split()[:8]
+            phrases.append(" ".join(words).lower())
+            break
+    return [p for p, _n in Counter(phrases).most_common(5) if _n >= 2]
+
+
+def _common_last_phrases(bodies: list[str]) -> list[str]:
+    """Last non-signoff sentence — captures recurring closer phrases
+    like 'Let me know what you think' or 'Talk soon'."""
+    from collections import Counter
+
+    phrases: list[str] = []
+    for b in bodies:
+        sentences = [s.strip() for s in _SENT_SPLIT_RE.split(b) if s.strip()]
+        if len(sentences) < 2:
+            continue
+        # Sentence before the sign-off line (avoids "—Ben" matching).
+        candidate = sentences[-1] if "," in sentences[-1] else sentences[-2]
+        words = candidate.split()[:8]
+        phrases.append(" ".join(words).lower())
+    return [p for p, _n in Counter(phrases).most_common(5) if _n >= 2]
+
+
+def _audit_llm_isms(bodies: list[str]) -> list[str]:
+    """Check each generic-LLM phrase against the corpus. Add it to
+    the avoid-list when the user genuinely doesn't use it. Means the
+    drafter knows 'this user never says "Best regards," — don't put
+    it in the draft.'"""
+    text = " ".join(bodies).lower()
+    avoided: list[str] = []
+    for phrase in _LLM_ISMS_TO_AUDIT:
+        if phrase.lower() not in text:
+            avoided.append(phrase)
+    return avoided
+
+
+_VOICE_NOTES_PROMPT = """\
+Below are recent reply emails written by ONE person. Describe their
+voice in 3-5 short sentences focused on what makes their writing
+distinctive vs generic professional email. Cover: warmth, formality,
+typical sentence length, idiosyncratic vocabulary, opener/closer
+habits.
+
+Output ONLY the prose summary — no headings, no bullets, no preamble.
+
+EMAILS
+======
+{samples}
+"""
+
+
+def _voice_register_notes(bodies: list[str], cfg) -> str:
+    """One Haiku call — qualitative voice summary. Failure returns
+    empty string; the drafter falls back to the structural patterns."""
+    sample_block = "\n\n---\n\n".join(b[:800] for b in bodies[:10])
+    if not sample_block.strip():
+        return ""
+    parsed = _llm_text_call(
+        prompt=_VOICE_NOTES_PROMPT.format(samples=sample_block),
+        cfg=cfg,
+        model="claude-haiku-4-5",
+        max_tokens=300,
+        feature="voice_profile",
+        note="voice_register",
+    )
+    return (parsed or "").strip()
+
+
+def _llm_text_call(
+    *, prompt: str, cfg, model: str, max_tokens: int,
+    feature: str, note: str,
+) -> str:
+    """Like _llm_json_call but for plain-text output (voice notes,
+    critique). Same try-Anthropic-then-local pattern."""
+    text = ""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic
+        except ImportError:
+            anthropic = None  # type: ignore[assignment]
+        if anthropic is not None:
+            from .budget import (
+                BudgetExceededError,
+                check_budget,
+                record_usage,
+            )
+            try:
+                check_budget(cfg, "anthropic", feature=feature)
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                record_usage(
+                    cfg, "anthropic", model,
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                    feature=feature, note=note,
+                )
+                text = "".join(
+                    b.text for b in resp.content if b.type == "text"
+                ).strip()
+            except BudgetExceededError as e:
+                log.info("email_assist: %s budget exhausted: %s", feature, e)
+            except anthropic.APIError as e:
+                log.info("email_assist: %s API error: %s", feature, e)
+    if not text:
+        try:
+            from . import local_llm
+        except ImportError:
+            return ""
+        if not local_llm.is_available(cfg):
+            return ""
+        out = local_llm.complete(prompt, cfg=cfg, max_tokens=max_tokens)
+        if out is None:
+            return ""
+        text = out.text.strip()
+    return text
+
+
+def _save_voice_profile(
+    conn: sqlite3.Connection, profile: VoiceProfile,
+) -> None:
+    _ensure_schema(conn)
+    payload = {
+        "greetings": profile.greetings,
+        "sign_offs": profile.sign_offs,
+        "avg_sentence_words": profile.avg_sentence_words,
+        "avg_reply_chars": profile.avg_reply_chars,
+        "contraction_rate": profile.contraction_rate,
+        "exclamation_rate": profile.exclamation_rate,
+        "emoji_rate": profile.emoji_rate,
+        "common_openers": profile.common_openers,
+        "common_closers": profile.common_closers,
+        "avoided_phrases": profile.avoided_phrases,
+        "register_notes": profile.register_notes,
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO email_style_profile"
+        "(id, profile_json, sent_count, updated_at) "
+        "VALUES (1, ?, ?, ?)",
+        (json.dumps(payload), profile.n_samples, time.time()),
+    )
+    conn.commit()
+
+
+def get_voice_profile(
+    conn: sqlite3.Connection,
+) -> VoiceProfile | None:
+    """Read the persisted profile. Returns None when no profile has
+    been computed yet — drafter falls back to the default rules."""
+    _ensure_schema(conn)
+    row = conn.execute(
+        "SELECT profile_json, sent_count, updated_at "
+        "FROM email_style_profile WHERE id = 1",
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        p = json.loads(row["profile_json"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(p, dict):
+        return None
+    return VoiceProfile(
+        greetings=list(p.get("greetings") or []),
+        sign_offs=list(p.get("sign_offs") or []),
+        avg_sentence_words=float(p.get("avg_sentence_words") or 0.0),
+        avg_reply_chars=int(p.get("avg_reply_chars") or 0),
+        contraction_rate=float(p.get("contraction_rate") or 0.5),
+        exclamation_rate=float(p.get("exclamation_rate") or 0.0),
+        emoji_rate=float(p.get("emoji_rate") or 0.0),
+        common_openers=list(p.get("common_openers") or []),
+        common_closers=list(p.get("common_closers") or []),
+        avoided_phrases=list(p.get("avoided_phrases") or []),
+        register_notes=str(p.get("register_notes") or ""),
+        n_samples=int(row["sent_count"] or 0),
+    )
+
+
+def needs_voice_profile_refresh(
+    conn: sqlite3.Connection,
+    *, days: int = _VOICE_PROFILE_REFRESH_DAYS,
+) -> bool:
+    """True iff the profile is missing or older than ``days``."""
+    _ensure_schema(conn)
+    row = conn.execute(
+        "SELECT updated_at FROM email_style_profile WHERE id = 1",
+    ).fetchone()
+    if row is None:
+        return True
+    return (time.time() - float(row["updated_at"])) > days * 86400
+
+
+def refresh_voice_profile_if_due(
+    conn: sqlite3.Connection, cfg,
+) -> bool:
+    """Daemon entrypoint: re-extract weekly. Returns True iff a
+    refresh actually ran."""
+    if not needs_voice_profile_refresh(conn):
+        return False
+    return extract_voice_profile(conn, cfg) is not None
+
+
+def _format_voice_profile_block(p: VoiceProfile) -> str:
+    """Render the profile as a compact text block for the drafter
+    prompt. Concrete patterns the model can copy verbatim."""
+    def _fmt_list(items: list[str], empty: str = "(none observed)") -> str:
+        if not items:
+            return empty
+        return "  - " + "\n  - ".join(items)
+    return (
+        f"voice profile (extracted from {p.n_samples} sent emails):\n"
+        f"  greetings to copy: \n{_fmt_list(p.greetings)}\n"
+        f"  sign-offs to copy: \n{_fmt_list(p.sign_offs)}\n"
+        f"  avg sentence length: {p.avg_sentence_words:.1f} words\n"
+        f"  avg reply length: {p.avg_reply_chars} chars\n"
+        f"  contraction usage: {p.contraction_rate:.0%} (1.0 = always uses I'd / can't / it's)\n"
+        f"  exclamation marks per reply: {p.exclamation_rate:.1f}\n"
+        f"  emojis per reply: {p.emoji_rate:.1f}\n"
+        f"  common opener phrases: \n{_fmt_list(p.common_openers)}\n"
+        f"  common closer phrases: \n{_fmt_list(p.common_closers)}\n"
+        f"  avoid these phrases (user never uses them): \n{_fmt_list(p.avoided_phrases)}\n"
+        f"  voice notes: {p.register_notes or '(none)'}"
+    )
+
+
+# ---- Few-shot reply-pair retrieval -----------------------------------
+
+def fewshot_reply_pairs(
+    conn: sqlite3.Connection,
+    *,
+    incoming_text: str,
+    embedder=None,
+    k: int = _FEWSHOT_PAIR_K,
+) -> list[tuple[str, str]]:
+    """Round 7 — find the (incoming, user_reply) pairs whose incoming
+    is most similar to the current incoming email. Returns
+    ``[(incoming_body, reply_body), ...]``.
+
+    Uses hybrid_search over the parent (incoming) emails so we land
+    on truly-similar conversations, not just same-sender ones. Falls
+    back to recency-ordered pairs when the embedder isn't available.
+    """
+    _ensure_schema(conn)
+    pair_rows = conn.execute(
+        "SELECT incoming_file_id, reply_file_id FROM email_reply_pairs "
+        "ORDER BY indexed_at DESC LIMIT 500",
+    ).fetchall()
+    if not pair_rows:
+        return []
+    incoming_ids = [int(r["incoming_file_id"]) for r in pair_rows]
+    reply_by_incoming = {
+        int(r["incoming_file_id"]): int(r["reply_file_id"])
+        for r in pair_rows
+    }
+
+    selected_ids: list[int] = []
+    if embedder is not None:
+        try:
+            from .search import hybrid_search
+            results = hybrid_search(
+                conn, embedder, incoming_text, k=k * 4,
+            )
+            # Resolve result file_paths back to file_ids and intersect
+            # with our paired-incoming set.
+            paths = [r.file_path for r in results]
+            if paths:
+                placeholders = ",".join("?" * len(paths))
+                rows = conn.execute(
+                    f"SELECT id FROM files WHERE path IN ({placeholders})",
+                    paths,
+                ).fetchall()
+                hit_ids = {int(r["id"]) for r in rows}
+                paired_set = set(incoming_ids)
+                # Preserve search-relevance order.
+                seen: set[int] = set()
+                for r in results:
+                    row = conn.execute(
+                        "SELECT id FROM files WHERE path = ?",
+                        (r.file_path,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    fid = int(row["id"])
+                    if fid in hit_ids and fid in paired_set and fid not in seen:
+                        selected_ids.append(fid)
+                        seen.add(fid)
+                        if len(selected_ids) >= k:
+                            break
+        except Exception as e:  # noqa: BLE001
+            log.info("email_assist: fewshot semantic search failed: %s", e)
+
+    # Fallback / top-up — fill remaining slots from most-recent pairs.
+    if len(selected_ids) < k:
+        for fid in incoming_ids:
+            if fid in selected_ids:
+                continue
+            selected_ids.append(fid)
+            if len(selected_ids) >= k:
+                break
+
+    # Hydrate pair bodies.
+    pairs: list[tuple[str, str]] = []
+    for inc_id in selected_ids:
+        rep_id = reply_by_incoming.get(inc_id)
+        if rep_id is None:
+            continue
+        inc_body = _read_file_body(conn, inc_id)
+        rep_body = _read_file_body(conn, rep_id)
+        if not (inc_body and rep_body):
+            continue
+        pairs.append((
+            inc_body[:_FEWSHOT_PAIR_CHARS],
+            _strip_email_headers(rep_body)[:_FEWSHOT_PAIR_CHARS],
+        ))
+    return pairs
+
+
+def _format_fewshot_block(pairs: list[tuple[str, str]]) -> str:
+    """Render reply pairs as a labelled few-shot block. The drafter
+    sees these as 'here's how the user actually replied to similar
+    emails' examples to mimic structurally."""
+    if not pairs:
+        return "(no reply-pair examples available yet)"
+    parts = []
+    for i, (inc, rep) in enumerate(pairs, 1):
+        parts.append(
+            f"--- EXAMPLE {i} ---\n"
+            f"INCOMING:\n{inc}\n\n"
+            f"USER REPLIED:\n{rep}",
+        )
+    return "\n\n".join(parts)
+
+
+# ---- Voice critique pass ---------------------------------------------
+
+_VOICE_CRITIQUE_PROMPT = """\
+A draft reply was written for the user. Critique it ONLY against the
+voice profile below. List any specific mismatches (banned phrases
+used, greeting/signoff that doesn't match observed patterns, sentence
+length way off, formality drift). If the draft genuinely matches the
+profile, respond with the single token OK and nothing else.
+
+Output format: either OK, or a bulleted list of mismatches (one per
+line, prefixed with "- "). No prose around it.
+
+VOICE PROFILE
+=============
+{profile_block}
+
+DRAFT
+=====
+{draft}
+"""
+
+
+def critique_draft_against_voice(
+    *, draft: str, profile: VoiceProfile, cfg,
+) -> str:
+    """Round 7 — Haiku call comparing the draft to the voice profile.
+    Returns "OK" when the draft passes, otherwise a bullet list of
+    mismatches. Caller decides whether to regenerate."""
+    if not draft.strip():
+        return "OK"
+    prompt = _VOICE_CRITIQUE_PROMPT.format(
+        profile_block=_format_voice_profile_block(profile),
+        draft=draft.strip(),
+    )
+    txt = _llm_text_call(
+        prompt=prompt, cfg=cfg,
+        model="claude-haiku-4-5", max_tokens=200,
+        feature="voice_critique", note="critique",
+    )
+    return (txt or "").strip() or "OK"
+
+
+# Critique-augmented prompt — appended to _DRAFT_PROMPT_V2 when we
+# regenerate after a failed voice critique. Tells Sonnet exactly
+# what was wrong with the prior attempt so it can fix the specific
+# mismatches instead of drifting in a new direction.
+_DRAFT_REGENERATE_SUFFIX = """\
+
+PRIOR DRAFT (REJECTED — do NOT repeat the same mistakes)
+==============
+{prior_draft}
+
+VOICE CRITIQUE — fix every item below in the new draft
+==============
+{critique}
+"""
+
+
+def _regenerate_with_critique(
+    *,
+    prior_draft: str, critique: str,
+    **drafter_kwargs,
+) -> DraftOutput | None:
+    """Round 7 — second-attempt drafter, fed the prior draft + the
+    voice critique. Reuses _default_drafter machinery via a one-shot
+    prompt augmentation: same retrieval, same analysis, but the
+    drafter sees what the prior attempt got wrong.
+
+    Capped at one regeneration so a stubborn voice mismatch can't
+    burn the budget in a loop.
+    """
+    body_clip = (
+        drafter_kwargs["body"]
+        if len(drafter_kwargs["body"]) <= 6000
+        else drafter_kwargs["body"][:6000] + "…"
+    )
+    analysis = drafter_kwargs.get("analysis")
+    voice_profile = drafter_kwargs.get("voice_profile")
+    analysis_block = (
+        _format_analysis_block(analysis) if analysis is not None
+        else "(analyzer unavailable)"
+    )
+    voice_block = (
+        _format_voice_profile_block(voice_profile)
+        if voice_profile is not None else "(no profile)"
+    )
+    fewshot_block = _format_fewshot_block(
+        drafter_kwargs.get("fewshot_pairs") or [],
+    )
+    prompt = (
+        _DRAFT_PROMPT_V2.format(
+            user_name=drafter_kwargs["user_name"],
+            from_=drafter_kwargs["from_"] or "(unknown)",
+            subject=drafter_kwargs["subject"] or "(no subject)",
+            body=body_clip,
+            analysis_block=analysis_block,
+            thread_block=_format_history_block(
+                drafter_kwargs.get("thread_history") or [],
+            ),
+            sender_block=_format_history_block(
+                drafter_kwargs.get("sender_history") or [],
+            ),
+            style_samples=drafter_kwargs.get("style_samples") or "",
+            brain_block=drafter_kwargs.get("brain_context")
+            or "(no relevant brain context found)",
+            voice_profile_block=voice_block,
+            fewshot_block=fewshot_block,
+        )
+        + _DRAFT_REGENERATE_SUFFIX.format(
+            prior_draft=prior_draft.strip(),
+            critique=critique.strip(),
+        )
+    )
+    parsed = _llm_json_call(
+        prompt=prompt,
+        cfg=drafter_kwargs["cfg"],
+        model="claude-sonnet-4-6",
+        max_tokens=1200,
+        feature="email_draft",
+        note=(
+            f"email_draft_regen/"
+            f"{(drafter_kwargs.get('from_') or '')[:30]}"
+        ),
+    )
+    if parsed is None:
+        return None
+    primary = str(parsed.get("primary") or "").strip()
+    alternative = str(parsed.get("alternative") or "").strip()
+    if not primary and not alternative:
+        return None
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return DraftOutput(
+        primary=primary,
+        alternative=alternative,
+        reasoning=str(parsed.get("reasoning") or ""),
+        confidence=max(0.0, min(1.0, confidence)),
+        open_questions=[
+            str(q) for q in (parsed.get("open_questions") or [])
+            if str(q).strip()
+        ],
+    )

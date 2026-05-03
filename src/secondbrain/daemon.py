@@ -463,6 +463,28 @@ def _build_daemon_scheduler(
         fn=lambda conn: _task_materialize(conn),
     ))
 
+    # Round 7: voice fidelity for email drafts.
+    #   - email_reply_pairs_index: hourly link new Sent items to their
+    #     incoming parents so few-shot retrieval has fresh data.
+    #   - voice_profile_refresh: weekly extract of the user's voice
+    #     profile from their last ~50 sent emails. Cooldown 7d.
+    from .email_assist import (
+        index_reply_pairs as _email_index_pairs,
+    )
+    from .email_assist import (
+        refresh_voice_profile_if_due as _email_voice_refresh,
+    )
+    sched.register(Job(
+        name="email_reply_pairs_index",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda conn: _email_index_pairs(conn),
+    ))
+    sched.register(Job(
+        name="email_voice_profile",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=24 * 7),
+        fn=lambda cfg, conn: _email_voice_refresh(conn, cfg),
+    ))
+
     return sched
 
 
