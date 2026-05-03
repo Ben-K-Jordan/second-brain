@@ -175,6 +175,24 @@ def check_google_calendar(cfg: Config) -> tuple[bool, str, dict]:
     return True, "", {"n_calendars": n_cals}
 
 
+def _key_fingerprint(key: str) -> str:
+    """Round 14 (audit-found gap M2) — return a non-reversible
+    fingerprint of an API key for the health-check ``extras`` dict.
+
+    The previous version stored ``key[:12]`` (Anthropic) / ``key[:8]``
+    (Voyage). Those substrings are mostly the well-known prefix
+    (``sk-ant-api01-``, ``pa-``) but include a few real bytes of
+    secret entropy that ended up rendered to the dashboard ``/health``
+    page and so could leak via screenshots or shoulder-surfing.
+
+    We hash with SHA-256 and keep the first 8 hex chars — enough to
+    distinguish "did the key change?" across health checks without
+    revealing any of the underlying key material.
+    """
+    import hashlib
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+
+
 def check_anthropic_key(cfg: Config) -> tuple[bool, str, dict]:
     """Verify the Anthropic key is set + parseable. Doesn't make a
     paid call — just shape-checks. Saves $0.0001/check vs round-trip."""
@@ -183,8 +201,8 @@ def check_anthropic_key(cfg: Config) -> tuple[bool, str, dict]:
     if not key:
         return False, "ANTHROPIC_API_KEY not set", {}
     if not key.startswith("sk-ant-"):
-        return False, f"key shape unexpected (got {key[:8]}...)", {}
-    return True, "", {"key_prefix": key[:12]}
+        return False, "key shape unexpected (does not start with sk-ant-)", {}
+    return True, "", {"key_fingerprint": _key_fingerprint(key)}
 
 
 def check_voyage_key(cfg: Config) -> tuple[bool, str, dict]:
@@ -197,8 +215,8 @@ def check_voyage_key(cfg: Config) -> tuple[bool, str, dict]:
     if not key:
         return False, "VOYAGE_API_KEY not set", {}
     if not key.startswith("pa-"):
-        return False, f"key shape unexpected (got {key[:6]}...)", {}
-    return True, "", {"key_prefix": key[:8]}
+        return False, "key shape unexpected (does not start with pa-)", {}
+    return True, "", {"key_fingerprint": _key_fingerprint(key)}
 
 
 def check_local_llm(cfg: Config) -> tuple[bool, str, dict]:

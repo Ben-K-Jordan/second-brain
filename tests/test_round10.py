@@ -418,7 +418,13 @@ def test_check_anthropic_key_valid_shape(tmp_cfg, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake-but-shape-OK")
     ok, _err, extra = health_checks.check_anthropic_key(tmp_cfg)
     assert ok is True
-    assert extra["key_prefix"].startswith("sk-ant-api")
+    # Round 14 — switched from `key_prefix` (leaked secret bytes) to
+    # `key_fingerprint` (sha256-truncated). Verify it's a hex string
+    # of the expected length, not the raw key material.
+    fingerprint = extra["key_fingerprint"]
+    assert len(fingerprint) == 8
+    assert all(c in "0123456789abcdef" for c in fingerprint)
+    assert "sk-ant" not in fingerprint
 
 
 def test_check_voyage_key_shape(tmp_cfg, monkeypatch):

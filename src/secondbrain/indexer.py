@@ -523,25 +523,135 @@ _USER_AGENT = (
 _URL_FETCH_MAX_BYTES = 200 * 1024 * 1024
 
 
+class UnsafeURLError(ValueError):
+    """Raised when a URL targets a private / loopback / link-local
+    address that would let SSRF reach internal services. See
+    ``_assert_url_is_public`` for the policy."""
+
+
+def _assert_url_is_public(url: str) -> None:
+    """Round 14 (audit-found gap H2) — SSRF guard for URL ingestion.
+
+    The previous version called ``requests.get(url, allow_redirects=True)``
+    on any user-supplied string. That meant anyone who could hand the
+    user a link (or reach the localhost dashboard / MCP server)
+    could pull:
+      - ``http://169.254.169.254/...`` — cloud-metadata IMDS endpoints
+      - ``http://127.0.0.1:<port>/...`` — other services on the host
+      - ``http://10.x.x.x/...``, ``http://192.168.x.x/...`` — intranet
+      - ``file://`` — local filesystem read
+
+    This function rejects those and ``raise``s ``UnsafeURLError``.
+    The scheme allowlist is ``http``/``https`` only; the host (or each
+    DNS-resolved IP) must be public per the IPv4/IPv6 ``is_private``,
+    ``is_loopback``, ``is_link_local``, ``is_reserved``, ``is_multicast``
+    rules. Resolution is done up-front so we can re-validate on each
+    redirect at the call site.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeURLError(
+            f"refusing scheme {scheme!r} (only http/https allowed)"
+        )
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURLError("URL has no host")
+    # Reject literal ``localhost`` / common loopback aliases up front;
+    # they normally resolve to 127.0.0.1 but on quirky hosts file setups
+    # could resolve elsewhere — we don't want to allow the *intent*.
+    if host.lower() in ("localhost", "ip6-localhost", "ip6-loopback"):
+        raise UnsafeURLError(f"refusing loopback host {host!r}")
+    # If the host is already an IP literal, validate it directly.
+    try:
+        ip_obj = ipaddress.ip_address(host)
+    except ValueError:
+        ip_obj = None
+    candidates: list[ipaddress._BaseAddress] = []
+    if ip_obj is not None:
+        candidates.append(ip_obj)
+    else:
+        # Resolve every A/AAAA record so a multi-record DNS poisoning
+        # attempt (one public, one private) doesn't slip through.
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError as e:
+            raise UnsafeURLError(f"could not resolve {host!r}: {e}") from e
+        for info in infos:
+            sockaddr = info[4]
+            try:
+                candidates.append(ipaddress.ip_address(sockaddr[0]))
+            except (ValueError, IndexError):
+                continue
+        if not candidates:
+            raise UnsafeURLError(f"no IPs resolved for {host!r}")
+    for ip in candidates:
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise UnsafeURLError(
+                f"refusing private/loopback IP {ip} for host {host!r}"
+            )
+
+
 def _fetch_url_to_tempfile(url: str) -> tuple[str, str]:
     """Download a URL with a real user-agent so sites like Wikipedia don't 403 us.
 
     Streams the response with a hard size cap. Returns (local_path,
     content_type). Caller must clean up the temp file.
+
+    Round 14: SSRF-protected. Pre-flight ``_assert_url_is_public``
+    rejects file://, loopback, RFC1918, link-local, and cloud-metadata
+    addresses. Redirects are disabled at the requests layer so we
+    can re-validate each hop ourselves up to ``_REDIRECT_MAX``.
     """
     import os
     import tempfile
-    from urllib.parse import urlparse
+    from urllib.parse import urljoin, urlparse
 
     import requests
 
-    resp = requests.get(
-        url,
-        headers={"User-Agent": _USER_AGENT, "Accept": "*/*"},
-        timeout=60,
-        allow_redirects=True,
-        stream=True,
-    )
+    _assert_url_is_public(url)
+    _REDIRECT_MAX = 5
+    current = url
+    resp = None
+    for _ in range(_REDIRECT_MAX + 1):
+        resp = requests.get(
+            current,
+            headers={"User-Agent": _USER_AGENT, "Accept": "*/*"},
+            timeout=60,
+            allow_redirects=False,
+            stream=True,
+        )
+        # 3xx with a Location header → re-validate then loop.
+        if 300 <= resp.status_code < 400:
+            loc = resp.headers.get("location")
+            resp.close()
+            if not loc:
+                raise UnsafeURLError(
+                    f"{current} returned {resp.status_code} with no Location"
+                )
+            # Resolve relative redirects against the current URL.
+            current = urljoin(current, loc)
+            _assert_url_is_public(current)
+            continue
+        break
+    else:
+        if resp is not None:
+            resp.close()
+        raise UnsafeURLError(
+            f"too many redirects (>{_REDIRECT_MAX}) starting at {url}"
+        )
+    assert resp is not None
     resp.raise_for_status()
     # Honor Content-Length up front - cheaper than streaming and bailing.
     declared = resp.headers.get("content-length")

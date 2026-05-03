@@ -394,10 +394,16 @@ def _default_classifier(
     import os
 
     # Round 10 (#4) — redact body before send.
+    # Round 14 (audit-found gap L1) — also redact ``from_`` and
+    # ``subject`` headers. Display-name PII (full name + phone) and
+    # signing tokens (DKIM-style signed-from headers some senders
+    # include in the visible From: line) had previously been sent raw.
     body_clip = _safe_for_prompt(body, max_chars=4000)
+    from_clip = _safe_for_prompt(from_ or "(unknown)", max_chars=200)
+    subject_clip = _safe_for_prompt(subject or "(no subject)", max_chars=300)
     prompt = _TRIAGE_PROMPT.format(
-        from_=from_ or "(unknown)",
-        subject=subject or "(no subject)",
+        from_=from_clip,
+        subject=subject_clip,
         body=body_clip,
     )
 
@@ -760,10 +766,13 @@ def analyze_email(
     """
 
     # Round 10 (#4) — redact before send, same rationale as classifier.
+    # Round 14 (audit-found gap L1) — also redact from_ / subject.
     body_clip = _safe_for_prompt(body, max_chars=4000)
+    from_clip = _safe_for_prompt(from_ or "(unknown)", max_chars=200)
+    subject_clip = _safe_for_prompt(subject or "(no subject)", max_chars=300)
     prompt = _ANALYZE_PROMPT.format(
-        from_=from_ or "(unknown)",
-        subject=subject or "(no subject)",
+        from_=from_clip,
+        subject=subject_clip,
         body=body_clip,
     )
     raw = _llm_json_call(
@@ -1591,10 +1600,13 @@ def _default_drafter(
         max_chars=8000,
     )
 
+    # Round 14 (audit-found gap L1) — also redact from_/subject headers.
+    from_clip = _safe_for_prompt(from_ or "(unknown)", max_chars=200)
+    subject_clip = _safe_for_prompt(subject or "(no subject)", max_chars=300)
     prompt = _DRAFT_PROMPT_V2.format(
         user_name=user_name,
-        from_=from_ or "(unknown)",
-        subject=subject or "(no subject)",
+        from_=from_clip,
+        subject=subject_clip,
         body=body_clip,
         analysis_block=analysis_block,
         thread_block=thread_block,
@@ -2887,11 +2899,18 @@ def _regenerate_with_critique(
         drafter_kwargs.get("style_samples") or "", max_chars=6000,
     )
     safe_prior = _safe_for_prompt(prior_draft.strip(), max_chars=2500)
+    # Round 14 (audit-found gap L1) — also redact from_/subject headers.
+    from_clip = _safe_for_prompt(
+        drafter_kwargs["from_"] or "(unknown)", max_chars=200,
+    )
+    subject_clip = _safe_for_prompt(
+        drafter_kwargs["subject"] or "(no subject)", max_chars=300,
+    )
     prompt = (
         _DRAFT_PROMPT_V2.format(
             user_name=drafter_kwargs["user_name"],
-            from_=drafter_kwargs["from_"] or "(unknown)",
-            subject=drafter_kwargs["subject"] or "(no subject)",
+            from_=from_clip,
+            subject=subject_clip,
             body=body_clip,
             analysis_block=analysis_block,
             thread_block=thread_block,

@@ -40,14 +40,21 @@ def _patch_dashboard(monkeypatch, tmp_path, fake_embedder):
 def client(monkeypatch, tmp_path, fake_embedder):
     """A test client backed by a fresh temp DB, so we don't pollute
     the user's real index. Uses the deterministic fake embedder
-    so we don't need sentence-transformers / VOYAGE_API_KEY."""
+    so we don't need sentence-transformers / VOYAGE_API_KEY.
+
+    Round 14 — sets a default localhost Referer so the same-origin
+    CSRF guard added to every state-mutating POST treats these test
+    requests as same-origin (TestClient defaults to the
+    ``http://testserver`` host, which the guard correctly rejects)."""
     from fastapi.testclient import TestClient
 
     from secondbrain.dashboard import create_app
 
     _patch_dashboard(monkeypatch, tmp_path, fake_embedder)
     app = create_app()
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers["referer"] = "http://127.0.0.1:8765/"
+    return c
 
 
 # ============================ /brief ==================================
@@ -481,6 +488,8 @@ def test_habits_checkin_creates_row(monkeypatch, tmp_path, fake_embedder):
 
     app = create_app()
     client_inner = TestClient(app)
+    # Round 14 — same-origin Referer for the CSRF guard on POST.
+    client_inner.headers["referer"] = "http://127.0.0.1:8765/habits"
     r = client_inner.post(
         f"/habits/{hid}/checkin", follow_redirects=False,
     )

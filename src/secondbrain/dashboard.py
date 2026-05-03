@@ -1151,6 +1151,31 @@ _NAV_GROUPS = [
 _INITIAL_BADGES_FN: object | None = None
 
 
+def _is_same_origin_request(request: Request) -> bool:
+    """Round 14 (audit-found gap M1) — same-origin guard helper.
+
+    Lifted from the inlined Origin/Referer check that round 13
+    sprinkled across ~12 mutation routes (and the audit then found
+    11 *more* mutation routes that hadn't been guarded at all).
+    Centralising it here means future routes get the protection by
+    default and the policy lives in exactly one place.
+
+    Policy: at least one of Origin / Referer must start with
+    ``http://127.0.0.1`` or ``http://localhost``. The dashboard binds
+    127.0.0.1 by default (see ``run_dashboard``), so cross-origin
+    pages can submit forms but won't have a same-origin Referer or
+    Origin — both of which are set by the browser itself and aren't
+    forge-able from JS in cross-origin contexts.
+    """
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+    return (
+        any(origin.startswith(p) for p in same_origin_prefixes)
+        or any(referer.startswith(p) for p in same_origin_prefixes)
+    )
+
+
 def _layout(
     title: str, body: str, active: str = "",
     *, initial_badges: dict | None = None,
@@ -2723,6 +2748,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         """Save (or clear) the per-conversation system prompt."""
         from .db import chat_get_conversation, chat_set_system_prompt
 
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         if chat_get_conversation(conn, cid) is None:
             return HTMLResponse("<h1>Not found</h1>", status_code=404)
@@ -2735,9 +2762,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return RedirectResponse(url=f"/chat/{cid}", status_code=303)
 
     @app.post("/chat/{cid:int}/delete")
-    def chat_delete(cid: int):
+    def chat_delete(cid: int, request: Request):
         from .db import chat_delete_conversation
 
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         chat_delete_conversation(conn, cid)
         return RedirectResponse(url="/chat/list", status_code=303)
@@ -2761,6 +2790,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             chat_get_system_prompt,
         )
 
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, embedder, reranker = get_state()
         form = await request.form()
         user_msg = (form.get("message") or "").strip()
@@ -3108,14 +3139,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .presets import resolve as resolve_preset
 
         _, conn, _, _ = get_state()
-        # Same-origin guard mirroring /ingest.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         name = (form.get("name") or "").strip()
@@ -3153,14 +3178,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .watchlist import run_watchlist
 
         cfg, conn, embedder, reranker = get_state()
-        # Same-origin guard.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         action = (form.get("action") or "").strip()
@@ -3334,14 +3353,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .db import application_create
 
         _, conn, _, _ = get_state()
-        # Same-origin guard.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         company = (form.get("company") or "").strip()
@@ -3361,13 +3374,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .db import APPLICATION_STATUSES, application_get, application_set_status
 
         _, conn, _, _ = get_state()
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         new_status = (form.get("new_status") or "").strip()
@@ -3384,13 +3392,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .db import application_delete
 
         _, conn, _, _ = get_state()
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         application_delete(conn, aid)
         return RedirectResponse(url="/applications", status_code=303)
@@ -3568,13 +3571,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
         cfg, conn, embedder, reranker = get_state()
         # CSRF guard.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         eid = (form.get("event_id") or "").strip()
@@ -3591,13 +3589,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .event_briefing import generate_for_event, manual_event
 
         cfg, conn, embedder, reranker = get_state()
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         title = (form.get("title") or "").strip()
@@ -3789,13 +3782,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from .db import reading_queue_enqueue
 
         _, conn, _, _ = get_state()
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         url = (form.get("url") or "").strip()
@@ -3813,13 +3801,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         )
 
         _, conn, _, _ = get_state()
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         form = await request.form()
         action = (form.get("action") or "").strip()
@@ -3945,19 +3928,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.post("/ingest", response_class=HTMLResponse)
     def ingest_action(request: Request, url: str = Form(...)):
         cfg, conn, embedder, _ = get_state()
-        # CSRF guard: form-POSTs aren't gated by CORS, so any page the user
-        # visits could otherwise force-ingest an arbitrary URL by submitting
-        # a hidden form to http://127.0.0.1:8765/ingest. Require the Origin
-        # (or Referer, when Origin isn't sent) to be the dashboard itself.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        same_origin = any(origin.startswith(p) for p in same_origin_prefixes) or any(
-            referer.startswith(p) for p in same_origin_prefixes
-        )
-        if not same_origin:
+        # CSRF guard: form-POSTs aren't gated by CORS, so any page the
+        # user visits could otherwise force-ingest an arbitrary URL by
+        # submitting a hidden form to http://127.0.0.1:8765/ingest.
+        # Round 14 — uses centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse(
-                "<h1>Forbidden</h1><p>Cross-origin POSTs to /ingest are blocked.</p>",
+                "<h1>Forbidden</h1>"
+                "<p>Cross-origin POSTs to /ingest are blocked.</p>",
                 status_code=403,
             )
         url = url.strip()
@@ -4129,19 +4107,23 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Tasks", body, "tasks"))
 
     @app.post("/tasks/add")
-    def tasks_add(text: str = Form(...)):
+    def tasks_add(request: Request, text: str = Form(...)):
         from fastapi.responses import RedirectResponse
 
         from . import tasks as tasks_mod
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         tasks_mod.add_manual(conn, text)
         return RedirectResponse(url="/tasks", status_code=303)
 
     @app.post("/tasks/{task_id:int}/done")
-    def tasks_mark_done(task_id: int):
+    def tasks_mark_done(task_id: int, request: Request):
         from fastapi.responses import RedirectResponse
 
         from . import tasks as tasks_mod
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         tasks_mod.mark_done(conn, task_id)
         return RedirectResponse(url="/tasks", status_code=303)
@@ -4409,13 +4391,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         # browser-extension API allow-list (CORS) plus this missing
         # guard left a CSRF hole reachable from a compromised
         # extension page.
-        origin = request.headers.get("origin", "")
-        referer = request.headers.get("referer", "")
-        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
-        if not (
-            any(origin.startswith(p) for p in same_origin_prefixes)
-            or any(referer.startswith(p) for p in same_origin_prefixes)
-        ):
+        # Round 14 — uses the centralised _is_same_origin_request helper.
+        if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         existing = people_mod.get_person(conn, person_id)
@@ -4508,10 +4485,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Habits", body, "habits"))
 
     @app.post("/habits/{habit_id:int}/checkin")
-    def habits_checkin_post(habit_id: int):
+    def habits_checkin_post(habit_id: int, request: Request):
         from fastapi.responses import RedirectResponse
 
         from . import personal
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         personal.checkin(conn, habit_id)
         return RedirectResponse(url="/habits", status_code=303)
@@ -4556,11 +4535,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.post("/journal/add")
     def journal_add_post(
+        request: Request,
         text: str = Form(""), mood: int = Form(0),
     ):
         from fastapi.responses import RedirectResponse
 
         from . import personal
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, embedder, _ = get_state()
         personal.upsert_journal(
             conn, mood=mood if mood > 0 else None, text=text,
@@ -4820,10 +4802,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Drafts", body, "drafts"))
 
     @app.post("/drafts/{draft_id:int}/sent")
-    def drafts_mark_sent(draft_id: int):
+    def drafts_mark_sent(draft_id: int, request: Request):
         from fastapi.responses import RedirectResponse
 
         from . import email_assist, meeting_thanks
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         email_assist.mark_draft_sent(conn, draft_id)
         # Round 8 — also flip any linked meeting_thanks row to 'sent'
@@ -4835,10 +4819,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return RedirectResponse(url="/drafts", status_code=303)
 
     @app.post("/drafts/{draft_id:int}/discard")
-    def drafts_discard(draft_id: int):
+    def drafts_discard(draft_id: int, request: Request):
         from fastapi.responses import RedirectResponse
 
         from . import email_assist
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         email_assist.discard_draft(conn, draft_id)
         return RedirectResponse(url="/drafts", status_code=303)
@@ -4957,31 +4943,39 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Thanks", body, "thanks"))
 
     @app.post("/thanks/{mt_id:int}/context")
-    def thanks_set_context(mt_id: int, text: str = Form("")):
+    def thanks_set_context(
+        mt_id: int, request: Request, text: str = Form(""),
+    ):
         from fastapi.responses import RedirectResponse
 
         from . import meeting_thanks
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         meeting_thanks.set_context(conn, mt_id, text)
         return RedirectResponse(url="/thanks", status_code=303)
 
     @app.post("/thanks/{mt_id:int}/skip")
-    def thanks_skip_post(mt_id: int):
+    def thanks_skip_post(mt_id: int, request: Request):
         from fastapi.responses import RedirectResponse
 
         from . import meeting_thanks
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         meeting_thanks.mark_skipped(conn, mt_id)
         return RedirectResponse(url="/thanks", status_code=303)
 
     @app.post("/thanks/{mt_id:int}/draft")
-    def thanks_draft_post(mt_id: int):
+    def thanks_draft_post(mt_id: int, request: Request):
         """Synchronously draft + redirect to /drafts so the user
         sees the result immediately. The daemon would do the same
         on its next tick — this is just the "do it now" button."""
         from fastapi.responses import RedirectResponse
 
         from . import meeting_thanks
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         meeting_thanks.generate_thanks_draft(conn, cfg, mt_id)
         return RedirectResponse(url="/drafts", status_code=303)

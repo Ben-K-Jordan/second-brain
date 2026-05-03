@@ -305,11 +305,16 @@ def _default_generator(
     except BudgetExceededError as e:
         log.warning("study: budget exceeded: %s", e)
         return []
-    # Cap body to keep input cost bounded — first 12k chars covers
-    # 99%-ile lectures and skips the closing chitchat.
-    body_cap = 12000
-    body_clip = body if len(body) <= body_cap else body[:body_cap] + "…"
-    prompt = _GENERATOR_PROMPT.format(title=title, body=body_clip, n=n)
+    # Round 14 (audit-found gap H1) — redact PII / secret-shaped
+    # substrings before the lecture body leaves for Anthropic. Every
+    # other LLM call site in the app applies _safe_for_prompt; this
+    # was the missed one. Cap to 12k chars (covers 99%-ile lectures
+    # and skips closing chitchat). Title goes through the same path
+    # in case the user names a lecture after a person / project.
+    from .email_assist import _safe_for_prompt
+    body_clip = _safe_for_prompt(body, max_chars=12000)
+    title_clean = _safe_for_prompt(title, max_chars=200)
+    prompt = _GENERATOR_PROMPT.format(title=title_clean, body=body_clip, n=n)
     client = anthropic.Anthropic()
     try:
         resp = client.messages.create(
