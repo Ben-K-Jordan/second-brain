@@ -260,55 +260,90 @@ def _first_line_h1(text: str) -> str:
 
 
 def _default_summary_generator(title: str, body: str, cfg) -> dict:
-    """Real generator. Bounded budget via per-feature 'summary' bucket."""
-    import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return {}
-    try:
-        import anthropic
-    except ImportError:
-        return {}
-    from .budget import (
-        BudgetExceededError,
-        check_budget,
-        record_usage,
-    )
+    """Real generator. Bounded budget via per-feature 'summary' bucket.
 
-    try:
-        check_budget(cfg, "anthropic", feature="summary")
-    except BudgetExceededError as e:
-        log.warning("synthesis: budget exceeded: %s", e)
-        return {}
+    Phase 89 wiring: when Anthropic is unavailable (no API key,
+    budget exhausted, transient error), fall back to a local Ollama
+    completion that produces a single-sentence TL;DR. The local path
+    can't reliably emit JSON, so key_points stays empty — degraded
+    but functional, which beats hard-failing on a daemon tick.
+    """
+    import os
+
     body_clip = (
         body if len(body) <= _AUTO_SUMMARY_INPUT_CAP
         else body[:_AUTO_SUMMARY_INPUT_CAP] + "…"
     )
     prompt = _TLDR_PROMPT.format(title=title, body=body_clip)
-    client = anthropic.Anthropic()
+
+    # ---- Primary: Anthropic ----
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic
+        except ImportError:
+            anthropic = None  # type: ignore[assignment]
+        if anthropic is not None:
+            from .budget import (
+                BudgetExceededError,
+                check_budget,
+                record_usage,
+            )
+            try:
+                check_budget(cfg, "anthropic", feature="summary")
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=600,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                record_usage(
+                    cfg, "anthropic", "claude-haiku-4-5",
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                    feature="summary",
+                    note=f"summary/{title[:40]}",
+                )
+                text = "".join(
+                    b.text for b in resp.content if b.type == "text"
+                ).strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```\w*\s*", "", text)
+                    text = re.sub(r"\s*```\s*$", "", text)
+                try:
+                    parsed = json.loads(text)
+                    if parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            except BudgetExceededError as e:
+                log.info(
+                    "synthesis: budget exhausted, trying local LLM: %s", e,
+                )
+            except anthropic.APIError as e:
+                log.info(
+                    "synthesis: Anthropic API error, trying local LLM: %s", e,
+                )
+
+    # ---- Fallback: local Ollama ----
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        log.warning("synthesis: API error: %s", e)
+        from . import local_llm
+    except ImportError:
         return {}
-    record_usage(
-        cfg, "anthropic", "claude-haiku-4-5",
-        input_tokens=resp.usage.input_tokens,
-        output_tokens=resp.usage.output_tokens,
-        feature="summary",
-        note=f"summary/{title[:40]}",
+    if not local_llm.is_available(cfg):
+        return {}
+    local_prompt = (
+        "Summarise this document in one sentence (<= 30 words). "
+        "Output the sentence only, no preamble.\n\n"
+        f"Title: {title}\n\nBody:\n{body_clip}"
     )
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```\w*\s*", "", text)
-        text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+    out = local_llm.complete(local_prompt, cfg=cfg, max_tokens=120)
+    if out is None:
         return {}
+    tldr = out.text.strip().splitlines()[0].strip().strip("\"'")[:280]
+    if not tldr:
+        return {}
+    log.info("synthesis: TL;DR via local LLM (%s)", out.model)
+    return {"tldr": tldr, "key_points": []}
 
 
 def materialize_summaries_due(

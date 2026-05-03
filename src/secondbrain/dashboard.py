@@ -942,6 +942,10 @@ def _layout(title: str, body: str, active: str = "") -> str:
         ("Journal", "/journal"),
         ("Projects", "/projects"),
         ("Drafts", "/drafts"),
+        ("Insights", "/insights"),
+        ("Memory", "/memory"),
+        ("Study", "/study/review"),
+        ("Snapshots", "/snapshots"),
         ("Briefings", "/briefings"),
         ("Queue", "/queue"),
         ("Search", "/search"),
@@ -4476,6 +4480,172 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         ]
 
         return {"entities": entities, "files": files}
+
+    # ============================================================
+    # Phase 73 / 75 / 86 / 87 — pages added in the polish-v3 audit:
+    # surface flagship recent features that previously had only a
+    # CLI / MCP entry point.
+    # ============================================================
+
+    @app.get("/snapshots", response_class=HTMLResponse)
+    def snapshots_view():
+        """Phase 87 — list weekly index snapshots so the user can
+        eyeball the timeline of their brain. Each row links to a
+        scoped search that filters to that snapshot's file set."""
+        from . import memory as memory_mod
+
+        cfg, conn, _, _ = get_read_state()
+        snaps = memory_mod.list_snapshots(conn, limit=50)
+        if not snaps:
+            body = (
+                "<h1>Snapshots</h1>"
+                "<div class='card'><p class='muted'>"
+                "No snapshots yet. The daemon takes one weekly; run "
+                "<code>secondbrain snapshot take</code> to capture "
+                "the current state immediately."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Snapshots", body, "snapshots"))
+        rows_html = []
+        now = time.time()
+        for s in snaps:
+            when = time.strftime("%Y-%m-%d", time.localtime(s.taken_at))
+            age = max(0, int((now - s.taken_at) // 86400))
+            label = f" <span class='muted'>· {escape(s.label)}</span>" if s.label else ""
+            rows_html.append(
+                f"<div class='stat'>"
+                f"<span><strong>#{s.id}</strong> {when}{label}</span>"
+                f"<span class='v muted'>{s.n_files} files · {age}d ago</span>"
+                f"</div>",
+            )
+        body = (
+            f"<h1>Snapshots ({len(snaps)})</h1>"
+            f"<div class='card'><p class='muted'>"
+            f"Snapshots support temporal queries — "
+            f"<code>secondbrain search 'X' --as-of '2 weeks ago'</code> "
+            f"filters results to the closest preceding snapshot."
+            f"</p>{''.join(rows_html)}</div>"
+        )
+        return HTMLResponse(_layout("Snapshots", body, "snapshots"))
+
+    @app.get("/insights", response_class=HTMLResponse)
+    def insights_view():
+        """Phase 75 — proactive 'I noticed X' surfacing. Same data the
+        daily brief uses, surfaced standalone for ad-hoc viewing."""
+        from . import synthesis
+
+        cfg, conn, _, _ = get_read_state()
+        insights = synthesis.detect_insights(conn)
+        if not insights:
+            body = (
+                "<h1>Insights</h1>"
+                "<div class='card'><p class='muted'>"
+                "Nothing new to flag right now. Insights surface "
+                "topic spikes (entities trending in your recent docs) "
+                "and health drift (Oura metrics out of band). "
+                "Already-shown insights are deduped for 7 days."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Insights", body, "insights"))
+        from .safety import redact_text as _redact
+        items_html = "".join(
+            f"<div class='card' style='margin-bottom:12px;'>"
+            f"<h3 style='margin:0 0 6px 0;'>{escape(_redact(i.headline))}</h3>"
+            f"<div class='muted' style='font-size:0.85em;'>{escape(i.kind)}</div>"
+            f"<p style='margin:8px 0 0 0;'>{escape(_redact(i.detail))}</p>"
+            f"</div>"
+            for i in insights
+        )
+        body = f"<h1>Insights ({len(insights)})</h1>{items_html}"
+        return HTMLResponse(_layout("Insights", body, "insights"))
+
+    @app.get("/study/review", response_class=HTMLResponse)
+    def study_review_view():
+        """Phase 67 — flashcard review session. Lists due cards;
+        each card has 'show answer' + 4 SM-2 grade buttons. Stays
+        server-rendered (one card per page) to keep the dashboard
+        dependency-free."""
+        from . import study
+
+        cfg, conn, _, _ = get_state()
+        due = study.due_cards(conn, limit=20)
+        if not due:
+            body = (
+                "<h1>Flashcard review</h1>"
+                "<div class='card'><p class='muted'>"
+                "No cards due. Run "
+                "<code>secondbrain study quiz</code> to see all your "
+                "decks, or wait for the daemon to materialise more "
+                "cards from your <code>[course]</code> docs."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Study", body, "study"))
+        from .safety import redact_text as _redact
+        items_html = []
+        for c in due:
+            items_html.append(
+                f"<div class='card' style='margin-bottom:12px;'>"
+                f"<div class='stat'>"
+                f"<span><strong>Card #{c.id}</strong> "
+                f"<span class='muted'>{escape(c.concept)}</span></span>"
+                f"<span class='v muted'>"
+                f"{escape(c.course_code)} · ease {c.ease:.2f}"
+                f"</span></div>"
+                f"<details style='margin-top:8px;'>"
+                f"<summary><strong>Q.</strong> {escape(_redact(c.question))}</summary>"
+                f"<p style='margin:8px 0 0 0;'>"
+                f"<strong>A.</strong> {escape(_redact(c.answer))}"
+                f"</p></details>"
+                f"<div class='muted' style='font-size:0.85em;margin-top:8px;'>"
+                f"Grade via "
+                f"<code>secondbrain study grade {c.id} 0|3|4|5</code>"
+                f"</div></div>",
+            )
+        body = (
+            f"<h1>Flashcard review ({len(due)} due)</h1>"
+            + "".join(items_html)
+        )
+        return HTMLResponse(_layout("Study", body, "study"))
+
+    @app.get("/memory", response_class=HTMLResponse)
+    def memory_view():
+        """Phase 86 — list cross-conversation memories so the user
+        can audit what the chat agent has stashed about them. Each
+        row shows kind / key / content / last referenced."""
+        from . import memory as memory_mod
+
+        cfg, conn, _, _ = get_read_state()
+        mems = memory_mod.list_memories(conn, limit=100)
+        if not mems:
+            body = (
+                "<h1>Chat memories</h1>"
+                "<div class='card'><p class='muted'>"
+                "No memories yet. The chat agent extracts persistent "
+                "facts (preferences, recurring projects, family info) "
+                "from your conversations as they happen."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Memory", body, "memory"))
+        from .safety import redact_text as _redact
+        items_html = []
+        for m in mems:
+            items_html.append(
+                f"<div class='stat' style='align-items:flex-start;'>"
+                f"<span style='flex:1;'>"
+                f"<span class='muted'>[{escape(m.kind)}]</span> "
+                f"<strong>{escape(_redact(m.key))}</strong>: "
+                f"{escape(_redact(m.content))}"
+                f"</span>"
+                f"<span class='v muted'>"
+                f"{m.reference_count} refs · "
+                f"conf {m.confidence:.2f}"
+                f"</span></div>",
+            )
+        body = (
+            f"<h1>Chat memories ({len(mems)})</h1>"
+            f"<div class='card'>{''.join(items_html)}</div>"
+        )
+        return HTMLResponse(_layout("Memory", body, "memory"))
 
     return app
 

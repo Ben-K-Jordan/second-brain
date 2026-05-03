@@ -2616,13 +2616,23 @@ def review(
     conn.close()
 
 
-@app.command()
-def insights() -> None:
-    """Phase 75: 'I noticed X' — pattern detection across recent docs
-    + health metrics. Surfaces topic spikes and out-of-norm health.
+insights_app = typer.Typer(
+    invoke_without_command=True,
+    help="Phase 75: 'I noticed X' — pattern detection across recent "
+         "docs + health metrics. Bare invocation shows the active "
+         "insight feed; `dismiss` records that you've seen one so it "
+         "won't re-surface within the dedup window.",
+)
+app.add_typer(insights_app, name="insights")
 
-    Insights are deduped — once surfaced, an insight won't re-fire
-    for 7 days unless cleared."""
+
+@insights_app.callback(invoke_without_command=True)
+def _insights_root(ctx: typer.Context) -> None:
+    """Show active insights when invoked without a subcommand —
+    preserves the original `secondbrain insights` UX after the
+    refactor to a subapp."""
+    if ctx.invoked_subcommand is not None:
+        return
     from .synthesis import detect_insights
 
     cfg = load_config()
@@ -2635,14 +2645,58 @@ def insights() -> None:
     for ins in rows:
         console.print(f"[bold]{ins.headline}[/]")
         console.print(f"  [dim]{ins.detail}[/]")
+        console.print(f"  [dim]key: {ins.key}[/]")
         console.print()
     conn.close()
 
 
-@app.command()
-def projects() -> None:
-    """Phase 73: smart projects — auto-detect clusters of recent docs
-    that hover around a single theme using the backlinks graph."""
+@insights_app.command("dismiss")
+def insights_dismiss(
+    key: str = typer.Argument(
+        ...,
+        help="Insight key (printed under each insight in the list).",
+    ),
+) -> None:
+    """Mark an insight as seen so it won't re-fire within the
+    7-day dedup window. Pass the ``key`` field shown in
+    `secondbrain insights`."""
+    from .synthesis import Insight, record_insight_fired
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    # We construct a minimal Insight just to pass into the recorder —
+    # only `key` is read off it for the dedup table.
+    record_insight_fired(
+        conn,
+        Insight(
+            key=key, kind="dismissed", headline="(dismissed)",
+            detail="", payload={},
+        ),
+    )
+    console.print(
+        f"[green]✓[/] Insight {key!r} dismissed (won't re-surface "
+        f"for 7 days).",
+    )
+    conn.close()
+
+
+projects_smart_app = typer.Typer(
+    invoke_without_command=True,
+    help="Phase 73: smart projects — auto-detected clusters of recent "
+         "docs that hover around a single theme. Bare invocation lists "
+         "detected clusters; `promote` converts one into a real, "
+         "user-curated project (Phase 81).",
+)
+# Use a different name from the existing "project" subapp (singular,
+# explicit-projects CRUD). "projects" plural = smart-cluster surface.
+app.add_typer(projects_smart_app, name="projects")
+
+
+@projects_smart_app.callback(invoke_without_command=True)
+def _projects_root(ctx: typer.Context) -> None:
+    """List detected clusters when invoked bare."""
+    if ctx.invoked_subcommand is not None:
+        return
     from .synthesis import detect_project_clusters
 
     cfg = load_config()
@@ -2655,9 +2709,9 @@ def projects() -> None:
         )
         conn.close()
         return
-    for c in clusters:
+    for i, c in enumerate(clusters):
         console.print(
-            f"[bold]{c.suggested_name}[/] "
+            f"[bold]#{i}[/] [bold]{c.suggested_name}[/] "
             f"[dim](score {c.score:.2f}, {len(c.member_paths)} docs)[/]",
         )
         console.print(f"  seed: {c.seed_title}")
@@ -2666,6 +2720,73 @@ def projects() -> None:
         if len(c.member_titles) > 5:
             console.print(f"  · _... +{len(c.member_titles) - 5} more_")
         console.print()
+    console.print(
+        "[dim]Promote with `secondbrain projects promote <#index>`.[/]",
+    )
+    conn.close()
+
+
+@projects_smart_app.command("promote")
+def projects_promote(
+    index: int = typer.Argument(
+        ...,
+        help="Cluster index from `secondbrain projects` (0 = first).",
+    ),
+    name: str = typer.Option(
+        None, "--name",
+        help="Override the auto-suggested project name.",
+    ),
+) -> None:
+    """Convert a detected cluster into a Phase-81 project (with a
+    slug + member files attached)."""
+    from . import personal
+    from .synthesis import detect_project_clusters
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    clusters = detect_project_clusters(conn)
+    if not clusters:
+        console.print("[red]No clusters to promote.[/]")
+        conn.close()
+        raise typer.Exit(code=1)
+    if index < 0 or index >= len(clusters):
+        console.print(
+            f"[red]Index {index} out of range (0..{len(clusters) - 1}).[/]",
+        )
+        conn.close()
+        raise typer.Exit(code=1)
+    cluster = clusters[index]
+    project_name = name or cluster.suggested_name or cluster.seed_title
+    pid = personal.create_project(
+        conn, project_name,
+        description=f"Auto-promoted from smart-cluster seed: {cluster.seed_title}",
+    )
+    # Attach every member file to the project so the user has a
+    # ready-made working set to start from.
+    placeholders = ",".join("?" * len(cluster.member_paths))
+    rows = conn.execute(
+        f"SELECT id, path FROM files WHERE path IN ({placeholders})",
+        list(cluster.member_paths),
+    ).fetchall()
+    n_attached = 0
+    n_now = time.time()
+    for r in rows:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO project_items"
+                "(project_id, kind, ref_id, added_at) "
+                "VALUES (?, 'file', ?, ?)",
+                (pid, int(r["id"]), n_now),
+            )
+            n_attached += 1
+        except Exception as e:  # noqa: BLE001
+            log = logging.getLogger(__name__)
+            log.warning("projects promote: attach failed: %s", e)
+    conn.commit()
+    console.print(
+        f"[green]✓[/] Project [bold]{project_name}[/] (#{pid}) created "
+        f"with {n_attached} attached file(s).",
+    )
     conn.close()
 
 
@@ -3102,6 +3223,72 @@ def snapshot_list(
             str(s.id), when, str(s.n_files), s.label or "",
         )
     console.print(table)
+    conn.close()
+
+
+@snapshot_app.command("diff")
+def snapshot_diff(
+    a: int = typer.Argument(..., help="Older snapshot id."),
+    b: int = typer.Argument(..., help="Newer snapshot id."),
+    limit: int = typer.Option(
+        50, "--limit", "-n",
+        help="Per-section cap on file paths to print.",
+    ),
+) -> None:
+    """Show what's new / removed between two snapshots.
+
+    Useful for 'what did I add since the last review?' / 'what got
+    deleted before today's brief got weird' kinds of questions. Both
+    snapshots must exist; ``a`` is the older one — its file_id set
+    is the baseline.
+    """
+    from . import memory as memory_mod
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+
+    snaps = {s.id: s for s in memory_mod.list_snapshots(conn, limit=10_000)}
+    if a not in snaps:
+        console.print(f"[red]Snapshot #{a} not found.[/]")
+        raise typer.Exit(code=1) from None
+    if b not in snaps:
+        console.print(f"[red]Snapshot #{b} not found.[/]")
+        raise typer.Exit(code=1) from None
+    snap_a = snaps[a]
+    snap_b = snaps[b]
+    added = snap_b.file_ids - snap_a.file_ids
+    removed = snap_a.file_ids - snap_b.file_ids
+    when_a = time.strftime("%Y-%m-%d", time.localtime(snap_a.taken_at))
+    when_b = time.strftime("%Y-%m-%d", time.localtime(snap_b.taken_at))
+    console.print(
+        f"[bold]Snapshot diff[/]  #{a} ({when_a}) → #{b} ({when_b})",
+    )
+    console.print(
+        f"  [green]+{len(added)} added[/]  "
+        f"[red]-{len(removed)} removed[/]",
+    )
+
+    def _resolve(ids: set[int]) -> list[str]:
+        if not ids:
+            return []
+        chunk = list(ids)[:limit]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT path FROM files WHERE id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        return sorted(r["path"] for r in rows)
+
+    added_paths = _resolve(added)
+    if added_paths:
+        console.print(f"\n[green]Added (showing {len(added_paths)}):[/]")
+        for p in added_paths:
+            console.print(f"  + {p}")
+    removed_paths = _resolve(removed)
+    if removed_paths:
+        console.print(f"\n[red]Removed (showing {len(removed_paths)}):[/]")
+        for p in removed_paths:
+            console.print(f"  - {p}")
     conn.close()
 
 

@@ -223,3 +223,84 @@ def parallel_sync(
 
     report.finished_at = time.time()
     return report
+
+
+# ---- Daemon entrypoint ------------------------------------------------
+
+def run_sync_due(cfg, conn, embedder) -> int:
+    """Daemon hook — sync every enabled connector once.
+
+    The daemon scheduler decides cadence (cooldown / interval); this
+    function unconditionally runs sync when called and returns the
+    grand-total indexed count so the runs table shows useful numbers.
+
+    Skips connectors whose ``is_enabled(cfg)`` returns False (no
+    credentials configured) so we don't spam logs with "missing token"
+    warnings every tick. Failures inside ``parallel_sync`` are caught
+    + logged per-connector — one crashing connector shouldn't take
+    down the rest of the sync run.
+    """
+    from .connectors import all_connectors
+    from .indexer import index_text
+
+    entity_extractor = None
+    if getattr(cfg, "entities_enabled", False):
+        try:
+            from .entities import make_entity_extractor
+            entity_extractor = make_entity_extractor(cfg)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "sync: entity extractor unavailable: %s", type(e).__name__,
+            )
+
+    connectors = []
+    for cls in all_connectors():
+        try:
+            c = cls()
+            if not c.is_enabled(cfg):
+                continue
+            connectors.append(c)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "sync: connector %s init crashed: %s",
+                cls, type(e).__name__,
+            )
+    if not connectors:
+        return 0
+
+    def _index(doc, source_name):  # noqa: ARG001
+        result = index_text(
+            conn, embedder, cfg,
+            virtual_path=doc.virtual_path,
+            title=doc.title,
+            content=doc.content,
+            mtime=doc.mtime,
+            kind=doc.kind,
+            source=doc.source,
+            entity_extractor=entity_extractor,
+        )
+        return result.status
+
+    report = parallel_sync(connectors, cfg, index_doc=_index)
+
+    # Phase 56: Oura health metrics ingest happens out-of-band from
+    # the doc indexer. Mirror the CLI behaviour so the daemon path
+    # keeps health_metrics fresh.
+    if any(c.name == "oura" for c in connectors):
+        try:
+            from .connectors.oura import fetch_summaries
+            from .health import ingest_summaries
+            n = ingest_summaries(conn, fetch_summaries(cfg))
+            log.info("sync: oura health_metrics: %d updated", n)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sync: oura health_metrics ingest failed: %s", e)
+
+    total = report.grand_total()
+    if total.indexed or total.error:
+        log.info(
+            "sync_due: indexed=%d unchanged=%d alias=%d errors=%d "
+            "(%.1fs across %d connectors)",
+            total.indexed, total.unchanged, total.alias, total.error,
+            report.duration_seconds, len(connectors),
+        )
+    return total.indexed

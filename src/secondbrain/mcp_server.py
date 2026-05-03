@@ -124,21 +124,30 @@ def _matching_entity_keys(conn, query: str, fuzzy: bool) -> list[str]:
     return list(matches)
 
 
+def _safe(s: str | None) -> str:
+    """Phase 88 — redact sensitive content (API keys, secrets, etc.)
+    before surfacing chunk / file / memory text to the MCP client.
+    Indexes still hold the verbatim text; we mask only at the render
+    boundary so search recall isn't crippled."""
+    if not s:
+        return ""
+    try:
+        from .safety import redact_text
+    except ImportError:
+        return s
+    return redact_text(s)
+
+
 def _format_results(results, header: str) -> str:
     if not results:
         return f"{header}\n\n(no matches)"
-    # Phase 88: redact sensitive content before surfacing to chat /
-    # MCP responses. Indexes still hold the verbatim text — we redact
-    # only at the render boundary so search recall isn't crippled.
-    from .safety import redact_text
-
     lines = [header, ""]
     for i, r in enumerate(results, 1):
         sources = "+".join(r.sources)
         tag = "reranked" if r.reranked else sources
         lines.append(f"### {i}. {r.file_path} (chunk {r.chunk_index}, via {tag}, score={r.score:.4f})")
         snippet = r.text if len(r.text) <= 1200 else r.text[:1200] + "..."
-        lines.append(redact_text(snippet))
+        lines.append(_safe(snippet))
         lines.append("")
     return "\n".join(lines)
 
@@ -451,14 +460,16 @@ def image_search(query: str, k: int = 10) -> str:
 
 @mcp.tool()
 def get_file(path: str) -> str:
-    """Return the full text contents of a file by path."""
+    """Return the full text contents of a file by path. Sensitive
+    content (API keys, secrets) is redacted at the render boundary
+    via Phase 88 patterns — the underlying file is untouched."""
     p = Path(path)
     if not p.exists():
         return f"File not found: {path}"
     if not p.is_file():
         return f"Not a file: {path}"
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        return _safe(p.read_text(encoding="utf-8", errors="replace"))
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -620,7 +631,7 @@ def find_mentions(entity: str, k: int = 10, fuzzy: bool = True) -> str:
     for r in rows:
         snippet = r["text"] if len(r["text"]) <= 600 else r["text"][:600] + "..."
         lines.append(f"### {r['path']} (chunk {r['chunk_index']})")
-        lines.append(snippet)
+        lines.append(_safe(snippet))
         lines.append("")
     return "\n".join(lines)
 
@@ -736,11 +747,11 @@ def list_open_tasks(limit: int = 20) -> str:
     for t in rows:
         age = max(0, int((now - t.created_at) // 86400))
         suffix = (
-            f"  (from: {t.source_title})"
+            f"  (from: {_safe(t.source_title)})"
             if t.source_path != "manual" else ""
         )
         age_label = f" [{age}d]" if age > 0 else ""
-        lines.append(f"  #{t.id}{age_label}  {t.text}{suffix}")
+        lines.append(f"  #{t.id}{age_label}  {_safe(t.text)}{suffix}")
     return "\n".join(lines)
 
 
@@ -795,7 +806,7 @@ def search_tasks(query: str, include_done: bool = False) -> str:
             "✓" if t.status == "done" else
             "✗" if t.status == "cancelled" else " "
         )
-        lines.append(f"  {marker} #{t.id}  {t.text}")
+        lines.append(f"  {marker} #{t.id}  {_safe(t.text)}")
     return "\n".join(lines)
 
 
@@ -1024,7 +1035,9 @@ def remember_fact(key: str, content: str, kind: str = "fact") -> str:
 @mcp.tool()
 def recall_memories(query: str, limit: int = 5) -> str:
     """Phase 86 — search across persisted cross-conversation memories.
-    Returns the top-K most relevant by token overlap."""
+    Returns the top-K most relevant by token overlap. Memory content
+    goes through Phase 88 redaction in case the user's older chats
+    pasted secrets into the recall buffer."""
     from .memory import most_relevant_memories
 
     cfg, conn, _, _ = _get_read_state()
@@ -1033,7 +1046,7 @@ def recall_memories(query: str, limit: int = 5) -> str:
         return f"No memories match {query!r}."
     lines = [f"Memories matching {query!r}:"]
     for m in rows:
-        lines.append(f"  · [{m.kind}] {m.key}: {m.content}")
+        lines.append(f"  · [{m.kind}] {_safe(m.key)}: {_safe(m.content)}")
     return "\n".join(lines)
 
 
@@ -1159,7 +1172,7 @@ def list_email_drafts() -> str:
         when = time.strftime(
             "%Y-%m-%d %H:%M", time.localtime(d.generated_at),
         )
-        preview = d.draft_text[:160].replace("\n", " ")
+        preview = _safe(d.draft_text[:160].replace("\n", " "))
         lines.append(f"  · #{d.id} [{when}] {preview}…")
     return "\n".join(lines)
 
@@ -1198,6 +1211,144 @@ def find_related_via_citations(path: str, direction: str = "outgoing") -> str:
             year = f" ({c.year})" if c.year else ""
             lines.append(f"  · {c.cited_text}{year}{resolved}")
     return "\n".join(lines)
+
+
+# =============================================================
+# Phase 73 / 74 / 75 / 87 / 89 — chat-agent-facing tools that
+# surface the recent synthesis features to MCP. Without these,
+# Claude couldn't reach summaries, insights, snapshots, or the
+# local-LLM health indicator from a conversation.
+# =============================================================
+
+@mcp.tool()
+def get_summary(path: str) -> str:
+    """Phase 74 — TL;DR + key points for a file. Returns the auto-
+    generated summary, falling back to '(no summary yet)' if the
+    summariser hasn't reached this doc.
+
+    Use when the user asks 'what's in this file?' / 'summarise
+    <path>' before you decide whether to call ``get_file`` for the
+    full text."""
+    from . import synthesis
+
+    cfg, conn, _, _ = _get_read_state()
+    row = conn.execute(
+        "SELECT id FROM files WHERE path = ?", (path,),
+    ).fetchone()
+    if row is None:
+        return f"Doc not in index: {path}"
+    summary = synthesis.get_summary(conn, int(row["id"]))
+    if summary is None:
+        return f"(no summary yet for {path})"
+    lines = [f"# Summary of {path}", "", _safe(summary.tldr), ""]
+    if summary.key_points:
+        lines.append("## Key points")
+        for kp in summary.key_points:
+            lines.append(f"- {_safe(kp)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_insights(limit: int = 10) -> str:
+    """Phase 75 — proactive 'I noticed X' insights from your data
+    (topic spikes, health drift). Already-shown insights are
+    deduped for 7 days so this won't re-surface yesterday's.
+
+    Use when the user asks 'what's new?' / 'anything I should
+    know?' / 'what have you noticed lately?'."""
+    from . import synthesis
+
+    cfg, conn, _, _ = _get_read_state()
+    insights = synthesis.detect_insights(conn)
+    if not insights:
+        return "No fresh insights right now."
+    lines = [f"Insights ({len(insights[:limit])}):"]
+    for i in insights[:limit]:
+        lines.append(f"  · **{_safe(i.headline)}**")
+        if i.detail:
+            lines.append(f"    {_safe(i.detail)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_snapshots(limit: int = 10) -> str:
+    """Phase 87 — list weekly index snapshots so the agent can pick
+    one to use with ``as_of_search``. Each snapshot captures the
+    set of files that existed at a specific point in time.
+
+    Use when the user asks 'what did I know two weeks ago?' / 'as
+    of <date>' / 'compare to last month' style queries."""
+    from . import memory as memory_mod
+
+    cfg, conn, _, _ = _get_read_state()
+    snaps = memory_mod.list_snapshots(conn, limit=limit)
+    if not snaps:
+        return (
+            "No snapshots taken yet. The daemon takes one weekly "
+            "automatically; run `secondbrain snapshot take` to "
+            "force one now."
+        )
+    lines = [f"Snapshots ({len(snaps)}):"]
+    for s in snaps:
+        when = time.strftime("%Y-%m-%d", time.localtime(s.taken_at))
+        label = f" [{s.label}]" if s.label else ""
+        lines.append(
+            f"  · #{s.id}  {when}{label}  ({s.n_files} files)",
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def as_of_search(query: str, when: str, k: int = 8) -> str:
+    """Phase 87 — search the brain as it existed at a point in time.
+    ``when`` accepts 'YYYY-MM-DD' or relative phrases ('yesterday',
+    'last week', 'N {days,weeks,months,years} ago'). Filters results
+    to files in the closest preceding weekly snapshot.
+
+    Use when the user asks 'what did I know about X back then?'."""
+    from .cli import _parse_as_of
+    from .search import hybrid_search
+
+    cfg, conn, embedder, reranker = _get_state()
+    ts = _parse_as_of(when)
+    if ts is None:
+        return f"Couldn't parse 'when' = {when!r}. Try 'YYYY-MM-DD' or 'N days ago'."
+    results = hybrid_search(
+        conn, embedder, query, k=k, reranker=reranker, as_of_ts=ts,
+    )
+    when_str = time.strftime("%Y-%m-%d", time.localtime(ts))
+    return _format_results(
+        results, f"Search for {query!r} as of {when_str}",
+    )
+
+
+@mcp.tool()
+def local_llm_status() -> str:
+    """Phase 89 — report whether the local Ollama fallback is
+    reachable and which models are pulled. Useful diagnostic when
+    the user asks 'is local LLM working?' or you've just fallen
+    back to it and want to confirm.
+    """
+    from . import local_llm
+
+    cfg, _, _, _ = _get_read_state()
+    if not local_llm.is_available(cfg):
+        host = getattr(cfg, "local_llm_host", "http://localhost:11434")
+        return (
+            f"Local LLM (Ollama) is NOT reachable at {host}. "
+            "Install + start Ollama, then `ollama pull llama3.1`."
+        )
+    models = local_llm.list_models(cfg)
+    if not models:
+        return (
+            "Ollama is reachable but no models are pulled. Run "
+            "`ollama pull llama3.1` to enable the fallback."
+        )
+    default = getattr(cfg, "local_llm_model", "llama3.1")
+    return (
+        f"Local LLM ready. Default model: {default}. "
+        f"Available: {', '.join(models)}"
+    )
 
 
 def run() -> None:

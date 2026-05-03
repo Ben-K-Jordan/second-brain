@@ -61,6 +61,24 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _safe(s: str | None) -> str:
+    """Phase 88 — apply sensitive-content redaction before any string
+    leaves this module via the SMTP relay or tray notification.
+
+    The brief renders chunk text (action items, queue summaries,
+    transcripts) and LLM output (insights, summaries) — both routes
+    can carry secrets the user pasted into a notes app once and
+    forgot about. Cheap (regex-only) and idempotent.
+    """
+    if not s:
+        return ""
+    try:
+        from .safety import redact_text
+    except ImportError:
+        return s
+    return redact_text(s)
+
+
 # ---- Tunables ---------------------------------------------------------
 
 # How far ahead to surface Canvas assignments. 72h gives you the natural
@@ -192,6 +210,28 @@ class ProjectClusterLine:
 
 
 @dataclass
+class BirthdayLine:
+    """Phase 65 hookup — a person whose birthday lands within the
+    brief's lookahead window."""
+    name: str
+    days_until: int          # 0 = today, 1 = tomorrow, etc.
+    age_turning: int | None  # None when birth year unknown
+    is_today: bool
+
+
+@dataclass
+class AnnotationLine:
+    """Phase 84 hookup — a PDF annotation extracted recently. We
+    surface the highlighted text + the file path so the user can
+    jump back to the source PDF."""
+    file_path: str
+    page: int
+    kind: str          # 'highlight' | 'note' | 'underline' | 'strike'
+    anchor: str        # the highlighted text (may be empty for pure notes)
+    note: str          # the user's note (may be empty for pure highlights)
+
+
+@dataclass
 class DailyBrief:
     """The whole morning brief in one structured object."""
     generated_at: float
@@ -214,6 +254,13 @@ class DailyBrief:
     project_clusters: list[ProjectClusterLine] = field(          # Phase 73
         default_factory=list,
     )
+    birthdays: list[BirthdayLine] = field(default_factory=list)  # Phase 65
+    recent_annotations: list[AnnotationLine] = field(            # Phase 84
+        default_factory=list,
+    )
+    # Lightweight "nudge" flags — surfaced as one-line reminders.
+    weekly_review_due: bool = False  # Phase 72
+    snapshot_due: bool = False       # Phase 87
 
 
 @dataclass
@@ -250,6 +297,10 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         knowledge_gaps=_gaps_section(conn),
         pending_email_drafts=_pending_drafts_count(conn),
         project_clusters=_project_clusters_section(conn),
+        birthdays=_birthdays_section(conn),
+        recent_annotations=_recent_annotations_section(conn),
+        weekly_review_due=_weekly_review_due(conn),
+        snapshot_due=_snapshot_due(conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -397,6 +448,163 @@ def _project_clusters_section(
     ]
 
 
+# Lookahead window for birthday surfacing. 7d covers "this week" so
+# the user has time to schedule a card / message; the section drops
+# off after the day passes (no "5 days late" guilt-trips).
+_BIRTHDAY_LOOKAHEAD_DAYS = 7
+
+
+def _birthdays_section(
+    conn: sqlite3.Connection,
+) -> list[BirthdayLine]:
+    """Phase 65 hookup — find people whose birthday lands in the
+    next 7 days. Tolerant about format: accepts ``MM-DD`` or
+    ``YYYY-MM-DD``; anything unparseable is silently skipped (the
+    field is user-edited, so noise is expected).
+    """
+    try:
+        from . import people as people_mod
+    except ImportError:
+        return []
+    try:
+        rows = people_mod.list_people(conn, limit=10_000)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: people fetch failed: %s", e)
+        return []
+    today = datetime.now().date()
+    out: list[BirthdayLine] = []
+    for p in rows:
+        bday = (p.birthday or "").strip()
+        if not bday:
+            continue
+        m, d, year_known = _parse_birthday(bday)
+        if m is None or d is None:
+            continue
+        # Find the next anniversary on or after today.
+        try:
+            anniv = today.replace(month=m, day=d)
+        except ValueError:
+            # E.g. Feb 29 in a non-leap year → fall back to Feb 28.
+            try:
+                anniv = today.replace(month=m, day=28 if m == 2 else d)
+            except ValueError:
+                continue
+        if anniv < today:
+            try:
+                anniv = anniv.replace(year=today.year + 1)
+            except ValueError:
+                continue
+        delta = (anniv - today).days
+        if delta > _BIRTHDAY_LOOKAHEAD_DAYS:
+            continue
+        age_turning = None
+        if year_known:
+            try:
+                birth_year = int(bday.split("-", 1)[0])
+                age_turning = anniv.year - birth_year
+            except (ValueError, IndexError):
+                pass
+        out.append(BirthdayLine(
+            name=p.display_name or p.canonical_name or "(unnamed)",
+            days_until=delta,
+            age_turning=age_turning,
+            is_today=(delta == 0),
+        ))
+    out.sort(key=lambda b: b.days_until)
+    return out
+
+
+def _parse_birthday(raw: str) -> tuple[int | None, int | None, bool]:
+    """Return (month, day, year_known). Accepts 'YYYY-MM-DD',
+    'MM-DD', 'MM/DD'. Returns (None, None, False) on parse failure.
+    """
+    s = raw.strip()
+    if not s:
+        return (None, None, False)
+    sep = "-" if "-" in s else ("/" if "/" in s else None)
+    if sep is None:
+        return (None, None, False)
+    parts = s.split(sep)
+    try:
+        if len(parts) == 3:
+            # YYYY-MM-DD
+            return (int(parts[1]), int(parts[2]), True)
+        if len(parts) == 2:
+            # MM-DD
+            return (int(parts[0]), int(parts[1]), False)
+    except ValueError:
+        pass
+    return (None, None, False)
+
+
+# Lookback window for annotations. 36h matches the yesterday-done
+# window — same "what did you actually do recently?" framing.
+_ANNOTATION_LOOKBACK_SECONDS = 36 * 3600
+# Cap so a long highlighting session doesn't dominate the brief.
+_ANNOTATIONS_MAX = 8
+
+
+def _recent_annotations_section(
+    conn: sqlite3.Connection,
+) -> list[AnnotationLine]:
+    """Phase 84 hookup — surface PDF highlights / notes the user
+    made in the last 36h. Joins to ``files`` for the path so the
+    rendered brief includes a click-back target."""
+    cutoff = time.time() - _ANNOTATION_LOOKBACK_SECONDS
+    try:
+        rows = conn.execute(
+            "SELECT a.page, a.kind, a.anchor, a.note, f.path "
+            "FROM pdf_annotations a "
+            "JOIN files f ON f.id = a.file_id "
+            "WHERE a.created_at >= ? "
+            "ORDER BY a.created_at DESC LIMIT ?",
+            (cutoff, _ANNOTATIONS_MAX),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Brain pre-dates Phase 84 schema. Quietly skip.
+        return []
+    return [
+        AnnotationLine(
+            file_path=r["path"],
+            page=int(r["page"]),
+            kind=r["kind"] or "highlight",
+            anchor=(r["anchor"] or "").strip(),
+            note=(r["note"] or "").strip(),
+        )
+        for r in rows
+    ]
+
+
+def _weekly_review_due(conn: sqlite3.Connection) -> bool:
+    """Phase 72 — true on a Sunday when no weekly review has been
+    generated in the last 5 days. (5d window so a daemon restart on
+    Sunday morning doesn't clear the nudge.) Returns False on any
+    other day so the brief stays focused mid-week."""
+    try:
+        from datetime import datetime as _dt
+        if _dt.now().weekday() != 6:  # 6 = Sunday
+            return False
+        from . import synthesis
+        return not synthesis.has_recent_weekly_review(conn, days=5)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: weekly-review-due check failed: %s", e)
+        return False
+
+
+def _snapshot_due(conn: sqlite3.Connection) -> bool:
+    """Phase 87 — true when no index snapshot has been taken in the
+    last 7 days (matching the daemon's ``take_snapshot_if_due`` cadence).
+    The brief surfaces this as a soft nudge so the user can run
+    ``secondbrain snapshot take`` themselves on machines where the
+    daemon doesn't run continuously."""
+    try:
+        from . import memory as memory_mod
+        return memory_mod.needs_snapshot(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: snapshot-due check failed: %s", e)
+        return False
+
+
 def _pending_drafts_count(conn: sqlite3.Connection) -> int:
     """Phase 83 — count of email drafts awaiting your review."""
     try:
@@ -426,7 +634,8 @@ def _has_actionable_content(brief: DailyBrief) -> bool:
         or (brief.email and brief.email.urgent)
         or brief.pending_email_drafts
         or brief.knowledge_gaps
-        or brief.project_clusters,
+        or brief.project_clusters
+        or brief.birthdays,
     )
 
 
@@ -804,6 +1013,11 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
     """
     if brief.insights:
         yield _render_insights(brief.insights)
+    if brief.birthdays:
+        # Birthdays are time-sensitive — front-load alongside the
+        # calendar so the user clocks "today's the day" before
+        # reading anything else.
+        yield _render_birthdays(brief.birthdays)
     if brief.today_events:
         yield _render_events(brief.today_events)
     if brief.assignments_due_soon:
@@ -830,6 +1044,11 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_goals(brief.goals)
     if brief.yesterday_done:
         yield _render_yesterday_done(brief.yesterday_done)
+    if brief.recent_annotations:
+        yield _render_annotations(brief.recent_annotations)
+    nudge_block = _render_nudges(brief)
+    if nudge_block:
+        yield nudge_block
     if brief.revisit_suggestions:
         yield _render_revisit(brief.revisit_suggestions)
 
@@ -839,11 +1058,11 @@ def _render_events(events: list) -> str:
     out = ["## Today on the calendar", ""]
     for ev in events:
         when = time.strftime("%H:%M", time.localtime(ev.starts_at))
-        bits = [f"- **{when}** {ev.title}"]
+        bits = [f"- **{when}** {_safe(ev.title)}"]
         if ev.location:
-            bits.append(f"_{ev.location}_")
+            bits.append(f"_{_safe(ev.location)}_")
         if ev.attendees:
-            atts = ", ".join(ev.attendees[:3])
+            atts = ", ".join(_safe(a) for a in ev.attendees[:3])
             extra = "" if len(ev.attendees) <= 3 else f" +{len(ev.attendees) - 3}"
             bits.append(f"with {atts}{extra}")
         out.append(" — ".join(bits))
@@ -855,26 +1074,27 @@ def _render_assignments(items: list[Assignment]) -> str:
     for a in items:
         when = time.strftime("%a %H:%M", time.localtime(a.due_at))
         link = f" — <{a.url}>" if a.url else ""
-        out.append(f"- **{when}** {a.title}{link}")
+        out.append(f"- **{when}** {_safe(a.title)}{link}")
     return "\n".join(out)
 
 
 def _render_action_items(items: list[ActionItem]) -> str:
     """Render open tasks with their id (so user can `tasks done <id>`)
-    and age in days when meaningful (≥ 1)."""
+    and age in days when meaningful (≥ 1). Text + source title both
+    go through ``_safe`` — transcript-extracted action items are the
+    most-common path for stray secrets to land in the brief."""
     out = ["## Open action items", ""]
     for it in items:
-        # Re-render as an unticked checkbox so users can copy-paste
-        # straight into Obsidian / a notes app and tick them off.
         prefix = f"`#{it.task_id}`" if it.task_id else ""
         age = ""
         if it.age_days >= 1:
             age = f" _({it.age_days}d)_"
-        suffix = f"  _(from: {it.source_title})_" if it.source_title else ""
+        src = _safe(it.source_title)
+        suffix = f"  _(from: {src})_" if src else ""
         bits = ["- [ ]"]
         if prefix:
             bits.append(prefix)
-        bits.append(it.text)
+        bits.append(_safe(it.text))
         line = " ".join(bits) + age + suffix
         out.append(line)
     out.append("")
@@ -913,7 +1133,7 @@ def _render_yesterday_done(items: list[CompletedTask]) -> str:
     out = ["## Recently done", ""]
     for t in items:
         when = time.strftime("%a %H:%M", time.localtime(t.completed_at))
-        out.append(f"- ✓ {t.text}  _({when})_")
+        out.append(f"- ✓ {_safe(t.text)}  _({when})_")
     return "\n".join(out)
 
 
@@ -921,20 +1141,20 @@ def _render_revisit(items: list[RevisitSuggestion]) -> str:
     """Quiet-day fallback: 'remember this?' suggestions from the index."""
     out = ["## Worth revisiting", "", "_Quiet day — picked from your archive:_", ""]
     for r in items:
-        out.append(f"- **{r.title}** _({r.aged_days}d ago)_  ")
-        out.append(f"  `{r.path}`")
+        out.append(f"- **{_safe(r.title)}** _({r.aged_days}d ago)_  ")
+        out.append(f"  `{_safe(r.path)}`")
     return "\n".join(out)
 
 
 def _render_queue(items: list[QueueItem]) -> str:
     out = [f"## Reading queue (top {len(items)})", ""]
     for q in items:
-        title = q.title or q.url
+        title = _safe(q.title or q.url)
         out.append(f"- [{title}]({q.url})")
         if q.summary:
             # Quote the summary so multi-line summaries don't break list
             # nesting in renderers that are strict about indent.
-            for line in q.summary.splitlines():
+            for line in _safe(q.summary).splitlines():
                 out.append(f"  > {line}")
     return "\n".join(out)
 
@@ -942,9 +1162,9 @@ def _render_queue(items: list[QueueItem]) -> str:
 def _render_watchlist(items: list[WatchlistHighlight]) -> str:
     out = ["## Watchlists — new in the last 24h", ""]
     for h in items:
-        out.append(f"- **{h.name}** — {h.new_count} new")
+        out.append(f"- **{_safe(h.name)}** — {h.new_count} new")
         for p in h.sample_paths:
-            out.append(f"  - {p}")
+            out.append(f"  - {_safe(p)}")
     return "\n".join(out)
 
 
@@ -952,9 +1172,9 @@ def _render_insights(items: list[InsightLine]) -> str:
     """Phase 75 — proactive 'I noticed X' surfacing. Front of brief."""
     out = ["## Worth noticing", ""]
     for ins in items:
-        out.append(f"- **{ins.headline}**")
+        out.append(f"- **{_safe(ins.headline)}**")
         if ins.detail:
-            out.append(f"  {ins.detail}")
+            out.append(f"  {_safe(ins.detail)}")
     return "\n".join(out)
 
 
@@ -978,6 +1198,65 @@ def _render_email(email: EmailTriageLine, n_drafts: int) -> str:
     return "\n".join(out)
 
 
+def _render_nudges(brief: DailyBrief) -> str:
+    """Phase 72/87 — soft reminders the user can act on. Empty
+    string means 'nothing to nudge today'; the iter_section_blocks
+    caller skips empty yields."""
+    bits: list[str] = []
+    if brief.weekly_review_due:
+        bits.append(
+            "- Weekly review is overdue — run "
+            "`secondbrain review` (or wait for the daemon).",
+        )
+    if brief.snapshot_due:
+        bits.append(
+            "- No snapshot in the last 7 days — "
+            "`secondbrain snapshot take` to checkpoint.",
+        )
+    if not bits:
+        return ""
+    return "\n".join(["## Nudges", "", *bits])
+
+
+def _render_annotations(items: list[AnnotationLine]) -> str:
+    """Phase 84 — PDF highlights / notes from the last 36h. Quote
+    each anchor so the user can re-read what they cared about
+    yesterday without opening the file. Falls back to ``note`` text
+    when the highlight has no anchor (pure note annotation)."""
+    out = ["## Highlights from yesterday", ""]
+    for a in items:
+        body = _safe(a.anchor) or _safe(a.note) or "(empty)"
+        if len(body) > 240:
+            body = body[:240].rstrip() + "…"
+        out.append(
+            f"- _p.{a.page}_ — {body}  `{_safe(a.file_path)}`",
+        )
+        if a.note and a.anchor:
+            out.append(f"  > note: {_safe(a.note)}")
+    return "\n".join(out)
+
+
+def _render_birthdays(items: list[BirthdayLine]) -> str:
+    """Phase 65 — heads-up on birthdays in the next week. Today's
+    birthday gets the cake emoji + bold; future ones get a date
+    annotation."""
+    out = ["## Birthdays this week", ""]
+    for b in items:
+        name = _safe(b.name)
+        age_bit = (
+            f" (turning {b.age_turning})" if b.age_turning else ""
+        )
+        if b.is_today:
+            out.append(f"- 🎂 **TODAY** — {name}{age_bit}")
+        elif b.days_until == 1:
+            out.append(f"- tomorrow — {name}{age_bit}")
+        else:
+            out.append(
+                f"- in {b.days_until}d — {name}{age_bit}",
+            )
+    return "\n".join(out)
+
+
 def _render_project_clusters(items: list[ProjectClusterLine]) -> str:
     """Phase 73 — auto-detected project clusters from the backlinks
     graph. We surface these as candidate working sets the user might
@@ -986,9 +1265,10 @@ def _render_project_clusters(items: list[ProjectClusterLine]) -> str:
            "_Recently-clustered docs that look like a working set:_",
            ""]
     for c in items:
-        name = c.suggested_name or c.seed_title
+        name = _safe(c.suggested_name or c.seed_title)
+        seed = _safe(c.seed_title)
         out.append(
-            f"- **{name}** — {c.n_members} docs around _{c.seed_title}_",
+            f"- **{name}** — {c.n_members} docs around _{seed}_",
         )
     return "\n".join(out)
 
@@ -999,7 +1279,7 @@ def _render_gaps(items: list[GapLine]) -> str:
            "_Questions you asked that returned weak results — study targets:_",
            ""]
     for g in items:
-        out.append(f"- _#{g.gap_id}_ {g.question[:120]}")
+        out.append(f"- _#{g.gap_id}_ {_safe(g.question)[:120]}")
     return "\n".join(out)
 
 

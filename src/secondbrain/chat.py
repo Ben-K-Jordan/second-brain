@@ -566,6 +566,12 @@ def ask_brain(
     Drains the streaming events, accumulating text and citations, and
     returns a ``ChatResponse``. Useful when the caller doesn't care about
     intermediate progress.
+
+    Phase 89 wiring: when ``stream_chat`` errors out (no Anthropic key,
+    budget exhausted, transient API failure), we fall back to a local
+    LLM path that does one round of search + answer. The fallback skips
+    tool-use loops entirely — local models can't reliably drive tool
+    use — but still produces a citation-bearing answer.
     """
     text_parts: list[str] = []
     citations: list[Citation] = []
@@ -601,6 +607,14 @@ def ask_brain(
             break
 
     if error:
+        # Phase 89 fallback: try local LLM with a search-grounded prompt
+        # before surfacing the error. The user gets a degraded answer
+        # instead of a hard failure when Anthropic is unavailable.
+        local_resp = _ask_brain_local_fallback(
+            cfg, conn, embedder, reranker, question,
+        )
+        if local_resp is not None:
+            return local_resp
         return ChatResponse(text=f"[error] {error}", citations=[], iterations=iterations)
     response = ChatResponse(
         text="".join(text_parts).strip(),
@@ -635,6 +649,84 @@ def ask_brain(
     except Exception as e:  # noqa: BLE001
         log.warning("study: gap-log failed: %s", e)
     return response
+
+
+def _ask_brain_local_fallback(
+    cfg: Config,
+    conn,
+    embedder: Embedder,
+    reranker: Reranker | None,
+    question: str,
+) -> ChatResponse | None:
+    """Phase 89 — when Anthropic is unavailable, run a local LLM
+    over hybrid-search context.
+
+    Cheaper, lower quality, no tool-use loops. Returns None when
+    Ollama is also unavailable (caller surfaces the original error
+    in that case). Citations come from the search step so the user
+    can still click through to source even if the local generation
+    is mediocre.
+    """
+    try:
+        from . import local_llm
+    except ImportError:
+        return None
+    if not local_llm.is_available(cfg):
+        return None
+
+    try:
+        results = hybrid_search(
+            conn, embedder, question, k=cfg.chat_search_k,
+            reranker=reranker,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("local fallback: search failed: %s", e)
+        results = []
+
+    citations: list[Citation] = []
+    context_blocks: list[str] = []
+    for r in results[:6]:
+        snippet = r.text if len(r.text) <= 600 else r.text[:600] + "…"
+        context_blocks.append(
+            f"[{r.file_path}]\n{snippet}",
+        )
+        citations.append(Citation(
+            chunk_id=r.chunk_id,
+            chunk_index=r.chunk_index,
+            file_path=r.file_path,
+            text=snippet,
+            score=r.score,
+            kind="brain",
+        ))
+
+    if context_blocks:
+        prompt = (
+            "Answer the user's question using only the context below. "
+            "Cite paths in square brackets like [path/to/file.md]. "
+            "If the context doesn't contain the answer, say so plainly.\n\n"
+            "Context:\n"
+            f"{chr(10).join(context_blocks)}\n\n"
+            f"Question: {question}"
+        )
+    else:
+        prompt = (
+            "The user's brain index returned no relevant context for "
+            "this question. Answer briefly from your general knowledge "
+            "and note that nothing in their index matched.\n\n"
+            f"Question: {question}"
+        )
+
+    out = local_llm.complete(prompt, cfg=cfg, max_tokens=600)
+    if out is None:
+        return None
+    log.info("ask_brain: answered via local LLM (%s)", out.model)
+    text = out.text.strip()
+    if not text:
+        return None
+    return ChatResponse(
+        text=f"{text}\n\n_(answered locally — Anthropic unavailable)_",
+        citations=citations, iterations=0,
+    )
 
 
 # `json` is referenced indirectly through the JSONResponse path; ensure it's

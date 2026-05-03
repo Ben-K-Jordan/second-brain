@@ -146,7 +146,7 @@ Classify this email into ONE of these labels:
                   GitHub mentions, 2FA codes.
 
 Respond with a JSON object:
-  {"label": "<one of above>", "confidence": 0..1, "rationale": "≤10 words"}
+  {{"label": "<one of above>", "confidence": 0..1, "rationale": "≤10 words"}}
 
 No prose, no Markdown fences. Just the JSON.
 
@@ -245,55 +245,96 @@ def _parse_email_header(body: str) -> tuple[str, str]:
 
 
 def _default_classifier(from_, subject, body, cfg) -> dict:
-    """Real Haiku classifier. Bounded body length to keep cost tight."""
+    """Real Haiku classifier. Bounded body length to keep cost tight.
+
+    Phase 89 wiring: when Anthropic isn't usable, fall back to a
+    local Ollama call asking for the single label string. Confidence
+    drops because local models are noisier on classification, but
+    the daemon stays running.
+    """
     import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return {}
-    try:
-        import anthropic
-    except ImportError:
-        return {}
-    from .budget import (
-        BudgetExceededError,
-        check_budget,
-        record_usage,
-    )
-    try:
-        check_budget(cfg, "anthropic", feature="email_triage")
-    except BudgetExceededError as e:
-        log.warning("email_assist: budget exceeded: %s", e)
-        return {}
+
     body_clip = body if len(body) <= 4000 else body[:4000] + "…"
     prompt = _TRIAGE_PROMPT.format(
         from_=from_ or "(unknown)",
         subject=subject or "(no subject)",
         body=body_clip,
     )
-    client = anthropic.Anthropic()
+
+    # ---- Primary: Anthropic ----
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic
+        except ImportError:
+            anthropic = None  # type: ignore[assignment]
+        if anthropic is not None:
+            from .budget import (
+                BudgetExceededError,
+                check_budget,
+                record_usage,
+            )
+            try:
+                check_budget(cfg, "anthropic", feature="email_triage")
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=200,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                record_usage(
+                    cfg, "anthropic", "claude-haiku-4-5",
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                    feature="email_triage",
+                    note=f"email_triage/{from_[:30]}",
+                )
+                text = "".join(
+                    b.text for b in resp.content if b.type == "text"
+                ).strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```\w*\s*", "", text)
+                    text = re.sub(r"\s*```\s*$", "", text)
+                try:
+                    parsed = json.loads(text)
+                    if parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            except BudgetExceededError as e:
+                log.info(
+                    "email_assist: budget exhausted, trying local LLM: %s", e,
+                )
+            except anthropic.APIError as e:
+                log.info(
+                    "email_assist: API error, trying local LLM: %s", e,
+                )
+
+    # ---- Fallback: local Ollama ----
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        log.warning("email_assist: classify API error: %s", e)
+        from . import local_llm
+    except ImportError:
         return {}
-    record_usage(
-        cfg, "anthropic", "claude-haiku-4-5",
-        input_tokens=resp.usage.input_tokens,
-        output_tokens=resp.usage.output_tokens,
-        feature="email_triage",
-        note=f"email_triage/{from_[:30]}",
+    if not local_llm.is_available(cfg):
+        return {}
+    local_prompt = (
+        "Classify this email into exactly one label: urgent, response, "
+        "informational, newsletter, automated.\n"
+        "Reply with only the single word label.\n\n"
+        f"From: {from_}\nSubject: {subject}\n\n{body_clip}"
     )
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```\w*\s*", "", text)
-        text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+    out = local_llm.complete(local_prompt, cfg=cfg, max_tokens=20)
+    if out is None:
         return {}
+    label_raw = out.text.strip().lower().split()[0] if out.text.strip() else ""
+    label = label_raw.strip(".,;:'\"")
+    if label not in {
+        "urgent", "response", "informational", "newsletter", "automated",
+    }:
+        return {}
+    log.info(
+        "email_assist: classified via local LLM (%s) → %s", out.model, label,
+    )
+    return {"label": label, "confidence": 0.6, "rationale": "local-llm"}
 
 
 def classify_due(
@@ -478,24 +519,14 @@ def generate_draft(
 def _default_drafter(
     *, from_, subject, body, style_samples, user_name, cfg,
 ) -> str:
-    """Real drafter via Claude Sonnet (better voice mimicry than Haiku)."""
+    """Real drafter via Claude Sonnet (better voice mimicry than Haiku).
+
+    Phase 89 wiring: when Anthropic isn't usable, fall back to a
+    local Ollama draft. Voice mimicry is much weaker but a draft
+    you can edit beats no draft.
+    """
     import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return ""
-    try:
-        import anthropic
-    except ImportError:
-        return ""
-    from .budget import (
-        BudgetExceededError,
-        check_budget,
-        record_usage,
-    )
-    try:
-        check_budget(cfg, "anthropic", feature="email_draft")
-    except BudgetExceededError as e:
-        log.warning("email_assist: budget exceeded: %s", e)
-        return ""
+
     body_clip = body if len(body) <= 6000 else body[:6000] + "…"
     prompt = _DRAFT_PROMPT.format(
         user_name=user_name,
@@ -504,25 +535,63 @@ def _default_drafter(
         body=body_clip,
         style_samples=style_samples,
     )
-    client = anthropic.Anthropic()
+
+    # ---- Primary: Anthropic ----
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic
+        except ImportError:
+            anthropic = None  # type: ignore[assignment]
+        if anthropic is not None:
+            from .budget import (
+                BudgetExceededError,
+                check_budget,
+                record_usage,
+            )
+            try:
+                check_budget(cfg, "anthropic", feature="email_draft")
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=800,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                record_usage(
+                    cfg, "anthropic", "claude-sonnet-4-6",
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                    feature="email_draft",
+                    note=f"email_draft/{from_[:30]}",
+                )
+                text = "".join(
+                    b.text for b in resp.content if b.type == "text"
+                ).strip()
+                if text:
+                    return text
+            except BudgetExceededError as e:
+                log.info(
+                    "email_assist: draft budget exhausted, "
+                    "trying local LLM: %s", e,
+                )
+            except anthropic.APIError as e:
+                log.info(
+                    "email_assist: draft API error, trying local LLM: %s", e,
+                )
+
+    # ---- Fallback: local Ollama ----
     try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        log.warning("email_assist: draft API error: %s", e)
+        from . import local_llm
+    except ImportError:
         return ""
-    record_usage(
-        cfg, "anthropic", "claude-sonnet-4-6",
-        input_tokens=resp.usage.input_tokens,
-        output_tokens=resp.usage.output_tokens,
-        feature="email_draft",
-        note=f"email_draft/{from_[:30]}",
+    if not local_llm.is_available(cfg):
+        return ""
+    out = local_llm.complete(
+        prompt, cfg=cfg, max_tokens=600,
     )
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    return text
+    if out is None:
+        return ""
+    log.info("email_assist: draft via local LLM (%s)", out.model)
+    return out.text.strip()
 
 
 def list_unsent_drafts(

@@ -38,6 +38,20 @@ from .db import watchlist_list, watchlist_runs
 log = logging.getLogger(__name__)
 
 
+def _safe(s: str | None) -> str:
+    """Phase 88 — apply sensitive-content redaction before any string
+    leaves this module via the SMTP relay. Cheap (regex-only) and
+    idempotent. ``None`` collapses to empty string so renderers can
+    safely concatenate."""
+    if not s:
+        return ""
+    try:
+        from .safety import redact_text
+    except ImportError:
+        return s
+    return redact_text(s)
+
+
 # --------------------- digest_runs schema (ad-hoc) ---------------------
 # Tiny side table; not worth its own helpers in db.py.
 
@@ -136,8 +150,8 @@ def _render_html(rows: list[dict], since_ts: float | None) -> str:
             new_section = ""
             if new_paths:
                 items = "".join(
-                    f'<li><a href="{escape(p)}" '
-                    f'style="color:#2c7a2c;">{escape(p)}</a></li>'
+                    f'<li><a href="{escape(_safe(p))}" '
+                    f'style="color:#2c7a2c;">{escape(_safe(p))}</a></li>'
                     for p in new_paths[:30]
                 )
                 more = (
@@ -149,7 +163,7 @@ def _render_html(rows: list[dict], since_ts: float | None) -> str:
                     f'New since last digest ({len(new_paths)})</p>'
                     f'<ul style="padding-left:20px;margin:4px 0;">{items}{more}</ul>'
                 )
-            answer = r["latest_answer"]
+            answer = _safe(r["latest_answer"])
             answer_html = ""
             if answer:
                 # naive line→<br> rendering; the model's bullets stay readable.
@@ -163,7 +177,7 @@ def _render_html(rows: list[dict], since_ts: float | None) -> str:
             if r["latest_error"]:
                 err_html = (
                     f'<p style="color:#a33;"><i>last run errored: '
-                    f'{escape(r["latest_error"])}</i></p>'
+                    f'{escape(_safe(r["latest_error"]))}</i></p>'
                 )
             sections.append(
                 f'<section style="margin:24px 0;padding-top:12px;'
@@ -172,7 +186,7 @@ def _render_html(rows: list[dict], since_ts: float | None) -> str:
                 f'<span style="font-weight:400;color:#888;font-size:0.85em;">'
                 f'· {r["run_count"]} run(s) · every {sched}m</span></h3>'
                 f'<p style="color:#666;font-style:italic;margin:0 0 8px 0;">'
-                f'"{escape(wl["query"])}"</p>'
+                f'"{escape(_safe(wl["query"]))}"</p>'
                 f'{new_section}{answer_html}{err_html}'
                 f'</section>'
             )
@@ -208,18 +222,18 @@ def _render_text(rows: list[dict], since_ts: float | None) -> str:
     for r in rows:
         wl = r["watchlist"]
         lines.append(f"## {wl['name']}")
-        lines.append(f'   "{wl["query"]}"')
+        lines.append(f'   "{_safe(wl["query"])}"')
         if r["all_new_paths"]:
             lines.append(f"   New since last digest ({len(r['all_new_paths'])}):")
             for p in r["all_new_paths"][:30]:
-                lines.append(f"     - {p}")
+                lines.append(f"     - {_safe(p)}")
             if len(r["all_new_paths"]) > 30:
                 lines.append(f"     ... and {len(r['all_new_paths']) - 30} more")
         if r["latest_error"]:
-            lines.append(f"   ! last run errored: {r['latest_error']}")
+            lines.append(f"   ! last run errored: {_safe(r['latest_error'])}")
         elif r["latest_answer"]:
             lines.append("")
-            for ln in r["latest_answer"].splitlines():
+            for ln in _safe(r["latest_answer"]).splitlines():
                 lines.append(f"   {ln}")
         lines.append("")
     return "\n".join(lines)

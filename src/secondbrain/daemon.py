@@ -439,6 +439,30 @@ def _build_daemon_scheduler(
         fn=_people_backfill_job,
     ))
 
+    # Polish v3 round 4: schedule connector sync. Without this, the
+    # daemon never pulls Gmail / GitHub / Notion / etc. — `secondbrain
+    # sync` was manual-only. Cooldown 60min + interval 60min gives
+    # roughly hourly syncs without busy-spinning when the daemon
+    # restarts mid-cooldown.
+    from .sync import run_sync_due as _run_sync_due
+    sched.register(Job(
+        name="connector_sync",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=1),
+        fn=lambda cfg, conn, embedder: _run_sync_due(cfg, conn, embedder),
+    ))
+
+    # Polish v3 round 4: tasks.materialize_from_transcripts on the
+    # daemon scheduler. Previously ran only on-demand from CLI / brief
+    # / dashboard — meaning a user who never opens those got no auto-
+    # extracted tasks. 30min interval is responsive enough for
+    # "I just had a meeting, where's my action item?" without churning.
+    from .tasks import materialize_from_transcripts as _task_materialize
+    sched.register(Job(
+        name="tasks_from_transcripts",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda conn: _task_materialize(conn),
+    ))
+
     return sched
 
 
