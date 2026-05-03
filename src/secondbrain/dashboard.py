@@ -898,6 +898,7 @@ PALETTE_JS = r"""
         {kind: 'page', icon: '⌨', label: 'Chat',       href: '/chat',          meta: 'ask the brain'},
         {kind: 'page', icon: '✓', label: 'Tasks',      href: '/tasks',         meta: ''},
         {kind: 'page', icon: '✉', label: 'Drafts',     href: '/drafts',        meta: 'email'},
+        {kind: 'page', icon: '🤝', label: 'Thanks',     href: '/thanks',        meta: 'meeting follow-up'},
         {kind: 'page', icon: '!', label: 'Insights',   href: '/insights',      meta: ''},
         {kind: 'page', icon: '◇', label: 'Habits',     href: '/habits',        meta: ''},
         {kind: 'page', icon: '✎', label: 'Journal',    href: '/journal',       meta: ''},
@@ -1079,7 +1080,7 @@ _PRIMARY_NAV = [
     ("Tasks",    "/tasks",    "tasks"),
     ("Search",   "/search",   None),
     ("Drafts",   "/drafts",   "drafts"),
-    ("Insights", "/insights", "insights"),
+    ("Thanks",   "/thanks",   "thanks"),
 ]
 
 # Overflow nav — grouped by purpose so users can scan to the right
@@ -1094,6 +1095,7 @@ _NAV_GROUPS = [
         ("Memory",   "/memory"),
     ]),
     ("Knowledge", [
+        ("Insights",  "/insights"),
         ("Projects",  "/projects"),
         ("Study",     "/study/review"),
         ("Snapshots", "/snapshots"),
@@ -1644,6 +1646,7 @@ def create_app():
                 ("Chat",      "/chat",          None),
                 ("Tasks",     "/tasks",         "tasks"),
                 ("Drafts",    "/drafts",        "drafts"),
+                ("Thanks",    "/thanks",        "thanks"),
                 ("Insights",  "/insights",      "insights"),
                 ("Search",    "/search",        None),
             ]),
@@ -4515,9 +4518,15 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     def drafts_mark_sent(draft_id: int):
         from fastapi.responses import RedirectResponse
 
-        from . import email_assist
+        from . import email_assist, meeting_thanks
         cfg, conn, _, _ = get_state()
         email_assist.mark_draft_sent(conn, draft_id)
+        # Round 8 — also flip any linked meeting_thanks row to 'sent'
+        # so the /thanks page reflects reality.
+        try:
+            meeting_thanks.mark_sent_for_draft(conn, draft_id)
+        except Exception:  # noqa: BLE001
+            pass
         return RedirectResponse(url="/drafts", status_code=303)
 
     @app.post("/drafts/{draft_id:int}/discard")
@@ -4527,6 +4536,149 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from . import email_assist
         cfg, conn, _, _ = get_state()
         email_assist.discard_draft(conn, draft_id)
+        return RedirectResponse(url="/drafts", status_code=303)
+
+    # --- Round 8: meeting thanks page ---------------------------------
+
+    @app.get("/thanks", response_class=HTMLResponse)
+    def thanks_view():
+        """List meetings waiting on context or a draft. Form per row
+        for "I had this conversation about X" notes; transcript-
+        matched rows show the source path. Drafted rows link back to
+        /drafts so the user has one place to actually send from."""
+        from . import meeting_thanks
+        from .safety import redact_text as _redact
+
+        cfg, conn, _, _ = get_state()
+        rows = meeting_thanks.list_pending(conn)
+        drafted = [
+            r for r in meeting_thanks.list_all(conn, limit=20)
+            if r.status in ("drafted", "sent")
+        ]
+        if not rows and not drafted:
+            body = (
+                "<h1>Meeting thanks</h1><div class='card'><p class='muted'>"
+                "No recent meetings to thank-you yet. The daemon scans "
+                "calendar events hourly; you can also force a scan via "
+                "<code>secondbrain thanks scan</code>."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Thanks", body, "thanks"))
+
+        items: list[str] = []
+        for mt in rows:
+            when = time.strftime(
+                "%a %b %d, %H:%M", time.localtime(mt.starts_at),
+            )
+            attendees = escape(", ".join(mt.attendees) or "(unknown)")
+            ctx_html = ""
+            if mt.transcript_path:
+                ctx_html = (
+                    f"<div class='stat' style='border-bottom:none;'>"
+                    f"<span class='muted'>Transcript matched:</span>"
+                    f"<span class='v'><code>{escape(mt.transcript_path)}</code></span>"
+                    f"</div>"
+                    f"<form method='post' action='/thanks/{mt.id}/draft' "
+                    f"style='display:inline;margin-right:8px;'>"
+                    f"<button type='submit'>Draft thank-you now</button>"
+                    f"</form>"
+                )
+            else:
+                # Free-text context form. Once submitted, the row flips
+                # to 'ready' and the daemon picks it up next tick.
+                ctx_html = (
+                    f"<form method='post' action='/thanks/{mt.id}/context' "
+                    f"style='margin-top:8px;'>"
+                    f"<label class='muted' style='font-size:11px;"
+                    f"text-transform:uppercase;letter-spacing:0.05em;'>"
+                    f"What did you talk about?</label>"
+                    f"<textarea name='text' rows='4' "
+                    f"style='width:100%;margin-top:4px;' "
+                    f"placeholder='Topics discussed, anything you "
+                    f"committed to follow up on, personal details "
+                    f"worth referencing…'></textarea>"
+                    f"<div style='margin-top:8px;'>"
+                    f"<button type='submit'>Save context + queue draft</button>"
+                    f"</div></form>"
+                )
+            skip_html = (
+                f"<form method='post' action='/thanks/{mt.id}/skip' "
+                f"style='display:inline;'>"
+                f"<button type='submit' class='link-btn'>Skip</button>"
+                f"</form>"
+            )
+            items.append(
+                f"<div class='card' style='margin-bottom:12px;'>"
+                f"<div class='stat'>"
+                f"<strong>{escape(_redact(mt.event_title))}</strong>"
+                f"<span class='v muted'>{when}</span>"
+                f"</div>"
+                f"<div class='stat' style='border-bottom:none;padding-bottom:0;'>"
+                f"<span class='muted'>To:</span>"
+                f"<span class='v'>{attendees}</span>"
+                f"</div>"
+                f"{ctx_html}"
+                f"<div style='margin-top:8px;'>{skip_html}</div>"
+                f"</div>",
+            )
+        drafted_html = ""
+        if drafted:
+            sub_items = []
+            for mt in drafted[:8]:
+                when = time.strftime(
+                    "%a %b %d", time.localtime(mt.starts_at),
+                )
+                link = (
+                    f"<a href='/drafts'>draft #{mt.draft_id}</a>"
+                    if mt.draft_id else "(draft missing)"
+                )
+                marker = "✓" if mt.status == "sent" else "✎"
+                sub_items.append(
+                    f"<div class='stat'>"
+                    f"<span>{marker} {escape(mt.event_title)}</span>"
+                    f"<span class='v muted'>{when} · {link}</span>"
+                    f"</div>",
+                )
+            drafted_html = (
+                "<h2>Already drafted / sent</h2>"
+                "<div class='card'>" + "".join(sub_items) + "</div>"
+            )
+
+        body = (
+            f"<h1>Meeting thanks ({len(rows)} pending)</h1>"
+            + "".join(items)
+            + drafted_html
+        )
+        return HTMLResponse(_layout("Thanks", body, "thanks"))
+
+    @app.post("/thanks/{mt_id:int}/context")
+    def thanks_set_context(mt_id: int, text: str = Form("")):
+        from fastapi.responses import RedirectResponse
+
+        from . import meeting_thanks
+        cfg, conn, _, _ = get_state()
+        meeting_thanks.set_context(conn, mt_id, text)
+        return RedirectResponse(url="/thanks", status_code=303)
+
+    @app.post("/thanks/{mt_id:int}/skip")
+    def thanks_skip_post(mt_id: int):
+        from fastapi.responses import RedirectResponse
+
+        from . import meeting_thanks
+        cfg, conn, _, _ = get_state()
+        meeting_thanks.mark_skipped(conn, mt_id)
+        return RedirectResponse(url="/thanks", status_code=303)
+
+    @app.post("/thanks/{mt_id:int}/draft")
+    def thanks_draft_post(mt_id: int):
+        """Synchronously draft + redirect to /drafts so the user
+        sees the result immediately. The daemon would do the same
+        on its next tick — this is just the "do it now" button."""
+        from fastapi.responses import RedirectResponse
+
+        from . import meeting_thanks
+        cfg, conn, _, _ = get_state()
+        meeting_thanks.generate_thanks_draft(conn, cfg, mt_id)
         return RedirectResponse(url="/drafts", status_code=303)
 
     # --- Browser extension API ----------------------------------------
@@ -4771,12 +4923,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.get("/api/nav-counts")
     def api_nav_counts():
         """Pending-state counts for the primary nav badges. Cheap —
-        three small reads against the read-only conn. Failures inside
-        any one count fall back to 0 so a missing schema (fresh brain)
+        small reads against the read-only conn. Failures inside any
+        one count fall back to 0 so a missing schema (fresh brain)
         doesn't break the nav."""
         cfg, conn, _, _ = get_read_state()
-        out = {"tasks": 0, "drafts": 0, "insights": 0,
-               "urgent": {"drafts": False, "insights": False}}
+        out = {
+            "tasks": 0, "drafts": 0, "insights": 0, "thanks": 0,
+            "urgent": {"drafts": False, "thanks": False},
+        }
         # Open tasks
         try:
             from . import tasks as tasks_mod
@@ -4788,16 +4942,27 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             from . import email_assist
             n_drafts = len(email_assist.list_unsent_drafts(conn, limit=200))
             out["drafts"] = n_drafts
-            # Drafts pile up faster than tasks; flag urgent past 5.
             if n_drafts >= 5:
                 out["urgent"]["drafts"] = True
         except Exception:  # noqa: BLE001
             pass
-        # Active (un-deduped) insights
+        # Active (un-deduped) insights — kept for "More" surfacing.
         try:
             from . import synthesis
             insights = synthesis.detect_insights(conn)
             out["insights"] = len(insights)
+        except Exception:  # noqa: BLE001
+            pass
+        # Round 8 — pending meeting thanks. Counts both 'pending_context'
+        # (need user input) AND 'ready' (waiting for daemon to draft).
+        try:
+            from . import meeting_thanks
+            n_thanks = len(meeting_thanks.list_pending(conn, limit=200))
+            out["thanks"] = n_thanks
+            # Anything older than 24h with no draft is getting stale —
+            # surface as urgent so the user is nudged to act.
+            if n_thanks >= 3:
+                out["urgent"]["thanks"] = True
         except Exception:  # noqa: BLE001
             pass
         return out

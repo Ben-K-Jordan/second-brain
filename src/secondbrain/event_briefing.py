@@ -86,6 +86,31 @@ def iter_upcoming_events(
     yield from _iter_ics(cfg, now, horizon)
 
 
+def iter_recent_events(
+    cfg: Config, lookback_seconds: int,
+) -> Iterator[CalendarEvent]:
+    """Phase round-8 — yield events that ENDED in [now - lookback, now].
+
+    Mirror of ``iter_upcoming_events`` for after-the-fact processing
+    like the meeting-thanks pipeline. Range is "started after
+    (now - lookback - 4h)" so a 90min meeting that started inside
+    the lookback window still gets caught even if it ended just now.
+    """
+    now = time.time()
+    # Search a window wider than lookback to catch meetings that
+    # started before the window but ended inside it.
+    time_min = now - lookback_seconds - 4 * 3600
+    time_max = now
+    for ev in _iter_google_calendar(cfg, time_min, time_max):
+        ends = ev.starts_at + (ev.duration_seconds or 0)
+        if (now - lookback_seconds) <= ends <= now:
+            yield ev
+    for ev in _iter_ics(cfg, time_min, time_max):
+        ends = ev.starts_at + (ev.duration_seconds or 0)
+        if (now - lookback_seconds) <= ends <= now:
+            yield ev
+
+
 def _iter_google_calendar(
     cfg: Config, time_min_ts: float, time_max_ts: float,
 ) -> Iterator[CalendarEvent]:

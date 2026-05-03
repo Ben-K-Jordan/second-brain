@@ -2790,6 +2790,164 @@ def projects_promote(
     conn.close()
 
 
+# ============================ Round 8 — meeting thanks ===============
+
+thanks_app = typer.Typer(
+    no_args_is_help=True,
+    help="Round 8 auto-thank-you emails after coffee chats / "
+         "interviews / external meetings. Calendar events "
+         "matched against transcripts (or your free-form context) "
+         "produce a draft in /drafts that uses your voice profile.",
+)
+app.add_typer(thanks_app, name="thanks")
+
+
+@thanks_app.command("list")
+def thanks_list(
+    all_status: bool = typer.Option(
+        False, "--all", help="Include drafted / sent / skipped rows.",
+    ),
+) -> None:
+    """List meetings waiting on context or a draft."""
+    from . import meeting_thanks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = (
+        meeting_thanks.list_all(conn) if all_status
+        else meeting_thanks.list_pending(conn)
+    )
+    if not rows:
+        console.print(
+            "[dim]No pending thank-yous. Run `secondbrain thanks scan` "
+            "to pull recent meetings, or wait for the daemon.[/]",
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Meeting thanks")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("when", style="dim")
+    table.add_column("title")
+    table.add_column("status", style="dim")
+    table.add_column("ctx", style="dim", width=4)
+    table.add_column("attendees", style="dim")
+    for r in rows:
+        when = time.strftime("%a %H:%M", time.localtime(r.starts_at))
+        ctx = "✓" if r.has_context else "·"
+        atts = ", ".join(r.attendees[:2])
+        if len(r.attendees) > 2:
+            atts += f" +{len(r.attendees) - 2}"
+        table.add_row(
+            str(r.id), when, r.event_title[:50],
+            r.status, ctx, atts,
+        )
+    console.print(table)
+    conn.close()
+
+
+@thanks_app.command("scan")
+def thanks_scan() -> None:
+    """Force a fresh calendar scan + transcript-rematch right now.
+
+    The daemon does this hourly; useful when you just had a meeting
+    and don't want to wait."""
+    from . import meeting_thanks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    n_new = meeting_thanks.register_pending_thanks(conn, cfg)
+    n_rematch = meeting_thanks.rematch_transcripts(conn)
+    console.print(
+        f"[green]✓[/] {n_new} new meeting(s) registered; "
+        f"{n_rematch} transcript(s) matched.",
+    )
+    conn.close()
+
+
+@thanks_app.command("context")
+def thanks_context(
+    mt_id: int = typer.Argument(..., help="Meeting id (from `thanks list`)."),
+    text: str = typer.Argument(
+        ..., help="Free-form notes on what you talked about.",
+    ),
+) -> None:
+    """Provide context for a meeting that has no transcript.
+
+    Promotes the meeting to status='ready' so the next daemon tick
+    (or `thanks draft`) can write a thank-you using your notes."""
+    from . import meeting_thanks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if not meeting_thanks.set_context(conn, mt_id, text):
+        console.print(
+            f"[red]Couldn't update meeting #{mt_id} — not found or "
+            f"empty text.[/]",
+        )
+        conn.close()
+        raise typer.Exit(code=1) from None
+    console.print(
+        f"[green]✓[/] Context saved for meeting #{mt_id}. "
+        f"Run `secondbrain thanks draft {mt_id}` to draft now.",
+    )
+    conn.close()
+
+
+@thanks_app.command("skip")
+def thanks_skip(
+    mt_id: int = typer.Argument(..., help="Meeting id."),
+) -> None:
+    """Mark a meeting as not needing a thank-you."""
+    from . import meeting_thanks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    if not meeting_thanks.mark_skipped(conn, mt_id):
+        console.print(
+            f"[red]Couldn't skip meeting #{mt_id} — not found, or "
+            f"already drafted/sent.[/]",
+        )
+        conn.close()
+        raise typer.Exit(code=1) from None
+    console.print(f"[green]✓[/] Meeting #{mt_id} skipped.")
+    conn.close()
+
+
+@thanks_app.command("draft")
+def thanks_draft(
+    mt_id: int = typer.Argument(..., help="Meeting id."),
+    user_name: str = typer.Option(
+        "I", "--name", help="Name to sign as (defaults to 'I').",
+    ),
+) -> None:
+    """Generate a thank-you draft for a specific meeting now.
+
+    Uses your voice profile + reply-pair few-shot. The draft lands
+    in /drafts where you can review, tweak, and mark sent through
+    the same UI as inbox replies."""
+    from . import meeting_thanks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    draft_id = meeting_thanks.generate_thanks_draft(
+        conn, cfg, mt_id, user_name=user_name,
+    )
+    if draft_id is None:
+        console.print(
+            f"[red]Couldn't draft for meeting #{mt_id} — check that "
+            f"context exists (transcript or `thanks context`) and "
+            f"the meeting isn't already in 'drafted' state within "
+            f"the cooldown window.[/]",
+        )
+        conn.close()
+        raise typer.Exit(code=1) from None
+    console.print(
+        f"[green]✓[/] Drafted thank-you (draft #{draft_id}) — "
+        f"review at `secondbrain dashboard` → /drafts.",
+    )
+    conn.close()
+
+
 study_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 67 study mode. Flashcards generated from class "

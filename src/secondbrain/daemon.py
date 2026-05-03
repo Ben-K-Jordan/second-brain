@@ -485,6 +485,17 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _email_voice_refresh(conn, cfg),
     ))
 
+    # Round 8 — meeting thanks. Hourly scan to register newly-finished
+    # meetings, retry transcript matches, and auto-draft thank-yous
+    # for rows where context is available. Bounded by max_per_tick
+    # inside the helper so a vacation backlog doesn't blow the budget.
+    from .meeting_thanks import process_due_thanks as _process_thanks
+    sched.register(Job(
+        name="meeting_thanks",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _process_thanks(conn, cfg),
+    ))
+
     return sched
 
 

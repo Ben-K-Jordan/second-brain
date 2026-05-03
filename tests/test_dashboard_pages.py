@@ -230,7 +230,9 @@ def test_primary_nav_is_six_items():
     assert len(_PRIMARY_NAV) == 6
     labels = {item[0] for item in _PRIMARY_NAV}
     # Daily-use anchor items must all be present.
-    assert {"Brief", "Chat", "Tasks", "Search", "Drafts", "Insights"} == labels
+    # Round 8: Thanks displaced Insights to primary nav; Insights
+    # now lives under "Knowledge" in the More dropdown.
+    assert {"Brief", "Chat", "Tasks", "Search", "Drafts", "Thanks"} == labels
 
 
 def test_nav_groups_cover_all_pages():
@@ -265,12 +267,12 @@ def test_layout_renders_more_dropdown(client):
 
 
 def test_layout_renders_badge_spans_for_pending_items(client):
-    """Tasks / Drafts / Insights all get badge spans in the markup
+    """Tasks / Drafts / Thanks all get badge spans in the markup
     even when their count is zero — JS reveals them after fetch."""
     r = client.get("/brief")
     assert 'data-badge="tasks"' in r.text
     assert 'data-badge="drafts"' in r.text
-    assert 'data-badge="insights"' in r.text
+    assert 'data-badge="thanks"' in r.text
 
 
 def test_layout_includes_nav_badges_js(client):
