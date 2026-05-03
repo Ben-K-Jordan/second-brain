@@ -4182,6 +4182,34 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             f"<p class='muted'>Aliases: {escape(', '.join(profile.aliases))}</p>"
             if profile.aliases else ""
         )
+        # Round 10 (#10) — inline edit form for the profile fields
+        # most likely to need correction (email / role / company /
+        # birthday / notes). All optional; submitting partially-filled
+        # form only updates non-empty fields.
+        edit_html = (
+            f"<details class='card' style='margin-top:12px;'>"
+            f"<summary><strong>Edit profile</strong></summary>"
+            f"<form method='post' action='/person/{id}/edit' "
+            f"style='margin-top:12px;'>"
+            f"  <label>Email <input name='email' type='email' "
+            f"   value='{escape(profile.person.email)}' "
+            f"   style='width:100%;'></label><br><br>"
+            f"  <label>Role <input name='role' "
+            f"   value='{escape(profile.person.role)}' "
+            f"   style='width:100%;'></label><br><br>"
+            f"  <label>Company <input name='company' "
+            f"   value='{escape(profile.person.company)}' "
+            f"   style='width:100%;'></label><br><br>"
+            f"  <label>Birthday <input name='birthday' "
+            f"   placeholder='YYYY-MM-DD or MM-DD' "
+            f"   value='{escape(profile.person.birthday)}' "
+            f"   style='width:100%;'></label><br><br>"
+            f"  <label>Notes <textarea name='notes' rows='3' "
+            f"   style='width:100%;'>{escape(profile.person.notes)}"
+            f"</textarea></label><br><br>"
+            f"  <button type='submit'>Save</button>"
+            f"</form></details>"
+        )
         body = (
             f"<h1>{escape(profile.person.display_name)}</h1>"
             f"{aliases_html}"
@@ -4189,11 +4217,40 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             + "".join(meta_lines) + "</div>"
             + (f"<div class='card'><h2>Notes</h2><p>{escape(profile.person.notes)}</p></div>"
                if profile.person.notes else "")
+            + edit_html
             + mentions_html
         )
         return HTMLResponse(_layout(
             profile.person.display_name, body, "people",
         ))
+
+    @app.post("/person/{person_id:int}/edit")
+    def person_edit(
+        person_id: int,
+        email: str = Form(""),
+        role: str = Form(""),
+        company: str = Form(""),
+        birthday: str = Form(""),
+        notes: str = Form(""),
+    ):
+        """Round 10 (#10) — POST handler for the inline person-edit
+        form. Empty strings preserve existing values (caller passes
+        None to set_field for those)."""
+        from fastapi.responses import RedirectResponse
+
+        from . import people as people_mod
+        cfg, conn, _, _ = get_state()
+        people_mod.set_field(
+            conn, person_id,
+            email=email if email is not None else None,
+            role=role if role is not None else None,
+            company=company if company is not None else None,
+            birthday=birthday if birthday is not None else None,
+            notes=notes if notes is not None else None,
+        )
+        return RedirectResponse(
+            url=f"/person?id={person_id}", status_code=303,
+        )
 
     # --- Phase 79: habits page -----------------------------------------
 
