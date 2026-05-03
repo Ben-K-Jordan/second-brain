@@ -608,9 +608,13 @@ def test_legacy_drafter_path_still_works(fresh_db, tmp_cfg):
     )
     assert d is not None
     assert d.draft_text == "plain legacy reply"
-    # Legacy path → no analysis / alternative / etc.
+    # Legacy stub path → no analysis or alternative.
+    # (Round 10 #7 unified the codepath; legacy stubs that return a
+    # bare string get coerced into DraftOutput(primary=str), so the
+    # alternative_text is now empty string rather than None — both
+    # mean "no second variant".)
     assert d.analysis is None
-    assert d.alternative_text is None
+    assert not d.alternative_text
 
 
 def test_select_style_samples_smart_falls_back_to_general(fresh_db):

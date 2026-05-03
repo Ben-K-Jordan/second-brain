@@ -140,6 +140,22 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         # leaves the schema untouched (fresh DBs hit the CREATE path).
         if "duplicate column" not in str(e).lower():
             log.debug("email_assist: ALTER add metadata_json skipped: %s", e)
+    # Round 10 (#2) — draft feedback columns. ``feedback`` is NULL
+    # when the user hasn't acted yet; one of 'accepted' / 'rejected'
+    # / 'edited' once they do. ``rejection_reason`` lets the user
+    # leave a one-line note ('too formal', 'wrong tone') that the
+    # weekly stats surface as patterns to fix in the drafter.
+    for col, ddl in (
+        ("feedback", "ALTER TABLE email_drafts ADD COLUMN feedback TEXT"),
+        ("rejection_reason",
+         "ALTER TABLE email_drafts ADD COLUMN rejection_reason TEXT"),
+    ):
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                log.debug("email_assist: ALTER add %s skipped: %s", col, e)
     # Round 7 — voice profile + reply pairs. The profile is a single
     # JSON blob refreshed weekly; reply pairs link a Sent message to
     # the email it replied to so few-shot retrieval can surface real
@@ -1229,7 +1245,7 @@ def generate_draft(
     user_name: str = "I",
     drafter=None,
 ) -> Draft | None:
-    """Generate a reply draft using the round-6 structured pipeline:
+    """Generate a reply draft using the structured pipeline:
 
       1. ``analyze_email`` — Haiku JSON: intent / relationship /
          key_points / tone / open_questions.
@@ -1239,13 +1255,11 @@ def generate_draft(
       3. ``_default_drafter`` — Sonnet, fed all of the above; outputs
          primary + alternative + reasoning + open_questions in JSON.
 
-    Persists with sent_at=NULL so the user can review. The structured
-    metadata lives in ``metadata_json``; legacy callers that read
-    ``draft_text`` still work unchanged.
-
-    The ``drafter`` argument is preserved for tests that want to
-    inject a stub. Test stubs that return a plain string still
-    work — we treat that as the legacy single-version path.
+    Round 10 (#7) — the ``drafter`` parameter is now a stub that
+    REPLACES ``_default_drafter`` in step 3 (not a separate code
+    path). Same kwargs, same return contract. For backwards-compat
+    with older tests, a stub that returns a plain string gets
+    auto-wrapped into ``DraftOutput(primary=str)``.
     """
     _ensure_schema(conn)
     if not needs_draft(conn, file_id):
@@ -1260,21 +1274,15 @@ def generate_draft(
     body = "\n\n".join(r["text"] or "" for r in rows)
     from_, subject = _parse_email_header(body)
 
-    # Test-injection path: a custom drafter that takes the legacy
-    # kwargs returns just text. We don't run analysis or retrieval
-    # in that case — keeps existing tests fast + deterministic.
-    if drafter is not None:
-        return _persist_legacy_draft(
-            conn, file_id, drafter, from_, subject, body, user_name, cfg,
-        )
-    if cfg is None:
-        return None
-
     # ---- Stage 1: analyze ----
-    analysis = analyze_email(
-        from_=from_, subject=subject, body=body, cfg=cfg,
-        conn=conn, file_id=file_id,
-    )
+    # Skip analysis when cfg is missing (test path) — _default_drafter
+    # / stub still gets called with analysis=None.
+    analysis = None
+    if cfg is not None and drafter is None:
+        analysis = analyze_email(
+            from_=from_, subject=subject, body=body, cfg=cfg,
+            conn=conn, file_id=file_id,
+        )
     # ---- Stage 2: targeted retrieval (round 6 + 7) ----
     sender_email = _extract_email_address(from_)
     relationship = analysis.sender_relationship if analysis else "unknown"
@@ -1288,33 +1296,52 @@ def generate_draft(
     style_samples = _select_style_samples_smart(
         conn, sender_email=sender_email, relationship=relationship,
     )
-    brain_block = _brain_context_for_topics(conn, cfg, key_points)
-    # Round 7 — voice fidelity inputs.
-    voice_profile = get_voice_profile(conn)
+    brain_block = ""
+    if cfg is not None and drafter is None:
+        brain_block = _brain_context_for_topics(conn, cfg, key_points)
+    # Round 7 — voice fidelity inputs. Round 10 (#5): use the
+    # curated bootstrap profile when no real one exists yet so cold-
+    # start drafts don't drop to generic-LLM voice.
+    voice_profile = get_voice_profile_or_default(conn)
     embedder = None
-    try:
-        from .embedder import make_embedder
-        embedder = make_embedder(cfg)
-    except Exception:  # noqa: BLE001
-        embedder = None
+    if cfg is not None and drafter is None:
+        try:
+            from .embedder import make_embedder
+            embedder = make_embedder(cfg)
+        except Exception:  # noqa: BLE001
+            embedder = None
     fewshot = fewshot_reply_pairs(
         conn, incoming_text=body, embedder=embedder,
     )
 
-    # ---- Stage 3: draft ----
-    output = _default_drafter(
-        from_=from_, subject=subject, body=body,
-        style_samples=style_samples,
-        user_name=user_name, cfg=cfg,
-        analysis=analysis,
-        thread_history=thread_hist,
-        sender_history=sender_hist,
-        brain_context=brain_block,
-        voice_profile=voice_profile,
-        fewshot_pairs=fewshot,
-        conn=conn,
-        file_id=file_id,
-    )
+    # ---- Stage 3: draft (production OR injected stub) ----
+    drafter_fn = drafter if drafter is not None else _default_drafter
+    try:
+        raw_output = drafter_fn(
+            from_=from_, subject=subject, body=body,
+            style_samples=style_samples,
+            user_name=user_name, cfg=cfg,
+            analysis=analysis,
+            thread_history=thread_hist,
+            sender_history=sender_hist,
+            brain_context=brain_block,
+            voice_profile=voice_profile,
+            fewshot_pairs=fewshot,
+            conn=conn,
+            file_id=file_id,
+        )
+    except TypeError:
+        # Backwards-compat: older test stubs use ``**kw`` and don't
+        # accept the new kwargs. Call with a minimal shape.
+        raw_output = drafter_fn(
+            from_=from_, subject=subject, body=body,
+            style_samples=style_samples,
+            user_name=user_name, cfg=cfg,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("email_assist: drafter crashed: %s", e)
+        return None
+    output = _coerce_draft_output(raw_output)
     if output is None or not (output.primary or output.alternative).strip():
         return None
 
@@ -1322,8 +1349,15 @@ def generate_draft(
     # Only runs when we have a profile to critique against. The
     # regenerate path passes the critique back as a do-not-do list
     # so the second draft addresses the specific mismatches.
+    # Round 10 (#5) — only critique against a REAL profile (n_samples
+    # > 0). The bootstrap default has nothing user-specific to grade
+    # the draft against, so a critique pass is wasted spend.
     critique_text = ""
-    if voice_profile is not None and output.primary.strip():
+    if (
+        voice_profile is not None
+        and voice_profile.n_samples > 0
+        and output.primary.strip()
+    ):
         critique_text = critique_draft_against_voice(
             draft=output.primary, profile=voice_profile, cfg=cfg,
             conn=conn, file_id=file_id,
@@ -1394,36 +1428,47 @@ def generate_draft(
     )
 
 
-def _persist_legacy_draft(
-    conn, file_id, drafter, from_, subject, body, user_name, cfg,
-) -> Draft | None:
-    """Test-only path: a stubbed drafter (callable returning plain
-    text) bypasses analysis + retrieval. Keeps the existing tests
-    fast + deterministic; production code never hits this branch."""
-    style_samples = _gather_style_samples(conn)
-    try:
-        text = drafter(
-            from_=from_, subject=subject, body=body,
-            style_samples=style_samples,
-            user_name=user_name, cfg=cfg,
+def _coerce_draft_output(raw) -> DraftOutput | None:
+    """Round 10 (#7) — adapter for backwards-compatible test stubs.
+
+    The new contract is that drafters return ``DraftOutput | None``,
+    but older tests pass stubs that return plain strings (the legacy
+    single-call drafter shape). Wrap those into the new shape so
+    we don't have to touch every test simultaneously.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, DraftOutput):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        return DraftOutput(
+            primary=text, alternative="", reasoning="",
+            confidence=0.0, open_questions=[],
         )
-    except Exception as e:  # noqa: BLE001
-        log.warning("email_assist: legacy drafter crashed: %s", e)
-        return None
-    text = (text or "").strip()
-    if not text:
-        return None
-    cur = conn.execute(
-        "INSERT INTO email_drafts(file_id, draft_text, generated_at) "
-        "VALUES (?, ?, ?) RETURNING id",
-        (file_id, text, time.time()),
-    )
-    rid = int(cur.fetchone()["id"])
-    conn.commit()
-    return Draft(
-        id=rid, file_id=file_id, draft_text=text,
-        generated_at=time.time(),
-    )
+    if isinstance(raw, dict):
+        # Some test stubs return the raw JSON shape directly. Hydrate
+        # via the same path the production drafter uses.
+        primary = str(raw.get("primary") or "").strip()
+        if not primary and not raw.get("alternative"):
+            return None
+        try:
+            confidence = float(raw.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return DraftOutput(
+            primary=primary,
+            alternative=str(raw.get("alternative") or "").strip(),
+            reasoning=str(raw.get("reasoning") or ""),
+            confidence=max(0.0, min(1.0, confidence)),
+            open_questions=[
+                str(q) for q in (raw.get("open_questions") or [])
+                if str(q).strip()
+            ],
+        )
+    return None
 
 
 def _default_drafter(
@@ -1549,9 +1594,14 @@ def _default_drafter(
 def list_unsent_drafts(
     conn: sqlite3.Connection, *, limit: int = 50,
 ) -> list[Draft]:
+    """Round 10 (#2) — filter out rejected drafts (they're soft-
+    deleted now to preserve the feedback signal, but the user
+    doesn't want to see them again)."""
     _ensure_schema(conn)
     rows = conn.execute(
-        "SELECT * FROM email_drafts WHERE sent_at IS NULL "
+        "SELECT * FROM email_drafts "
+        "WHERE sent_at IS NULL "
+        "  AND (feedback IS NULL OR feedback != 'rejected') "
         "ORDER BY generated_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -1624,9 +1674,12 @@ def _row_to_draft(r) -> Draft:
 
 
 def mark_draft_sent(conn: sqlite3.Connection, draft_id: int) -> bool:
+    """Round 10 (#2) — also flag feedback='accepted' so the rolling
+    accept-rate stat reflects this draft."""
     _ensure_schema(conn)
     cur = conn.execute(
-        "UPDATE email_drafts SET sent_at = ? "
+        "UPDATE email_drafts "
+        "SET sent_at = ?, feedback = COALESCE(feedback, 'accepted') "
         "WHERE id = ? AND sent_at IS NULL",
         (time.time(), draft_id),
     )
@@ -1634,16 +1687,60 @@ def mark_draft_sent(conn: sqlite3.Connection, draft_id: int) -> bool:
     return cur.rowcount > 0
 
 
-def discard_draft(conn: sqlite3.Connection, draft_id: int) -> bool:
-    """Hard-delete an unsent draft. Used when the user decided to
-    write the reply themselves."""
+def discard_draft(
+    conn: sqlite3.Connection, draft_id: int,
+    *, reason: str = "",
+) -> bool:
+    """Round 10 (#2) — soft-deletion: mark feedback='rejected' so the
+    weekly stats can show 'you rejected X% of drafts'.
+
+    Previously discarded drafts were hard-deleted, which lost the
+    signal we need to evaluate the drafter. They still vanish from
+    ``list_unsent_drafts`` because that filters on sent_at IS NULL —
+    we now also exclude rows with feedback='rejected'.
+    """
     _ensure_schema(conn)
     cur = conn.execute(
-        "DELETE FROM email_drafts WHERE id = ? AND sent_at IS NULL",
-        (draft_id,),
+        "UPDATE email_drafts "
+        "SET feedback = 'rejected', rejection_reason = ? "
+        "WHERE id = ? AND sent_at IS NULL",
+        (reason[:500] if reason else None, draft_id),
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def feedback_stats(
+    conn: sqlite3.Connection, *, days: int = 7,
+) -> dict[str, int | float]:
+    """Round 10 (#2) — accept / reject / pending counts over the
+    last N days. Powers the /drafts header stat + the morning brief.
+
+    Returns dict with keys: accepted, rejected, pending, total,
+    accept_rate (0..1, computed from accepted/(accepted+rejected),
+    not against pending). 0.0 when no acted-on drafts."""
+    _ensure_schema(conn)
+    cutoff = time.time() - days * 86400
+    rows = conn.execute(
+        "SELECT feedback, COUNT(*) AS n FROM email_drafts "
+        "WHERE generated_at >= ? "
+        "GROUP BY feedback",
+        (cutoff,),
+    ).fetchall()
+    counts = {r["feedback"] or "pending": int(r["n"]) for r in rows}
+    accepted = counts.get("accepted", 0)
+    rejected = counts.get("rejected", 0)
+    pending = counts.get("pending", 0) + counts.get("edited", 0)
+    total = accepted + rejected + pending
+    acted = accepted + rejected
+    accept_rate = accepted / acted if acted else 0.0
+    return {
+        "accepted": accepted,
+        "rejected": rejected,
+        "pending": pending,
+        "total": total,
+        "accept_rate": accept_rate,
+    }
 
 
 def generate_drafts_due(
@@ -2366,6 +2463,65 @@ def _save_voice_profile(
         (json.dumps(payload), profile.n_samples, time.time()),
     )
     conn.commit()
+
+
+def default_voice_profile() -> VoiceProfile:
+    """Round 10 (#5) — curated bootstrap profile for new users who
+    haven't indexed their Sent folder yet.
+
+    Without this, the drafter would fall through to a generic-LLM
+    voice — which is exactly the cliché we tried to kill in round 7.
+    The default leans casual-warm-concise (the most common modern
+    professional voice) and explicitly lists banned phrases so the
+    drafter doesn't open with 'I hope this email finds you well'
+    on a brand-new install.
+
+    The profile gets replaced as soon as the user indexes any Sent
+    mail — the round-7 extractor runs weekly via the daemon.
+    """
+    return VoiceProfile(
+        greetings=["hi {name},", "{name},", "hey {name},"],
+        sign_offs=["thanks,\n{name}", "—{name}", "{name}"],
+        avg_sentence_words=12.0,
+        avg_reply_chars=240,
+        contraction_rate=0.85,
+        exclamation_rate=0.1,
+        emoji_rate=0.0,
+        common_openers=[],
+        common_closers=[],
+        avoided_phrases=[
+            "I hope this email finds you well",
+            "I hope this finds you well",
+            "Thank you for reaching out",
+            "Please don't hesitate to",
+            "Please let me know if you have any further questions",
+            "I look forward to hearing from you",
+            "Best regards,",
+            "Warm regards,",
+            "I wanted to reach out",
+            "I am writing to",
+        ],
+        register_notes=(
+            "Casual but professional. Uses contractions. Short "
+            "sentences, direct asks. Skips boilerplate openers / "
+            "closers. (Default — refines as the user's Sent folder "
+            "gets indexed.)"
+        ),
+        n_samples=0,  # marker that this is the bootstrap profile
+    )
+
+
+def get_voice_profile_or_default(
+    conn: sqlite3.Connection,
+) -> VoiceProfile:
+    """Round 10 (#5) — same as ``get_voice_profile`` but returns the
+    curated default when no profile exists yet. The drafter prefers
+    this over None so cold-start drafts don't degrade to generic
+    LLM voice."""
+    profile = get_voice_profile(conn)
+    if profile is None:
+        return default_voice_profile()
+    return profile
 
 
 def get_voice_profile(

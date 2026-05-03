@@ -261,6 +261,9 @@ class DailyBrief:
     # Lightweight "nudge" flags — surfaced as one-line reminders.
     weekly_review_due: bool = False  # Phase 72
     snapshot_due: bool = False       # Phase 87
+    # Round 10 (#9) — fragile-integration breakage warnings.
+    # list[HealthStatus]; rendered by health_checks helper.
+    stale_health: list = field(default_factory=list)
     # Round 9-B — stale connections worth reaching back out to.
     # Free-form list[StaleConnection]; rendered by connections module.
     stale_connections: list = field(default_factory=list)
@@ -310,6 +313,7 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         snapshot_due=_snapshot_due(conn),
         stale_connections=_stale_connections_section(conn),
         upcoming_preps=_upcoming_preps_section(cfg, conn),
+        stale_health=_stale_health_section(conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -606,6 +610,18 @@ def _upcoming_preps_section(cfg, conn: sqlite3.Connection) -> list:
         )
     except Exception as e:  # noqa: BLE001
         log.warning("daily brief: upcoming preps failed: %s", e)
+        return []
+
+
+def _stale_health_section(conn: sqlite3.Connection) -> list:
+    """Round 10 (#9) hookup — surface health checks that have been
+    failing > 24h. Calendar disconnections, IMAP auth failures,
+    missing API keys, etc."""
+    try:
+        from . import health_checks
+        return health_checks.stale_failures(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: stale health check failed: %s", e)
         return []
 
 
@@ -1045,6 +1061,11 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
     surfaces (habits, goals, yesterday's wins), then quiet-day
     fallbacks.
     """
+    if brief.stale_health:
+        # Round 10 (#9) — health failures front-loaded so the user
+        # notices before reading the rest of the brief (which may
+        # itself be incomplete due to the broken integration).
+        yield _render_stale_health(brief.stale_health)
     if brief.insights:
         yield _render_insights(brief.insights)
     if brief.birthdays:
@@ -1243,6 +1264,27 @@ def _render_email(email: EmailTriageLine, n_drafts: int) -> str:
             f"- ✉️ **{n_drafts} draft(s) awaiting review** "
             f"_(`secondbrain drafts list`)_",
         )
+    return "\n".join(out)
+
+
+def _render_stale_health(items: list) -> str:
+    """Round 10 (#9) — top-of-brief warning when third-party
+    integrations have been failing for >24h. Each row tells the user
+    what's broken and how long it's been."""
+    if not items:
+        return ""
+    out = ["## ⚠ Integrations need attention", ""]
+    for s in items:
+        days = s.days_since_ok or 0
+        when_str = (
+            f"{days}d" if days > 0 else "since last check"
+        )
+        out.append(
+            f"- **{_safe(s.name)}** broken for {when_str}: "
+            f"_{_safe(s.error)}_",
+        )
+    out.append("")
+    out.append("_Run `secondbrain doctor` for details._")
     return "\n".join(out)
 
 

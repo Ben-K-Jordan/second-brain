@@ -2948,6 +2948,55 @@ def thanks_draft(
     conn.close()
 
 
+@app.command()
+def doctor() -> None:
+    """Round 10 (#1 + #9) — health check across every fragile
+    integration: Google Calendar OAuth, IMAP creds, API keys, local
+    LLM, watched folders. Useful "is the system actually wired up?"
+    smoke test that doubles as a quick triage when something breaks."""
+    from . import health_checks
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    console.print("\n[bold cyan]Running health checks…[/]")
+    statuses = health_checks.run_all(conn, cfg)
+    table = Table(show_header=True, box=None, title="Health checks")
+    table.add_column("check")
+    table.add_column("ok")
+    table.add_column("last ok", style="dim")
+    table.add_column("detail")
+    for name, st in statuses.items():
+        if st.ok:
+            ok_marker = "[green]✓[/]"
+        else:
+            ok_marker = "[red]✗[/]"
+        if st.ok:
+            last_ok = "now"
+        elif st.last_ok_at:
+            days = st.days_since_ok or 0
+            last_ok = f"{days}d ago"
+        else:
+            last_ok = "never"
+        detail = (
+            (st.error[:80] + "…" if len(st.error) > 80 else st.error)
+            if not st.ok else
+            ", ".join(f"{k}={v}" for k, v in list(st.extra.items())[:2])
+        )
+        table.add_row(name, ok_marker, last_ok, detail)
+    console.print(table)
+    n_failing = sum(1 for s in statuses.values() if not s.ok)
+    if n_failing:
+        console.print(
+            f"\n[yellow]{n_failing} check(s) failing. Action items:[/]",
+        )
+        for name, st in statuses.items():
+            if not st.ok and st.error and "(" not in st.error:
+                console.print(f"  • [bold]{name}[/]: {st.error}")
+    else:
+        console.print("\n[green]All checks passing.[/]")
+    conn.close()
+
+
 audit_app = typer.Typer(
     no_args_is_help=False, invoke_without_command=True,
     help="Round 10 (#6) — view the AI action audit log. Every LLM "

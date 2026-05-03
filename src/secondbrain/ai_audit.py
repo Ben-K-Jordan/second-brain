@@ -218,6 +218,34 @@ def rollup_today(
     }
 
 
+def cost_for_window(
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    around_ts: float,
+    window_seconds: float = 90.0,
+) -> dict:
+    """Round 10 (#3) — sum AI cost + call count for a specific
+    file in a time window around ``around_ts``. Used to compute
+    per-draft cost on the /drafts page (a draft is the result of
+    several LLM calls — analyze + draft + critique + maybe regen
+    — all keyed to the same file_id within a few seconds).
+    """
+    _ensure_schema(conn)
+    lo = around_ts - window_seconds
+    hi = around_ts + window_seconds
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, SUM(cents) AS cents "
+        "FROM ai_actions "
+        "WHERE file_id = ? AND ts BETWEEN ? AND ?",
+        (file_id, lo, hi),
+    ).fetchone()
+    return {
+        "n": int(row["n"] or 0),
+        "cents": float(row["cents"] or 0),
+    }
+
+
 def trim_old(
     conn: sqlite3.Connection,
     *,

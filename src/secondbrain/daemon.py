@@ -527,6 +527,17 @@ def _build_daemon_scheduler(
         fn=lambda conn: _ai_trim(conn),
     ))
 
+    # Round 10 (#9) — health checks for OAuth tokens, API keys, IMAP,
+    # local LLM, watched folders. Fires every 6h (handled by run_if_due
+    # internally); cached results power the dashboard banner + the
+    # brief's "your calendar's been disconnected for 3 days" nudge.
+    from .health_checks import run_if_due as _health_check
+    sched.register(Job(
+        name="health_checks",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _health_check(conn, cfg),
+    ))
+
     return sched
 
 

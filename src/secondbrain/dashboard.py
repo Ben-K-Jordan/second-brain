@@ -1114,6 +1114,7 @@ _NAV_GROUPS = [
     ]),
     ("System", [
         ("Overview",  "/"),
+        ("Health",    "/health/system"),
         ("Audit",     "/audit"),
         ("Folders",   "/folders"),
         ("Queries",   "/queries"),
@@ -4410,7 +4411,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/drafts", response_class=HTMLResponse)
     def drafts_view():
-        from . import email_assist
+        from . import ai_audit, email_assist
         from .safety import redact_text as _redact
 
         cfg, conn, _, _ = get_state()
@@ -4516,11 +4517,25 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                     f'</details>'
                 )
 
+            # Round 10 (#3) — per-draft cost: sum LLM calls within
+            # 90s of the generated_at timestamp keyed to this file.
+            cost_info = ai_audit.cost_for_window(
+                conn, file_id=d.file_id, around_ts=d.generated_at,
+            )
+            cost_html = ""
+            if cost_info["cents"] > 0:
+                cost_html = (
+                    f'<span class="muted" style="font-size:11px;">'
+                    f' · ${cost_info["cents"] / 100:.4f} '
+                    f'({cost_info["n"]} call{"s" if cost_info["n"] != 1 else ""})'
+                    f'</span>'
+                )
+
             items.append(
                 f'<div class="card" style="margin-bottom:12px;">'
                 f'<div class="stat" style="border-bottom:none;padding-bottom:0;">'
                 f'<strong>Draft #{d.id}</strong>'
-                f'<span class="v muted">{when}</span>'
+                f'<span class="v muted">{when}{cost_html}</span>'
                 f'</div>'
                 f'{meta_html}'
                 f'{todos_html}'
@@ -4537,8 +4552,25 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f'</form></div>'
                 f'</div>',
             )
+        # Round 10 (#2) — accept-rate stat at top of /drafts. Lets
+        # the user see "I rejected 60% of drafts last week" without
+        # having to count.
+        stats = email_assist.feedback_stats(conn, days=14)
+        stats_html = ""
+        if stats["accepted"] + stats["rejected"] > 0:
+            rate_pct = int(stats["accept_rate"] * 100)
+            stats_html = (
+                f"<div class='card' style='margin-bottom:16px;"
+                f"font-size:13px;'>"
+                f"<strong>Last 14 days:</strong> "
+                f"{stats['accepted']} accepted, "
+                f"{stats['rejected']} rejected — "
+                f"<strong>{rate_pct}%</strong> accept rate"
+                f"</div>"
+            )
         body = (
             f"<h1>Email drafts ({len(drafts)})</h1>"
+            + stats_html
             + "".join(items)
         )
         return HTMLResponse(_layout("Drafts", body, "drafts"))
@@ -4711,6 +4743,63 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return RedirectResponse(url="/drafts", status_code=303)
 
     # --- Round 10 (#6): AI audit log ----------------------------------
+
+    # Round 10 (#9) — health page (separate from /audit so the user
+    # can drill into integration failures without the AI noise).
+
+    @app.get("/health/system", response_class=HTMLResponse)
+    def system_health_view():
+        from . import health_checks
+
+        cfg, conn, _, _ = get_state()
+        statuses = health_checks.list_status(conn)
+        if not statuses:
+            # Trigger an immediate run when the page is hit cold.
+            try:
+                health_checks.run_all(conn, cfg)
+                statuses = health_checks.list_status(conn)
+            except Exception:  # noqa: BLE001
+                statuses = []
+        if not statuses:
+            body = (
+                "<h1>System health</h1>"
+                "<div class='card'><p class='muted'>"
+                "No health checks have run yet. Run "
+                "<code>secondbrain doctor</code> in a terminal."
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Health", body, ""))
+        items = []
+        for s in statuses:
+            ok_marker = "✓" if s.ok else "✗"
+            ok_class = "good" if s.ok else "bad"
+            when = time.strftime(
+                "%a %b %d %H:%M", time.localtime(s.last_checked_at),
+            )
+            err_html = ""
+            if s.error and not s.ok:
+                err_html = (
+                    f"<div class='muted' style='color:var(--bad);"
+                    f"font-size:12px;margin-top:4px;'>{escape(s.error)}</div>"
+                )
+            items.append(
+                f"<div class='stat' style='align-items:flex-start;'>"
+                f"<span style='flex:1;'>"
+                f"<strong>{escape(s.name)}</strong> "
+                f"<span class='muted' style='font-size:11px;'>"
+                f"checked {when}</span>"
+                f"{err_html}"
+                f"</span>"
+                f"<span class='v {ok_class}'>{ok_marker}</span>"
+                f"</div>",
+            )
+        body = (
+            "<h1>System health</h1>"
+            "<div class='card'><h2>Integrations</h2>"
+            + "".join(items)
+            + "</div>"
+        )
+        return HTMLResponse(_layout("Health", body, ""))
 
     @app.get("/audit", response_class=HTMLResponse)
     def audit_view():
