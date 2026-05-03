@@ -61,6 +61,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             extra_json TEXT
         );
     """)
+    # Round 11 — first_checked_at column for "configured but broken
+    # from the start" stale detection. The original is_stale rule
+    # silently skipped checks that had never succeeded; this fixes it.
+    try:
+        conn.execute(
+            "ALTER TABLE health_checks "
+            "ADD COLUMN first_checked_at REAL",
+        )
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            log.debug(
+                "health_checks: ALTER add first_checked_at skipped: %s", e,
+            )
     conn.commit()
     try:
         _SCHEMA_INITIALIZED.add(conn)
@@ -76,6 +90,7 @@ class HealthStatus:
     last_ok_at: float | None
     error: str
     extra: dict
+    first_checked_at: float | None = None  # round 11
 
     @property
     def days_since_ok(self) -> int | None:
@@ -88,12 +103,32 @@ class HealthStatus:
     @property
     def is_stale(self) -> bool:
         """True when this check has been failing long enough that the
-        brief should nudge the user."""
+        brief should nudge the user.
+
+        Round 11 fix (audit-found semantic bug): we used to skip
+        ``last_ok_at is None`` entirely under the rationale "never
+        configured — don't spam". But that hides the case where the
+        user DID configure something (e.g. set ANTHROPIC_API_KEY)
+        and it's failing on every check (wrong shape, revoked key) —
+        the daily brief silently dropped that nudge.
+
+        New rule: if the check has been running for 24h+ since
+        ``first_checked_at`` and never succeeded, treat that as stale
+        too. Distinguishes "configured but broken since the start"
+        from "ran once five minutes ago, give it time".
+        """
         if self.ok:
             return False
-        if self.last_ok_at is None:
-            return False  # never configured — don't spam
-        return (time.time() - self.last_ok_at) > _STALE_AFTER_SECONDS
+        now = time.time()
+        if self.last_ok_at is not None:
+            return (now - self.last_ok_at) > _STALE_AFTER_SECONDS
+        # Never succeeded. Stale if it's been observed (and failing)
+        # for at least the threshold.
+        if self.first_checked_at is not None:
+            return (now - self.first_checked_at) > _STALE_AFTER_SECONDS
+        # Old-schema row without first_checked_at — assume not stale
+        # (the next check pass will populate the column).
+        return False
 
 
 # ---- Individual check functions -------------------------------------
@@ -286,11 +321,13 @@ def _persist(
     conn: sqlite3.Connection, *,
     name: str, ok: bool, error: str, extra: dict,
 ) -> None:
-    """Upsert a check result, preserving last_ok_at across runs."""
+    """Upsert a check result, preserving last_ok_at + first_checked_at
+    across runs (round 11)."""
     import json
     now = time.time()
     row = conn.execute(
-        "SELECT last_ok_at FROM health_checks WHERE name = ?",
+        "SELECT last_ok_at, first_checked_at FROM health_checks "
+        "WHERE name = ?",
         (name,),
     ).fetchone()
     if row and ok:
@@ -299,14 +336,21 @@ def _persist(
         last_ok_at = row["last_ok_at"]
     else:
         last_ok_at = now if ok else None
+    # Preserve first_checked_at if we've seen this name before.
+    first_checked_at = (
+        row["first_checked_at"] if row and row["first_checked_at"]
+        else now
+    )
     conn.execute(
         "INSERT OR REPLACE INTO health_checks"
-        "(name, last_checked_at, last_ok_at, ok, error, extra_json) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(name, last_checked_at, last_ok_at, ok, error, "
+        " extra_json, first_checked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             name, now, last_ok_at, 1 if ok else 0,
             error[:500] if error else "",
             json.dumps(extra) if extra else None,
+            first_checked_at,
         ),
     )
     conn.commit()
@@ -348,6 +392,13 @@ def _row_to_status(row) -> HealthStatus:
                 extra = parsed
     except (TypeError, ValueError):
         extra = {}
+    # Round 11 — first_checked_at column may not exist on legacy
+    # databases (round-10 schema). Guard the access.
+    try:
+        first_checked = row["first_checked_at"]
+        first_checked_at = float(first_checked) if first_checked else None
+    except (IndexError, KeyError):
+        first_checked_at = None
     return HealthStatus(
         name=row["name"],
         ok=bool(row["ok"]),
@@ -355,6 +406,7 @@ def _row_to_status(row) -> HealthStatus:
         last_ok_at=float(row["last_ok_at"]) if row["last_ok_at"] else None,
         error=row["error"] or "",
         extra=extra,
+        first_checked_at=first_checked_at,
     )
 
 

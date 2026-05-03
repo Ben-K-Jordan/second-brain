@@ -1439,6 +1439,11 @@ def generate_draft(
                 fewshot_pairs=fewshot,
                 prior_draft=output.primary,
                 critique=critique_text,
+                # Round 11 — pass conn + file_id so the regen call
+                # writes its own ai_actions row (it's a separate
+                # Sonnet call costing the same as the primary).
+                conn=conn,
+                file_id=file_id,
             )
             if output2 is not None and output2.primary.strip():
                 output = output2
@@ -2854,11 +2859,13 @@ def _regenerate_with_critique(
     Capped at one regeneration so a stubborn voice mismatch can't
     burn the budget in a loop.
     """
-    body_clip = (
-        drafter_kwargs["body"]
-        if len(drafter_kwargs["body"]) <= 6000
-        else drafter_kwargs["body"][:6000] + "…"
-    )
+    # Round 11 fix (audit-found gap) — same redaction the primary
+    # drafter does. Round 10 #4 wrapped _safe_for_prompt around
+    # body / thread / sender / style / brain / fewshot in
+    # ``_default_drafter`` but missed this regen path. Without these,
+    # the second-attempt prompt sent more raw user data to Anthropic
+    # than the first attempt did.
+    body_clip = _safe_for_prompt(drafter_kwargs["body"], max_chars=6000)
     analysis = drafter_kwargs.get("analysis")
     voice_profile = drafter_kwargs.get("voice_profile")
     analysis_block = (
@@ -2869,9 +2876,29 @@ def _regenerate_with_critique(
         _format_voice_profile_block(voice_profile)
         if voice_profile is not None else "(no profile)"
     )
-    fewshot_block = _format_fewshot_block(
-        drafter_kwargs.get("fewshot_pairs") or [],
+    fewshot_block = _safe_for_prompt(
+        _format_fewshot_block(
+            drafter_kwargs.get("fewshot_pairs") or [],
+        ),
+        max_chars=8000,
     )
+    thread_block = _safe_for_prompt(
+        _format_history_block(drafter_kwargs.get("thread_history") or []),
+        max_chars=8000,
+    )
+    sender_block = _safe_for_prompt(
+        _format_history_block(drafter_kwargs.get("sender_history") or []),
+        max_chars=8000,
+    )
+    brain_block = _safe_for_prompt(
+        drafter_kwargs.get("brain_context")
+        or "(no relevant brain context found)",
+        max_chars=4000,
+    )
+    style_samples = _safe_for_prompt(
+        drafter_kwargs.get("style_samples") or "", max_chars=6000,
+    )
+    safe_prior = _safe_for_prompt(prior_draft.strip(), max_chars=2500)
     prompt = (
         _DRAFT_PROMPT_V2.format(
             user_name=drafter_kwargs["user_name"],
@@ -2879,23 +2906,21 @@ def _regenerate_with_critique(
             subject=drafter_kwargs["subject"] or "(no subject)",
             body=body_clip,
             analysis_block=analysis_block,
-            thread_block=_format_history_block(
-                drafter_kwargs.get("thread_history") or [],
-            ),
-            sender_block=_format_history_block(
-                drafter_kwargs.get("sender_history") or [],
-            ),
-            style_samples=drafter_kwargs.get("style_samples") or "",
-            brain_block=drafter_kwargs.get("brain_context")
-            or "(no relevant brain context found)",
+            thread_block=thread_block,
+            sender_block=sender_block,
+            style_samples=style_samples,
+            brain_block=brain_block,
             voice_profile_block=voice_block,
             fewshot_block=fewshot_block,
         )
         + _DRAFT_REGENERATE_SUFFIX.format(
-            prior_draft=prior_draft.strip(),
+            prior_draft=safe_prior,
             critique=critique.strip(),
         )
     )
+    # Round 11 fix — also wire audit logging. Same pattern as the
+    # primary drafter (round 10 #6). conn / file_id come through
+    # drafter_kwargs from the call site.
     parsed = _llm_json_call(
         prompt=prompt,
         cfg=drafter_kwargs["cfg"],
@@ -2906,6 +2931,13 @@ def _regenerate_with_critique(
             f"email_draft_regen/"
             f"{(drafter_kwargs.get('from_') or '')[:30]}"
         ),
+        conn=drafter_kwargs.get("conn"),
+        audit_kind="draft_regen",
+        audit_summary=(
+            f"regenerated draft for {(drafter_kwargs.get('from_') or '')[:60]!r} "
+            f"after voice critique"
+        ),
+        audit_file_id=drafter_kwargs.get("file_id"),
     )
     if parsed is None:
         return None

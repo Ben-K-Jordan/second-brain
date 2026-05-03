@@ -246,12 +246,31 @@ header .kbd-hint:hover {
 }
 .nav-more-pop {
     position: absolute; top: calc(100% + 6px); right: 0;
-    min-width: 520px; padding: var(--s-4);
+    min-width: 520px; max-width: calc(100vw - 32px);
+    padding: var(--s-4);
     background: var(--bg-elevated);
     border: 1px solid var(--border-strong); border-radius: var(--r);
     box-shadow: var(--shadow-pop);
     display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-4);
     z-index: 20;
+}
+/* Round 11 — responsive: collapse to 2 columns on tablets, 1 on
+   phones. Without this the dropdown overflows + the urgent health
+   badge gets clipped on Mobile Safari (~390px viewport). */
+@media (max-width: 720px) {
+    .nav-more-pop {
+        min-width: 280px;
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+@media (max-width: 480px) {
+    .nav-more-pop {
+        min-width: 220px; max-width: calc(100vw - 16px);
+        grid-template-columns: 1fr;
+    }
+    /* Header itself wraps so primary-nav buttons + brand stay visible. */
+    header { flex-wrap: wrap; }
+    header nav { flex-wrap: wrap; }
 }
 .nav-more-group h4 {
     margin: 0 0 var(--s-2);
@@ -919,6 +938,7 @@ PALETTE_JS = r"""
         {kind: 'page', icon: '☼', label: 'Daily',      href: '/briefing',      meta: 'briefing'},
         {kind: 'page', icon: '#', label: 'Queries',    href: '/queries',       meta: 'history'},
         {kind: 'page', icon: '⊕', label: 'Audit',      href: '/audit',         meta: 'AI actions log'},
+        {kind: 'page', icon: '⚙', label: 'Diagnostics', href: '/health/system', meta: 'integration health'},
         {kind: 'page', icon: '+', label: 'Ingest URL', href: '/ingest',        meta: ''},
     ];
 
@@ -1671,14 +1691,16 @@ def create_app():
                 ("Folders",   "/folders",       None),
             ]),
             ("Sources & system", [
-                ("Prep",      "/prep",          None),
-                ("Watch",     "/watch",         None),
-                ("Queue",     "/queue",         None),
-                ("Apps",      "/applications",  None),
-                ("Briefings", "/briefings",     None),
-                ("Daily",     "/briefing",      None),
-                ("Queries",   "/queries",       None),
-                ("Ingest",    "/ingest",        None),
+                ("Prep",         "/prep",          None),
+                ("Watch",        "/watch",         None),
+                ("Queue",        "/queue",         None),
+                ("Apps",         "/applications",  None),
+                ("Briefings",    "/briefings",     None),
+                ("Daily",        "/briefing",      None),
+                ("Diagnostics",  "/health/system", None),
+                ("Audit",        "/audit",         None),
+                ("Queries",      "/queries",       None),
+                ("Ingest",       "/ingest",        None),
             ]),
         ]
         launchpad_html = "".join(
@@ -4264,21 +4286,46 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         birthday: str = Form(""),
         notes: str = Form(""),
     ):
-        """Round 10 (#10) — POST handler for the inline person-edit
-        form. Empty strings preserve existing values (caller passes
-        None to set_field for those)."""
+        """Round 11 fix (audit-found bug) — POST handler for the
+        inline person-edit form.
+
+        ``set_field`` semantics: ``None`` preserves the existing
+        value, empty string clears it. The previous version of this
+        handler always passed the form value (defaulting to ``""``
+        from ``Form("")``), which meant a programmatic / partial POST
+        would wipe every field the caller didn't include.
+
+        Fix: pass each value to ``set_field`` ONLY when it differs
+        from the currently-stored value. That way:
+          - User edits one field on the form → other fields re-submit
+            their existing value → no-ops, no clearing.
+          - User intentionally clears a field on the form → submitted
+            ``""`` differs from prior value → cleared.
+          - User leaves a field blank that was already blank → no-op.
+          - Programmatic POST missing a field → defaults to ``""`` →
+            still no-op when the stored value was already empty.
+        """
         from fastapi.responses import RedirectResponse
 
         from . import people as people_mod
         cfg, conn, _, _ = get_state()
-        people_mod.set_field(
-            conn, person_id,
-            email=email if email is not None else None,
-            role=role if role is not None else None,
-            company=company if company is not None else None,
-            birthday=birthday if birthday is not None else None,
-            notes=notes if notes is not None else None,
-        )
+        existing = people_mod.get_person(conn, person_id)
+        if existing is None:
+            return RedirectResponse(url="/people", status_code=303)
+        # Build kwargs only for fields that actually changed.
+        updates: dict[str, str] = {}
+        for field_name, submitted in (
+            ("email", email),
+            ("role", role),
+            ("company", company),
+            ("birthday", birthday),
+            ("notes", notes),
+        ):
+            current = getattr(existing, field_name, "") or ""
+            if (submitted or "") != current:
+                updates[field_name] = submitted
+        if updates:
+            people_mod.set_field(conn, person_id, **updates)
         return RedirectResponse(
             url=f"/person?id={person_id}", status_code=303,
         )
@@ -4897,10 +4944,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     def audit_view():
         """Round 10 (#6) — list every AI action with cost / status /
         summary. Lets the user answer "why did the AI do X?" without
-        reading source code."""
+        reading source code.
+
+        Round 11 fix (audit-found bug) — uses the writer conn, not
+        the read-only conn. ``ai_audit.recent`` calls ``_ensure_schema``
+        which runs ``CREATE TABLE IF NOT EXISTS`` + ``COMMIT`` — that
+        raises through a read-only conn on a brain old enough to lack
+        the ai_actions table. Same risk for ``health_checks.list_status``."""
         from . import ai_audit
 
-        cfg, conn, _, _ = get_read_state()
+        cfg, conn, _, _ = get_state()
         rows = ai_audit.recent(conn, limit=200)
         if not rows:
             body = (
@@ -5365,10 +5418,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     @app.get("/api/nav-counts")
     def api_nav_counts():
         """Pending-state counts for the primary nav badges. Cheap —
-        small reads against the read-only conn. Failures inside any
-        one count fall back to 0 so a missing schema (fresh brain)
-        doesn't break the nav."""
-        cfg, conn, _, _ = get_read_state()
+        small reads against the writer conn (round 11 fix: was
+        read-only, but several of the count helpers — ai_audit,
+        health_checks, email_drafts — call ``_ensure_schema`` which
+        writes). Failures inside any one count fall back to 0 so a
+        missing schema (fresh brain) doesn't break the nav."""
+        cfg, conn, _, _ = get_state()
         out = {
             "tasks": 0, "drafts": 0, "insights": 0, "thanks": 0,
             "urgent": {"drafts": False, "thanks": False},

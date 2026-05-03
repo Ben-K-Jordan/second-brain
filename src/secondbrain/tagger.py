@@ -61,19 +61,46 @@ def generate_tags(
     chunk_text: str,
     cfg: Config,
     model: str | None = None,
+    *,
+    conn=None,
+    file_id: int | None = None,
 ) -> list[str]:
     """Ask Claude for 1-3 tags. Returns [] if SDK / key missing or call fails.
 
     Tagging is best-effort — we never raise from here, since tagging is
     nice-to-have and shouldn't break a tag pass for a single bad chunk.
+
+    Round 11 (audit-found gap) — when ``conn`` is given, every call
+    writes one ``ai_actions`` row.
     """
+    def _audit(status: str, response_chars: int = 0,
+               cents: float = 0.0, error: str = ""):
+        if conn is None:
+            return
+        try:
+            from . import ai_audit
+            ai_audit.record_action(
+                conn, kind="tag", feature="tag",
+                model=model or cfg.tag_model,
+                status=status,
+                prompt_chars=len(chunk_text),
+                response_chars=response_chars,
+                cents=cents,
+                summary=f"tagged chunk (file_id={file_id})",
+                error=error, file_id=file_id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     if not chunk_text.strip():
         return []
     if not os.environ.get("ANTHROPIC_API_KEY"):
+        _audit("no_provider", error="ANTHROPIC_API_KEY not set")
         return []
     try:
         import anthropic
     except ImportError:
+        _audit("no_provider", error="anthropic SDK missing")
         return []
 
     # Round 10 (#4) — redact secret-shaped tokens before send. Tags
@@ -98,8 +125,9 @@ def generate_tags(
         text = "\n".join(b.text for b in response.content if b.type == "text")
         tags = _parse_tags(text)
         # Record cost (best-effort)
+        cents = 0.0
         try:
-            from .budget import record_usage
+            from .budget import estimate_cost, record_usage
             record_usage(
                 cfg, "anthropic", model,
                 input_tokens=response.usage.input_tokens
@@ -107,9 +135,17 @@ def generate_tags(
                 output_tokens=response.usage.output_tokens,
                 note="tag",
             )
+            cents = estimate_cost(
+                model,
+                input_tokens=response.usage.input_tokens
+                    + response.usage.cache_read_input_tokens,
+                output_tokens=response.usage.output_tokens,
+            ).cents
         except Exception:
             pass
+        _audit("success", response_chars=len(text), cents=cents)
         return tags
     except Exception as e:
         log.warning("tag generation failed: %s", e)
+        _audit("api_error", error=str(e)[:200])
         return []

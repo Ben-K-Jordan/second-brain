@@ -284,8 +284,28 @@ def stream_chat(
         return
 
     client = anthropic.Anthropic()
+
+    # Round 11 (audit-found gap) — redact the user's message + any
+    # history before sending to Anthropic. The chat surface is the
+    # highest-volume LLM path in the app and was the only LLM-using
+    # codepath that didn't get round-10 #4 prompt-side redaction.
+    # Tool-result snippets already redact via _format_search_result.
+    try:
+        from .safety import redact_text as _redact_chat
+    except ImportError:
+        def _redact_chat(s):
+            return s
+
     messages = _normalize_history(history)
-    messages.append({"role": "user", "content": user_message})
+    # Defensive: redact any historical user/assistant content that
+    # was persisted to chat_messages with secret-shaped substrings
+    # before the round-11 fix landed.
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = _redact_chat(c)
+    redacted_user_msg = _redact_chat(user_message)
+    messages.append({"role": "user", "content": redacted_user_msg})
 
     # Use the conversation-specific persona when provided. Default falls
     # back to the search-grounded brain prompt.
@@ -306,8 +326,10 @@ def stream_chat(
             surfaced_memory_ids = [m.id for m in relevant]
             memory_block = render_memories_for_prompt(relevant)
             if memory_block:
+                # Redact the memory block too — recalled memories may
+                # contain secrets the user pasted into a prior chat.
                 active_system_prompt = (
-                    f"{active_system_prompt}\n\n{memory_block}"
+                    f"{active_system_prompt}\n\n{_redact_chat(memory_block)}"
                 )
     except Exception as e:  # noqa: BLE001
         log.warning("memory: recall failed: %s", e)
@@ -382,6 +404,41 @@ def stream_chat(
             )
         except Exception as e:  # noqa: BLE001
             log.warning("chat usage recording failed: %s", e)
+
+        # Round 11 (audit-found gap) — chat is the highest-volume
+        # LLM surface and was the only one not writing ai_actions.
+        # One row per iteration so the user can see a tool-use loop
+        # as several "chat" actions in /audit.
+        try:
+            from . import ai_audit
+            from .budget import estimate_cost
+            in_tok = getattr(response.usage, "input_tokens", 0)
+            out_tok = getattr(response.usage, "output_tokens", 0)
+            try:
+                cents = estimate_cost(
+                    cfg.chat_model,
+                    input_tokens=in_tok, output_tokens=out_tok,
+                ).cents
+            except Exception:  # noqa: BLE001
+                cents = 0.0
+            ai_audit.record_action(
+                conn,
+                kind="chat", feature="chat",
+                model=cfg.chat_model, status="success",
+                prompt_chars=sum(
+                    len(m.get("content", "") or "")
+                    for m in messages
+                    if isinstance(m.get("content"), str)
+                ),
+                response_chars=in_tok * 4,  # rough approx for log scaling
+                cents=cents,
+                summary=(
+                    f"chat iter {iteration}: "
+                    f"{redacted_user_msg[:80]}"
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # Server-side web_search billing: each request to the tool costs
         # ~$0.01 regardless of result count. Anthropic exposes the count

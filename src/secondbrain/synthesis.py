@@ -225,7 +225,34 @@ def materialize_summary(
         result = generator(title, body, cfg)
     except Exception as e:  # noqa: BLE001
         log.warning("synthesis: summary generator crashed: %s", e)
+        # Round 11 (audit-found gap) — record failures too.
+        try:
+            from . import ai_audit
+            ai_audit.record_action(
+                conn, kind="summary", feature="summary",
+                model="claude-haiku-4-5", status="api_error",
+                file_id=file_id, error=str(e)[:200],
+                summary=f"summary failed for {title[:60]}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return None
+    # Round 11 — log the success/empty result. We don't know whether
+    # the generator used Anthropic or local LLM; the summary `tldr`
+    # length is a proxy for response_chars.
+    try:
+        from . import ai_audit
+        ai_audit.record_action(
+            conn, kind="summary", feature="summary",
+            model="claude-haiku-4-5",
+            status="success" if result.get("tldr") else "parse_error",
+            file_id=file_id,
+            prompt_chars=len(body),
+            response_chars=len(result.get("tldr") or ""),
+            summary=f"summary for {title[:60]}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     if not result:
         return None
     tldr = (result.get("tldr") or "").strip()[:500]
