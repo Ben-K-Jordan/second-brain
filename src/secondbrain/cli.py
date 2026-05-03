@@ -3001,6 +3001,12 @@ def doctor(
     else:
         console.print("\n[green]All checks passing.[/]")
     conn.close()
+    # Round 13 fix (audit-found bug) — exit non-zero when any check
+    # is failing so cron / CI / monitoring scripts can detect broken
+    # integrations. Previously always exited 0, making `doctor` useless
+    # in any wrapper that expected a real exit-code signal.
+    if n_failing:
+        raise typer.Exit(code=1)
 
 
 audit_app = typer.Typer(

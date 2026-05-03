@@ -314,8 +314,8 @@ def test_diagnostics_page_renders_without_crashing(
     client = TestClient(app)
     r = client.get("/health/system")
     assert r.status_code == 200
-    # Title in H1 should say "System health" or similar.
-    assert "ystem health" in r.text
+    # Title in H1 should say "Diagnostics" (round-13 rename).
+    assert "Diagnostics" in r.text
 
 
 # ============================ Tasks page recipient surface ===========

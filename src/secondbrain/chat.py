@@ -392,6 +392,26 @@ def stream_chat(
                 response = stream.get_final_message()
         except anthropic.APIError as e:
             log.warning("chat API call failed: %s", e)
+            # Round 13 fix (audit-found gap) — write a failure audit
+            # row before returning. Round 11 only audited successful
+            # iterations, so failed turns vanished from the log.
+            try:
+                from . import ai_audit
+                ai_audit.record_action(
+                    conn,
+                    kind="chat", feature="chat",
+                    model=cfg.chat_model, status="api_error",
+                    prompt_chars=sum(
+                        len(m.get("content", "") or "")
+                        for m in messages
+                        if isinstance(m.get("content"), str)
+                    ),
+                    response_chars=0, cents=0.0,
+                    summary=f"chat iter {iteration}: API error",
+                    error=str(e)[:300],
+                )
+            except Exception:  # noqa: BLE001
+                pass
             yield ChatTurnEvent("error", f"Anthropic API error: {e}")
             return
 
@@ -421,15 +441,27 @@ def stream_chat(
                 ).cents
             except Exception:  # noqa: BLE001
                 cents = 0.0
+            # Round 13 fix — count chars across both string content
+            # AND list-of-blocks content (tool_use / tool_result blocks).
+            # The previous round-11 version under-counted by ignoring
+            # list content, making large tool-result iterations look
+            # cheap in the audit signal.
+            prompt_chars = 0
+            for m in messages:
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    prompt_chars += len(c)
+                elif isinstance(c, list):
+                    for block in c:
+                        if isinstance(block, dict):
+                            prompt_chars += len(
+                                str(block.get("content") or "")
+                            ) + len(str(block.get("text") or ""))
             ai_audit.record_action(
                 conn,
                 kind="chat", feature="chat",
                 model=cfg.chat_model, status="success",
-                prompt_chars=sum(
-                    len(m.get("content", "") or "")
-                    for m in messages
-                    if isinstance(m.get("content"), str)
-                ),
+                prompt_chars=prompt_chars,
                 response_chars=in_tok * 4,  # rough approx for log scaling
                 cents=cents,
                 summary=(

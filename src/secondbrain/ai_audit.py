@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from dataclasses import dataclass, field
@@ -35,6 +36,19 @@ log = logging.getLogger(__name__)
 
 # Schema-init cache, mirrors email_assist.
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+# Round 13 fix (audit-found concurrency hazard) — every
+# ``record_action`` call commits its own row, but the writer conn
+# is shared across the daemon worker thread, dashboard worker
+# threads, and the MCP server thread. Without serialisation, an
+# audit ``commit()`` from thread A could commit another transaction
+# that thread B had open, surprise-flushing partial writes.
+#
+# This RLock serialises ``record_action``'s INSERT + commit so the
+# audit log can never accidentally flush an unrelated transaction.
+# Reentrant because future code might end up calling record_action
+# from within an audit-emitting LLM helper.
+_AUDIT_WRITE_LOCK = threading.RLock()
 
 # Default retention. 30 days of audit rows keeps the table small
 # (sub-MB) while preserving enough history for "why did this draft
@@ -127,28 +141,33 @@ def record_action(
     NEVER take down the calling LLM pipeline, so all errors are
     swallowed + logged at debug level.
 
+    Round 13 fix — guarded by ``_AUDIT_WRITE_LOCK`` so the per-row
+    commit can't accidentally flush an unrelated transaction
+    held by another thread on the shared writer conn.
+
     Returns the new row id, or 0 on failure."""
     try:
-        _ensure_schema(conn)
-        cur = conn.execute(
-            "INSERT INTO ai_actions"
-            "(ts, kind, feature, model, status, file_id, person_id, "
-            " draft_id, prompt_chars, response_chars, cents, summary, "
-            " error, extra_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "RETURNING id",
-            (
-                time.time(), kind, feature, model or "", status,
-                file_id, person_id, draft_id,
-                int(prompt_chars), int(response_chars), float(cents),
-                summary[:500] if summary else "",
-                error[:500] if error else "",
-                json.dumps(extra) if extra else None,
-            ),
-        )
-        row = cur.fetchone()
-        conn.commit()
-        return int(row["id"]) if row else 0
+        with _AUDIT_WRITE_LOCK:
+            _ensure_schema(conn)
+            cur = conn.execute(
+                "INSERT INTO ai_actions"
+                "(ts, kind, feature, model, status, file_id, person_id, "
+                " draft_id, prompt_chars, response_chars, cents, summary, "
+                " error, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "RETURNING id",
+                (
+                    time.time(), kind, feature, model or "", status,
+                    file_id, person_id, draft_id,
+                    int(prompt_chars), int(response_chars), float(cents),
+                    summary[:500] if summary else "",
+                    error[:500] if error else "",
+                    json.dumps(extra) if extra else None,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"]) if row else 0
     except Exception as e:  # noqa: BLE001
         log.debug("ai_audit: record failed: %s", e)
         return 0

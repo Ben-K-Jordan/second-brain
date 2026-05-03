@@ -1143,17 +1143,80 @@ _NAV_GROUPS = [
 ]
 
 
-def _layout(title: str, body: str, active: str = "") -> str:
+# Round 13 — module-level callback set by create_app() so _layout can
+# fetch initial badges (most importantly: stale health failures) at
+# render time without each route having to compute + pass them. The
+# JS fetch remains the live source; this just bridges the cold-load
+# gap so a broken integration is visible at first paint.
+_INITIAL_BADGES_FN: object | None = None
+
+
+def _layout(
+    title: str, body: str, active: str = "",
+    *, initial_badges: dict | None = None,
+) -> str:
+    """Render the page chrome.
+
+    Round 13 fix (audit-found cold-load gap) — ``initial_badges`` lets
+    routes pre-render badge state at first paint so a stale health
+    failure shows the urgent indicator immediately rather than waiting
+    on the /api/nav-counts JS fetch. Without this, JS-disabled or
+    slow-network users never saw the badge at all.
+
+    Routes that pass ``initial_badges=None`` (the default) get badges
+    computed via the module-level ``_INITIAL_BADGES_FN`` registered
+    by ``create_app``. Tests that import _layout standalone get
+    empty badges — same as the pre-round-13 behavior.
+
+    The dict shape mirrors /api/nav-counts.
+    """
+    if initial_badges is None and _INITIAL_BADGES_FN is not None:
+        try:
+            initial_badges = _INITIAL_BADGES_FN()  # type: ignore[operator]
+        except Exception:  # noqa: BLE001
+            initial_badges = None
+    badges = initial_badges or {}
+    urgent = badges.get("urgent", {}) if isinstance(badges, dict) else {}
+
+    def _badge_attrs(key: str) -> str:
+        n = badges.get(key, 0) if isinstance(badges, dict) else 0
+        if not isinstance(n, int) or n <= 0:
+            return ""
+        cls = "nav-badge has-count"
+        if urgent.get(key):
+            cls += " urgent"
+        return (
+            f' class="{cls}" data-badge="{key}" data-initial-count="{n}"'
+        )
+
     # Primary nav items — first slug after "/" is the active marker.
+    def _primary_badge(badge: str | None) -> str:
+        if not badge:
+            return ""
+        attrs = _badge_attrs(badge)
+        if attrs:
+            n = badges.get(badge, 0)
+            label = "99+" if n > 99 else str(n)
+            return f'<span{attrs}>{label}</span>'
+        return f'<span class="nav-badge" data-badge="{badge}"></span>'
+
     primary_html = "".join(
         f'<a href="{href}" '
         f'class="{"active" if href.split("/")[1] == active else ""}">'
-        f'{escape(name)}'
-        + (f'<span class="nav-badge" data-badge="{badge}"></span>'
-           if badge else "")
-        + '</a>'
+        f'{escape(name)}{_primary_badge(badge)}</a>'
         for name, href, badge in _PRIMARY_NAV
     )
+    # Health badge in the More dropdown — server-rendered when stale.
+    health_attrs = _badge_attrs("health")
+    if health_attrs:
+        n = badges.get("health", 0)
+        more_health_badge = (
+            f'<span{health_attrs}>{"99+" if n > 99 else n}</span>'
+        )
+    else:
+        more_health_badge = (
+            '<span class="nav-badge urgent" data-badge="health"></span>'
+        )
     # Overflow dropdown — grouped pages reached via "More ▾".
     more_html = "".join(
         '<div class="nav-more-group">'
@@ -1180,7 +1243,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         <nav>
             {primary_html}
             <details class="nav-more">
-                <summary>More ▾<span class="nav-badge urgent" data-badge="health"></span></summary>
+                <summary>More ▾{more_health_badge}</summary>
                 <div class="nav-more-pop">{more_html}</div>
             </details>
         </nav>
@@ -1610,6 +1673,36 @@ def create_app():
             state["cfg"], state["read_conn"],
             state["embedder"], state["reranker"],
         )
+
+    # Round 13 — register a server-render callback for nav badges so
+    # _layout can show the urgent health indicator at first paint
+    # (rather than waiting on the /api/nav-counts JS fetch). Cheap:
+    # one COUNT query per page render, gracefully degrades to empty
+    # on any error.
+    def _compute_initial_badges() -> dict:
+        out: dict = {
+            "tasks": 0, "drafts": 0, "insights": 0,
+            "thanks": 0, "health": 0,
+            "urgent": {"drafts": False, "thanks": False, "health": False},
+        }
+        try:
+            _, conn, _, _ = get_state()
+        except Exception:  # noqa: BLE001
+            return out
+        # Health stale count is the most important — it's why we
+        # added this. Count only; full state comes from the JS fetch.
+        try:
+            from . import health_checks
+            stale = health_checks.stale_failures(conn)
+            if stale:
+                out["health"] = len(stale)
+                out["urgent"]["health"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    global _INITIAL_BADGES_FN
+    _INITIAL_BADGES_FN = _compute_initial_badges
 
     # --- Routes ---
 
@@ -4279,6 +4372,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.post("/person/{person_id:int}/edit")
     def person_edit(
+        request: Request,
         person_id: int,
         email: str = Form(""),
         role: str = Form(""),
@@ -4308,6 +4402,21 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from fastapi.responses import RedirectResponse
 
         from . import people as people_mod
+
+        # Round 13 fix (audit-found bug) — same-origin guard. Every
+        # other state-mutating POST in dashboard.py has this; the
+        # round-10 #10 person_edit handler shipped without one. The
+        # browser-extension API allow-list (CORS) plus this missing
+        # guard left a CSRF hole reachable from a compromised
+        # extension page.
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        same_origin_prefixes = ("http://127.0.0.1", "http://localhost")
+        if not (
+            any(origin.startswith(p) for p in same_origin_prefixes)
+            or any(referer.startswith(p) for p in same_origin_prefixes)
+        ):
+            return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         existing = people_mod.get_person(conn, person_id)
         if existing is None:
@@ -4897,7 +5006,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 statuses = []
         if not statuses:
             body = (
-                "<h1>System health</h1>"
+                "<h1>Diagnostics</h1>"
                 "<div class='card'><p class='muted'>"
                 "No health checks have run yet. Run "
                 "<code>secondbrain doctor</code> in a terminal."
@@ -4933,7 +5042,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f"</div>",
             )
         body = (
-            "<h1>System health</h1>"
+            "<h1>Diagnostics</h1>"
             "<div class='card'><h2>Integrations</h2>"
             + "".join(items)
             + "</div>"

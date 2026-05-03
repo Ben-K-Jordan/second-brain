@@ -70,6 +70,9 @@ def test_person_edit_keeps_unchanged_fields_intact(
             "birthday": "1990-05-12",
             "notes": "great mentor",
         },
+        # Round 13 added a same-origin guard to /person/.../edit; pass
+        # a localhost referer so the POST clears it.
+        headers={"referer": "http://127.0.0.1:8765/person?id=" + str(pid)},
         follow_redirects=False,
     )
     assert r.status_code == 303
@@ -122,6 +125,9 @@ def test_person_edit_clears_field_when_form_blanks_it(
             "birthday": "",
             "notes": "",
         },
+        # Round 13 added a same-origin guard to /person/.../edit; pass
+        # a localhost referer so the POST clears it.
+        headers={"referer": "http://127.0.0.1:8765/person?id=" + str(pid)},
         follow_redirects=False,
     )
     assert r.status_code == 303

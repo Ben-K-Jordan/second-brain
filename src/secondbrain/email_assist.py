@@ -1263,23 +1263,11 @@ def _format_analysis_block(a: EmailAnalysis) -> str:
     )
 
 
-def _gather_style_samples(
-    conn: sqlite3.Connection, n: int = 3,
-) -> str:
-    """Pull a few recent ``Sent`` items as voice reference. Returns
-    one big string; empty when no Sent items have been ingested."""
-    rows = conn.execute(
-        "SELECT c.text FROM chunks c JOIN files f ON f.id = c.file_id "
-        "WHERE f.path LIKE 'imap://%' "
-        "  AND c.text LIKE '%Folder: Sent%' "
-        "ORDER BY f.indexed_at DESC LIMIT ?",
-        (n,),
-    ).fetchall()
-    if not rows:
-        return "(no recent sent mail indexed — defaulting to a neutral tone)"
-    return "\n\n---\n\n".join(
-        (r["text"] or "")[:1500] for r in rows
-    )
+# Round 13 — removed `_gather_style_samples`. It was the random-Sent-
+# items helper used by the round-5 single-call drafter (and by the
+# round-7 `_persist_legacy_draft` test path before that was deleted in
+# round 10 #7). All current call sites use `_select_style_samples_smart`
+# which scopes samples to the inferred sender relationship.
 
 
 def needs_draft(conn: sqlite3.Connection, file_id: int) -> bool:

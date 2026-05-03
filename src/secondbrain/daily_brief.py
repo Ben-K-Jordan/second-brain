@@ -785,8 +785,17 @@ def _open_action_items(conn: sqlite3.Connection) -> list[ActionItem]:
     Each item carries its task id + age in days so the rendered brief
     lets the user run ``tasks done <id>`` directly, and surfaces the
     "this has been open for 3 weeks" signal that nudges follow-through.
+
+    Round 13 fix (audit-found gap) — wrap the import + list_open call
+    in try/except. Every other section in this module degrades to an
+    empty list on failure; this one used to crash the entire brief
+    if e.g. the tasks schema migration raced.
     """
-    from . import tasks as tasks_mod
+    try:
+        from . import tasks as tasks_mod
+    except ImportError as e:
+        log.warning("daily brief: tasks module unavailable: %s", e)
+        return []
 
     # Idempotent — INSERT-OR-IGNORE per item, so this is safe to call
     # on every brief render.
@@ -798,7 +807,11 @@ def _open_action_items(conn: sqlite3.Connection) -> list[ActionItem]:
         # Materialisation is best-effort — a malformed chunk shouldn't
         # take down the whole brief.
         log.warning("daily brief: task materialisation failed: %s", e)
-    rows = tasks_mod.list_open(conn, limit=_ACTION_ITEM_MAX)
+    try:
+        rows = tasks_mod.list_open(conn, limit=_ACTION_ITEM_MAX)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: tasks list_open failed: %s", e)
+        return []
     now = time.time()
     out: list[ActionItem] = []
     for t in rows:
