@@ -110,7 +110,14 @@ class Task:
 
     ``source_path`` of ``'manual'`` means user-added (no back-reference);
     anything else is a virtual path that can be clicked back to the
-    originating doc."""
+    originating doc.
+
+    Round 9-C additions:
+      - ``recipient_person_id``: when extracted by the structured
+        promise extractor and matched to a known person.
+      - ``due_hint``: free-form deadline phrase ("Friday", "by EOD")
+        as the source said it. Distinct from ``due_at`` which is a
+        machine-parsed timestamp (future work)."""
     id: int
     text: str
     source_path: str
@@ -119,6 +126,8 @@ class Task:
     created_at: float
     completed_at: float | None
     due_at: float | None
+    recipient_person_id: int | None = None
+    due_hint: str = ""
 
 
 # ============================ extraction ==============================
@@ -368,6 +377,16 @@ def mark_many_done(
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:
+    # Round 9-C columns may not exist on legacy databases — guard
+    # the access so existing tests / older brains still hydrate.
+    try:
+        recipient_person_id = row["recipient_person_id"]
+    except (IndexError, KeyError):
+        recipient_person_id = None
+    try:
+        due_hint = row["due_hint"] or ""
+    except (IndexError, KeyError):
+        due_hint = ""
     return Task(
         id=int(row["id"]),
         text=row["text"],
@@ -377,6 +396,10 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         created_at=row["created_at"],
         completed_at=row["completed_at"],
         due_at=row["due_at"],
+        recipient_person_id=(
+            int(recipient_person_id) if recipient_person_id else None
+        ),
+        due_hint=due_hint,
     )
 
 
@@ -473,4 +496,224 @@ def format_task_line(task: Task) -> str:
     src = ""
     if task.source_path != "manual":
         src = f"  ({task.source_title})"
+    # Round 9-C — show recipient + due hint when populated.
+    extras = []
+    if task.due_hint:
+        extras.append(f"due: {task.due_hint}")
+    if extras:
+        src += "  [" + ", ".join(extras) + "]"
     return f"{head} {task.text}{src}"
+
+
+# ============================================================
+# Round 9-C — structured promise extractor.
+#
+# The regex extractor above catches `- [ ] foo` checkboxes. But
+# transcripts and emails contain plenty of natural-language
+# promises that never get formatted as bullets:
+#
+#   "I'll send you the design doc by Friday"
+#   "Let me know about the timeline"
+#   "I'll introduce you to Marcus"
+#
+# This extractor runs one Haiku call per new transcript and
+# returns structured promises with recipient + due_hint metadata
+# that get matched against the people table.
+# ============================================================
+
+_PROMISE_PROMPT = """\
+Below is a meeting transcript or email body. Extract any concrete
+PROMISES — things the user committed to do, send, follow up on,
+or get back to someone about.
+
+Output ONE JSON object — no prose, no Markdown fences:
+
+{{
+  "promises": [
+    {{
+      "text": "<short imperative restatement: 'send Sarah the design doc'>",
+      "recipient": "<name as mentioned, or empty string if no specific recipient>",
+      "due_hint": "<deadline phrase exactly as it appeared, or empty>"
+    }},
+    ...
+  ]
+}}
+
+Rules:
+- ONLY include things the USER committed to. Skip promises FROM
+  others ("Sarah said she'd send X" → not a user promise).
+- Skip vague pleasantries ("we should grab coffee sometime").
+- ``text`` must start with an action verb (send, draft, share,
+  follow up, schedule, etc.) and stay under 12 words.
+- Empty list is correct when there are no promises.
+
+TRANSCRIPT
+==========
+{body}
+"""
+
+
+def extract_promises_from_text(
+    text: str, cfg=None,
+) -> list[dict]:
+    """Round 9-C — one structured extraction call per chunk.
+
+    Returns a list of ``{text, recipient, due_hint}`` dicts. Empty
+    list when no promises detected (or LLM unavailable). Uses the
+    shared ``email_assist._llm_json_call`` helper for try-Anthropic-
+    then-local with the same budget guards.
+    """
+    if cfg is None:
+        return []
+    body = (text or "").strip()
+    if len(body) < 50:
+        return []
+    if len(body) > 6000:
+        body = body[:6000] + "…"
+    try:
+        from .email_assist import _llm_json_call
+    except ImportError:
+        return []
+    parsed = _llm_json_call(
+        prompt=_PROMISE_PROMPT.format(body=body),
+        cfg=cfg,
+        model="claude-haiku-4-5",
+        max_tokens=600,
+        feature="task_promises",
+        note="extract_promises",
+    )
+    if parsed is None:
+        return []
+    promises = parsed.get("promises") or []
+    if not isinstance(promises, list):
+        return []
+    out: list[dict] = []
+    for p in promises:
+        if not isinstance(p, dict):
+            continue
+        text_field = str(p.get("text") or "").strip()
+        if not text_field:
+            continue
+        out.append({
+            "text": text_field[:280],
+            "recipient": str(p.get("recipient") or "").strip()[:80],
+            "due_hint": str(p.get("due_hint") or "").strip()[:80],
+        })
+    return out
+
+
+def _ensure_promise_state_table(conn: sqlite3.Connection) -> None:
+    """Track which files we've already extracted promises from so
+    daemon ticks don't re-spend on the same chunks."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS task_promise_runs (
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            ran_at REAL NOT NULL,
+            n_promises INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.commit()
+
+
+def _ensure_round9c_columns(conn: sqlite3.Connection) -> None:
+    """Lazy ALTER ADD COLUMN for round-9-C task fields. Mirrors the
+    pattern used in email_assist for metadata_json — duplicate-column
+    error means already migrated; anything else gets logged."""
+    for col, ddl in (
+        ("recipient_person_id", "ALTER TABLE tasks ADD COLUMN recipient_person_id INTEGER"),
+        ("due_hint", "ALTER TABLE tasks ADD COLUMN due_hint TEXT NOT NULL DEFAULT ''"),
+    ):
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                log.debug("tasks: ALTER add %s skipped: %s", col, e)
+
+
+def materialize_promises_from_transcripts(
+    conn: sqlite3.Connection, cfg,
+    *,
+    lookback_days: int = _DEFAULT_LOOKBACK_DAYS,
+    max_per_run: int = 5,
+) -> int:
+    """Round 9-C daemon hook — for each new transcript not yet
+    promise-extracted, run the LLM extractor + insert tasks with
+    matched recipient + due hint.
+
+    Bounded by ``max_per_run`` to keep per-tick cost predictable
+    (each call is one Haiku invocation on a multi-KB transcript).
+    """
+    _ensure_promise_state_table(conn)
+    _ensure_round9c_columns(conn)
+    cutoff = time.time() - lookback_days * 86400
+    # Find recent transcripts we haven't extracted from yet.
+    rows = conn.execute(
+        "SELECT f.id, f.path FROM files f "
+        "LEFT JOIN task_promise_runs tpr ON tpr.file_id = f.id "
+        "WHERE f.path LIKE 'transcript://%' "
+        "  AND f.indexed_at >= ? "
+        "  AND tpr.file_id IS NULL "
+        "ORDER BY f.indexed_at DESC LIMIT ?",
+        (cutoff, max_per_run),
+    ).fetchall()
+    if not rows:
+        return 0
+    n_total = 0
+    try:
+        from . import people as people_mod
+    except ImportError:
+        people_mod = None
+    for r in rows:
+        fid = int(r["id"])
+        path = r["path"]
+        body_rows = conn.execute(
+            "SELECT text FROM chunks WHERE file_id = ? "
+            "ORDER BY chunk_index ASC",
+            (fid,),
+        ).fetchall()
+        body = "\n\n".join((br["text"] or "") for br in body_rows)
+        title = _doc_title(conn, fid, path)
+        promises = extract_promises_from_text(body, cfg)
+        n_for_doc = 0
+        for p in promises:
+            text = p["text"]
+            recipient = p.get("recipient", "")
+            due_hint = p.get("due_hint", "")
+            recipient_id: int | None = None
+            if recipient and people_mod is not None:
+                match = people_mod.find_by_alias(conn, recipient)
+                if match is not None:
+                    recipient_id = match.id
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO tasks"
+                    "(text, text_lower, source_path, source_title, "
+                    " status, created_at, recipient_person_id, due_hint) "
+                    "VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+                    (
+                        text, text.lower(), path,
+                        title or path, time.time(),
+                        recipient_id, due_hint,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    n_for_doc += 1
+            except sqlite3.IntegrityError:
+                pass
+        # Mark this file as extracted regardless of how many promises
+        # came back — we don't want to retry zero-promise transcripts
+        # on every tick.
+        conn.execute(
+            "INSERT OR REPLACE INTO task_promise_runs"
+            "(file_id, ran_at, n_promises) VALUES (?, ?, ?)",
+            (fid, time.time(), n_for_doc),
+        )
+        n_total += n_for_doc
+    conn.commit()
+    if n_total:
+        log.info(
+            "tasks: extracted %d structured promise(s) "
+            "from %d transcript(s)", n_total, len(rows),
+        )
+    return n_total

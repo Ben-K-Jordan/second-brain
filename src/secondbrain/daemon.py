@@ -496,6 +496,29 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _process_thanks(conn, cfg),
     ))
 
+    # Round 9-A — pre-fetch meeting prep for the next 24h so the
+    # CLI / dashboard / brief reads are instant. 30min interval
+    # matches the prep cache TTL.
+    from .meeting_prep import prefetch_upcoming as _prefetch_prep
+    sched.register(Job(
+        name="meeting_prep_prefetch",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda cfg, conn: _prefetch_prep(conn, cfg),
+    ))
+
+    # Round 9-C — structured promise extractor. Catches natural-
+    # language commitments ("I'll send Sarah the design doc by
+    # Friday") that the regex-based materializer misses. Capped at
+    # 5 transcripts per tick because each is one Haiku call.
+    from .tasks import (
+        materialize_promises_from_transcripts as _extract_promises,
+    )
+    sched.register(Job(
+        name="task_promises",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _extract_promises(conn, cfg),
+    ))
+
     return sched
 
 

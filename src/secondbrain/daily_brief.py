@@ -261,6 +261,13 @@ class DailyBrief:
     # Lightweight "nudge" flags — surfaced as one-line reminders.
     weekly_review_due: bool = False  # Phase 72
     snapshot_due: bool = False       # Phase 87
+    # Round 9-B — stale connections worth reaching back out to.
+    # Free-form list[StaleConnection]; rendered by connections module.
+    stale_connections: list = field(default_factory=list)
+    # Round 9-A — upcoming external meetings within the brief window
+    # that have brain-grounded prep available. Free-form so we don't
+    # need to import meeting_prep types here.
+    upcoming_preps: list = field(default_factory=list)
 
 
 @dataclass
@@ -301,6 +308,8 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         recent_annotations=_recent_annotations_section(conn),
         weekly_review_due=_weekly_review_due(conn),
         snapshot_due=_snapshot_due(conn),
+        stale_connections=_stale_connections_section(conn),
+        upcoming_preps=_upcoming_preps_section(cfg, conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -573,6 +582,31 @@ def _recent_annotations_section(
         )
         for r in rows
     ]
+
+
+def _stale_connections_section(conn: sqlite3.Connection) -> list:
+    """Round 9-B hookup — surface a few stale connections worth
+    reaching back out to. Empty list when no candidates clear the
+    threshold."""
+    try:
+        from . import connections
+        return connections.find_stale_connections(conn, limit=4)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: stale connections failed: %s", e)
+        return []
+
+
+def _upcoming_preps_section(cfg, conn: sqlite3.Connection) -> list:
+    """Round 9-A hookup — pull prep for today's upcoming external
+    meetings. Cached by meeting_prep so this is cheap."""
+    try:
+        from . import meeting_prep
+        return meeting_prep.upcoming_preps(
+            conn, cfg, lookahead_seconds=24 * 3600,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: upcoming preps failed: %s", e)
+        return []
 
 
 def _weekly_review_due(conn: sqlite3.Connection) -> bool:
@@ -1020,6 +1054,11 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_birthdays(brief.birthdays)
     if brief.today_events:
         yield _render_events(brief.today_events)
+    if brief.upcoming_preps:
+        # Round 9-A — meeting prep block right after the calendar.
+        block = _render_upcoming_preps(brief.upcoming_preps)
+        if block:
+            yield block
     if brief.assignments_due_soon:
         yield _render_assignments(brief.assignments_due_soon)
     if brief.open_action_items:
@@ -1046,6 +1085,15 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_yesterday_done(brief.yesterday_done)
     if brief.recent_annotations:
         yield _render_annotations(brief.recent_annotations)
+    if brief.stale_connections:
+        # Round 9-B — quiet-day-ish surface; no urgency, just a nudge.
+        try:
+            from . import connections as _conn_mod
+            block = _conn_mod.render_stale_block(brief.stale_connections)
+            if block:
+                yield block
+        except Exception as e:  # noqa: BLE001
+            log.warning("daily brief: stale render failed: %s", e)
     nudge_block = _render_nudges(brief)
     if nudge_block:
         yield nudge_block
@@ -1195,6 +1243,33 @@ def _render_email(email: EmailTriageLine, n_drafts: int) -> str:
             f"- ✉️ **{n_drafts} draft(s) awaiting review** "
             f"_(`secondbrain drafts list`)_",
         )
+    return "\n".join(out)
+
+
+def _render_upcoming_preps(items: list) -> str:
+    """Round 9-A — compact meeting-prep block for the morning brief.
+
+    One line per upcoming meeting with a count of attendees + the
+    most-stale relationship (so the user sees 'haven't seen Sarah in
+    4 months' as a glance-able cue). Full prep lives at /prep."""
+    if not items:
+        return ""
+    out = ["## Upcoming meetings — prep ready", ""]
+    for p in items[:5]:
+        bits = [p.when_str]
+        if p.attendees:
+            bits.append(f"{len(p.attendees)} ext")
+            # Surface the most-stale attendee as the headline.
+            stalest = max(p.attendees, key=lambda a: a.days_since_seen)
+            if stalest.days_since_seen >= 30:
+                months = stalest.days_since_seen // 30
+                if months >= 1:
+                    bits.append(f"{stalest.name} {months}mo")
+        out.append(
+            f"- **{_safe(p.title)}** _({' · '.join(bits)})_  ",
+        )
+    out.append("")
+    out.append("_Full prep at `/prep`._")
     return "\n".join(out)
 
 

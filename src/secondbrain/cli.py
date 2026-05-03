@@ -2948,6 +2948,86 @@ def thanks_draft(
     conn.close()
 
 
+prep_app = typer.Typer(
+    no_args_is_help=False, invoke_without_command=True,
+    help="Round 9-A — brain-grounded prep for upcoming external "
+         "meetings. Bare invocation lists upcoming meetings with "
+         "attendee context; `<event-id>` shows the full prep.",
+)
+app.add_typer(prep_app, name="prep")
+
+
+@prep_app.callback(invoke_without_command=True)
+def _prep_root(ctx: typer.Context) -> None:
+    """List upcoming external meetings + their prep digest."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from . import meeting_prep
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    preps = meeting_prep.upcoming_preps(conn, cfg)
+    if not preps:
+        console.print(
+            "[dim]No upcoming external meetings in the next 24h.[/]",
+        )
+        conn.close()
+        return
+    for p in preps:
+        console.print(
+            f"\n[bold cyan]{p.title}[/] [dim]({p.when_str}, "
+            f"{p.duration_minutes}min)[/]",
+        )
+        if not p.attendees:
+            continue
+        for a in p.attendees:
+            stale = (
+                f" · {a.days_since_seen}d since last seen"
+                if a.days_since_seen else ""
+            )
+            console.print(
+                f"  [bold]{a.name}[/] [dim]<{a.email}>{stale}[/]",
+            )
+            if a.open_task_lines:
+                for t in a.open_task_lines[:3]:
+                    console.print(f"    [yellow]·[/] {t}")
+            if a.co_topics:
+                console.print(
+                    f"    [dim]topics: {', '.join(a.co_topics[:5])}[/]",
+                )
+    console.print(
+        "\n[dim]Run `secondbrain prep show <event-id>` for the full "
+        "prep doc.[/]",
+    )
+    conn.close()
+
+
+@prep_app.command("show")
+def prep_show(
+    event_id: str = typer.Argument(
+        ..., help="Event id from `secondbrain prep` listing.",
+    ),
+) -> None:
+    """Render the full prep markdown for one specific meeting."""
+    from rich.markdown import Markdown
+
+    from . import meeting_prep
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    preps = meeting_prep.upcoming_preps(conn, cfg)
+    match = next((p for p in preps if p.event_id == event_id), None)
+    if match is None:
+        console.print(
+            f"[red]No upcoming meeting with id {event_id!r}.[/]",
+        )
+        conn.close()
+        raise typer.Exit(code=1) from None
+    md = meeting_prep.render_prep_markdown(match)
+    console.print(Markdown(md))
+    conn.close()
+
+
 study_app = typer.Typer(
     no_args_is_help=True,
     help="Phase 67 study mode. Flashcards generated from class "
@@ -3716,6 +3796,57 @@ def people_alias(
         console.print(f"[green]✓[/] Added alias [bold]{alias}[/]")
     else:
         console.print("[yellow]Alias already exists.[/]")
+    conn.close()
+
+
+@people_app.command("stale")
+def people_stale(
+    limit: int = typer.Option(10, "--limit", "-n"),
+    min_age_days: int = typer.Option(
+        60, "--min-age",
+        help="Minimum days of silence before someone is 'stale'.",
+    ),
+) -> None:
+    """Round 9-B — list folks worth reaching back out to.
+
+    Ranks by past relationship strength (mention_count) weighted by
+    how long it's been since you last interacted."""
+    from . import connections
+
+    cfg = load_config()
+    conn, _ = _open_state(cfg)
+    rows = connections.find_stale_connections(
+        conn, limit=limit, min_age_days=min_age_days,
+    )
+    if not rows:
+        console.print(
+            "[dim]No stale connections — everyone's been seen recently, "
+            "or no people have crossed the prior-mention threshold.[/]",
+        )
+        conn.close()
+        return
+    table = Table(show_header=True, box=None, title="Stale connections")
+    table.add_column("id", style="dim", width=4)
+    table.add_column("name")
+    table.add_column("last seen", style="dim")
+    table.add_column("mentions", justify="right")
+    table.add_column("role/co", style="dim")
+    for c in rows:
+        when = (
+            f"{c.months_since_seen}mo"
+            if c.months_since_seen >= 1
+            else f"{c.days_since_seen}d"
+        )
+        meta_bits = []
+        if c.role:
+            meta_bits.append(c.role)
+        if c.company:
+            meta_bits.append(f"@ {c.company}")
+        table.add_row(
+            str(c.person_id), c.name, when,
+            str(c.mention_count), " ".join(meta_bits),
+        )
+    console.print(table)
     conn.close()
 
 

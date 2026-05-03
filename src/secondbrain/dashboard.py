@@ -899,6 +899,7 @@ PALETTE_JS = r"""
         {kind: 'page', icon: '✓', label: 'Tasks',      href: '/tasks',         meta: ''},
         {kind: 'page', icon: '✉', label: 'Drafts',     href: '/drafts',        meta: 'email'},
         {kind: 'page', icon: '🤝', label: 'Thanks',     href: '/thanks',        meta: 'meeting follow-up'},
+        {kind: 'page', icon: '📋', label: 'Prep',       href: '/prep',          meta: 'upcoming meeting prep'},
         {kind: 'page', icon: '!', label: 'Insights',   href: '/insights',      meta: ''},
         {kind: 'page', icon: '◇', label: 'Habits',     href: '/habits',        meta: ''},
         {kind: 'page', icon: '✎', label: 'Journal',    href: '/journal',       meta: ''},
@@ -1103,6 +1104,7 @@ _NAV_GROUPS = [
         ("Entities",  "/entities"),
     ]),
     ("Sources", [
+        ("Prep",       "/prep"),
         ("Watch",      "/watch"),
         ("Queue",      "/queue"),
         ("Apps",       "/applications"),
@@ -1666,6 +1668,7 @@ def create_app():
                 ("Folders",   "/folders",       None),
             ]),
             ("Sources & system", [
+                ("Prep",      "/prep",          None),
                 ("Watch",     "/watch",         None),
                 ("Queue",     "/queue",         None),
                 ("Apps",      "/applications",  None),
@@ -4063,6 +4066,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/people", response_class=HTMLResponse)
     def people_view():
+        from . import connections
         from . import people as people_mod
 
         cfg, conn, _, _ = get_read_state()
@@ -4078,6 +4082,29 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             )
             return HTMLResponse(_layout("People", body, "people"))
         now = time.time()
+
+        # Round 9-B — stale connections at the top of the page.
+        stale = connections.find_stale_connections(conn, limit=8)
+        stale_html = ""
+        if stale:
+            stale_items = "".join(
+                f'<div class="stat">'
+                f'<span><a href="/person?id={c.person_id}">'
+                f'{escape(c.name)}</a> '
+                f'<span class="muted">{escape(c.email or "")}</span></span>'
+                f'<span class="v muted">'
+                f'{c.mention_count} mentions · '
+                f'{c.months_since_seen}mo since seen'
+                f'</span></div>'
+                for c in stale
+            )
+            stale_html = (
+                "<div class='card' style='margin-bottom:16px;"
+                "border-color:var(--amber);'>"
+                "<h2>Worth reaching back out</h2>"
+                f"{stale_items}</div>"
+            )
+
         items_html = "".join(
             f'<div class="stat">'
             f'<span><a href="/person?id={p.id}">{escape(p.display_name)}</a> '
@@ -4089,7 +4116,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             for p in rows
         )
         body = (
-            f"<h1>People</h1><div class='card'>"
+            f"<h1>People</h1>{stale_html}<div class='card'>"
             f"<h2>Recent ({len(rows)})</h2>{items_html}</div>"
         )
         return HTMLResponse(_layout("People", body, "people"))
@@ -4680,6 +4707,115 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         cfg, conn, _, _ = get_state()
         meeting_thanks.generate_thanks_draft(conn, cfg, mt_id)
         return RedirectResponse(url="/drafts", status_code=303)
+
+    # --- Round 9-A: meeting prep page ---------------------------------
+
+    @app.get("/prep", response_class=HTMLResponse)
+    def prep_view():
+        """List upcoming external meetings with brain-grounded prep.
+
+        Each meeting card shows attendee names + days-since-seen
+        + open tasks involving them + topics that come up. Click
+        through for the full markdown prep doc."""
+        from . import meeting_prep
+        from .safety import redact_text as _redact
+
+        cfg, conn, _, _ = get_state()
+        try:
+            preps = meeting_prep.upcoming_preps(conn, cfg)
+        except Exception:  # noqa: BLE001
+            # Calendar fetch / OAuth issues become an empty list; the
+            # page renders the friendly "no upcoming" fallback below.
+            preps = []
+        if not preps:
+            body = (
+                "<h1>Upcoming meetings — prep</h1>"
+                "<div class='card'><p class='muted'>"
+                "No upcoming external meetings in the next 24h. "
+                "(Or your calendar isn't connected — see the "
+                "<code>secondbrain auth google</code> docs.)"
+                "</p></div>"
+            )
+            return HTMLResponse(_layout("Prep", body, "prep"))
+
+        items: list[str] = []
+        for p in preps:
+            attendee_blocks = []
+            for a in p.attendees:
+                meta_bits: list[str] = []
+                if a.days_since_seen:
+                    meta_bits.append(f"{a.days_since_seen}d since seen")
+                if a.n_prior_emails:
+                    meta_bits.append(f"{a.n_prior_emails} prior email(s)")
+                if a.n_open_tasks:
+                    meta_bits.append(f"{a.n_open_tasks} open task(s)")
+                meta_html = ""
+                if meta_bits:
+                    meta_html = (
+                        f"<div class='muted' style='font-size:11px;"
+                        f"margin-top:2px;'>"
+                        f"{escape(' · '.join(meta_bits))}</div>"
+                    )
+                tasks_html = ""
+                if a.open_task_lines:
+                    items_html = "".join(
+                        f"<li>{escape(_redact(t))}</li>"
+                        for t in a.open_task_lines[:5]
+                    )
+                    tasks_html = (
+                        "<details style='margin-top:6px;font-size:12px;'>"
+                        "<summary class='muted'>Open with this person</summary>"
+                        f"<ul style='margin:4px 0 0 0;'>{items_html}</ul>"
+                        "</details>"
+                    )
+                topics_html = ""
+                if a.co_topics:
+                    topics_html = (
+                        f"<div class='muted' style='font-size:12px;"
+                        f"margin-top:6px;'>topics: "
+                        f"{escape(', '.join(a.co_topics[:6]))}</div>"
+                    )
+                first_time = (
+                    a.days_since_seen == 0
+                    and a.n_prior_emails == 0
+                    and a.n_open_tasks == 0
+                )
+                first_html = ""
+                if first_time:
+                    first_html = (
+                        "<div class='muted' style='font-size:12px;"
+                        "margin-top:4px;'>First time you're seeing "
+                        "this person in your brain.</div>"
+                    )
+                attendee_blocks.append(
+                    f"<div style='margin-top:10px;'>"
+                    f"<strong>{escape(_redact(a.name))}</strong> "
+                    f"<span class='muted'>&lt;{escape(a.email)}&gt;</span>"
+                    f"{meta_html}"
+                    f"{first_html}"
+                    f"{tasks_html}"
+                    f"{topics_html}"
+                    f"</div>",
+                )
+            duration = (
+                f"{p.duration_minutes} min" if p.duration_minutes else ""
+            )
+            location = f" · {escape(p.location)}" if p.location else ""
+            items.append(
+                f"<div class='card' style='margin-bottom:12px;'>"
+                f"<div class='stat' style='border-bottom:none;padding-bottom:0;'>"
+                f"<strong>{escape(_redact(p.title))}</strong>"
+                f"<span class='v muted'>{escape(p.when_str)} · "
+                f"{escape(duration)}{location}</span>"
+                f"</div>"
+                + "".join(attendee_blocks)
+                + "</div>",
+            )
+        body = (
+            f"<h1>Upcoming meetings — prep ({len(preps)})</h1>"
+            + "".join(items)
+        )
+        return HTMLResponse(_layout("Prep", body, "prep"))
 
     # --- Browser extension API ----------------------------------------
     # These endpoints are consumed by the multi-AI bridge browser

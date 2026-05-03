@@ -349,6 +349,150 @@ def profile_for(
     )
 
 
+# ---- Full context (round 9 shared helper) ----------------------------
+
+@dataclass
+class PersonContext:
+    """Everything the brain knows about a person, in one shape.
+
+    Powers meeting prep (round 9-A), stale-connection detection
+    (round 9-B), and recipient-matching for the structured task
+    extractor (round 9-C). Each field is best-effort: missing
+    schemas (fresh brain, no email indexed yet) just yield empty
+    lists, never raise.
+    """
+    person: Person
+    aliases: list[str]
+    days_since_seen: int
+    days_since_first_seen: int
+    # Recent docs that mention them (limit ~10).
+    recent_mentions: list[MentionRow]
+    # Email files where they appear as From: (limit ~5). Path strings
+    # so callers can hydrate via the existing search infra.
+    prior_emails: list[tuple[str, float]]   # [(path, mtime), ...]
+    # Open tasks whose text or source mentions this person (limit ~10).
+    open_tasks: list[tuple[int, str]]       # [(task_id, text), ...]
+    # Top entities co-occurring in their mention chunks — proxy for
+    # "topics this person cares about / is associated with".
+    co_topics: list[tuple[str, int]]        # [(entity_text, count), ...]
+
+
+def gather_full_context(
+    conn: sqlite3.Connection, person_id: int,
+    *,
+    n_mentions: int = 10,
+    n_emails: int = 5,
+    n_tasks: int = 10,
+    n_topics: int = 8,
+) -> PersonContext | None:
+    """Round 9 — pull everything we know about a person into one
+    structured shape. Each query is independently best-effort so a
+    missing schema doesn't cascade.
+
+    The output is intentionally retrieval-only (no LLM calls). Callers
+    that want a polished prose render layer it on top with their own
+    prompt.
+    """
+    p = get_person(conn, person_id)
+    if p is None:
+        return None
+    now = time.time()
+    aliases = get_aliases(conn, person_id)
+
+    # Recent mentions — already a public helper, just reuse.
+    mentions = recent_mentions(conn, person_id, limit=n_mentions)
+
+    # Prior emails: any email file whose first chunk has 'From: <name>'
+    # or 'From: <email>'. We match aliases case-insensitively.
+    prior_emails: list[tuple[str, float]] = []
+    if aliases:
+        like_clauses = " OR ".join(
+            "LOWER(c.text) LIKE ?" for _ in aliases
+        )
+        params: list = []
+        for alias in aliases:
+            params.append(f"%from:%{alias.lower()}%")
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT f.path, f.mtime FROM files f "
+                "JOIN chunks c ON c.file_id = f.id "
+                f"WHERE c.chunk_index = 0 AND ({like_clauses}) "
+                "  AND (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+                "ORDER BY f.mtime DESC LIMIT ?",
+                [*params, n_emails],
+            ).fetchall()
+            prior_emails = [(r["path"], float(r["mtime"])) for r in rows]
+        except sqlite3.OperationalError:
+            # Email tables not present yet on a fresh brain — fine.
+            prior_emails = []
+
+    # Open tasks mentioning the person. We match against task text +
+    # source_title. No FK by person_id (the round-9-C extractor adds
+    # that), so substring-match on aliases is the heuristic.
+    open_tasks: list[tuple[int, str]] = []
+    if aliases:
+        try:
+            like_clauses = " OR ".join(
+                "LOWER(text) LIKE ? OR LOWER(source_title) LIKE ?"
+                for _ in aliases
+            )
+            params = []
+            for alias in aliases:
+                params.extend([f"%{alias.lower()}%", f"%{alias.lower()}%"])
+            rows = conn.execute(
+                "SELECT id, text FROM tasks "
+                "WHERE status = 'open' "
+                f"  AND ({like_clauses}) "
+                "ORDER BY created_at DESC LIMIT ?",
+                [*params, n_tasks],
+            ).fetchall()
+            open_tasks = [(int(r["id"]), r["text"]) for r in rows]
+        except sqlite3.OperationalError:
+            open_tasks = []
+
+    # Co-occurring topics: entities that show up in chunks where
+    # this person is mentioned. Cheap signal for "what do we usually
+    # talk about with them."
+    co_topics: list[tuple[str, int]] = []
+    try:
+        rows = conn.execute(
+            "SELECT e.text, COUNT(*) AS n FROM entities e "
+            "JOIN person_mentions pm ON pm.chunk_id = e.chunk_id "
+            "WHERE pm.person_id = ? "
+            "  AND e.label IN ('ORG', 'PRODUCT', 'WORK_OF_ART', 'EVENT') "
+            "GROUP BY e.text_lower ORDER BY n DESC LIMIT ?",
+            (person_id, n_topics),
+        ).fetchall()
+        co_topics = [(r["text"], int(r["n"])) for r in rows]
+    except sqlite3.OperationalError:
+        co_topics = []
+
+    return PersonContext(
+        person=p,
+        aliases=aliases,
+        days_since_seen=max(0, int((now - p.last_seen_at) // 86400)),
+        days_since_first_seen=max(
+            0, int((now - p.first_seen_at) // 86400),
+        ),
+        recent_mentions=mentions,
+        prior_emails=prior_emails,
+        open_tasks=open_tasks,
+        co_topics=co_topics,
+    )
+
+
+def gather_full_context_by_alias(
+    conn: sqlite3.Connection, name_or_email: str,
+) -> PersonContext | None:
+    """Convenience wrapper — accepts a name / alias / email and
+    resolves to a person_id before pulling context. Returns None
+    when the alias doesn't map to anyone."""
+    p = find_by_alias(conn, name_or_email)
+    if p is None:
+        return None
+    return gather_full_context(conn, p.id)
+
+
 # ============================ profile edits ===========================
 
 def set_field(
