@@ -180,10 +180,19 @@ def check_local_llm(cfg: Config) -> tuple[bool, str, dict]:
     return True, "", {"models": models[:10]}
 
 
-def check_imap(cfg: Config) -> tuple[bool, str, dict]:
-    """Best-effort IMAP credential check. Returns ok=True with an
-    'unconfigured' error string when no host is set — caller treats
-    'unconfigured' as not-broken."""
+def check_imap(
+    cfg: Config, *, network: bool = False,
+) -> tuple[bool, str, dict]:
+    """Round 11 — IMAP credential check. Shape-only by default
+    (verifies host / user / password env-var are all set) so the
+    hourly daemon doesn't write a login attempt to the IMAP
+    server's auth logs every cycle.
+
+    ``network=True`` does the real login; used by ``secondbrain
+    doctor`` for ad-hoc triage. The hourly daemon job uses the
+    cheap shape-check to detect "user changed app password and
+    forgot to update env var" without spamming the server.
+    """
     import os
     host = (getattr(cfg, "imap_host", "") or "").strip()
     user = (getattr(cfg, "imap_username", "") or "").strip()
@@ -196,6 +205,13 @@ def check_imap(cfg: Config) -> tuple[bool, str, dict]:
         return False, (
             "SECONDBRAIN_IMAP_PASSWORD env var not set"
         ), {"configured": True}
+    if not network:
+        # Shape-only path: all three are set, assume good. The next
+        # IMAP sync (which does its own login) will surface a real
+        # auth failure via the connector's error path if creds are bad.
+        return True, "", {
+            "host": host, "user": user, "verified": "shape-only",
+        }
     try:
         import imaplib
         with imaplib.IMAP4_SSL(host, getattr(cfg, "imap_port", 993),
@@ -203,7 +219,7 @@ def check_imap(cfg: Config) -> tuple[bool, str, dict]:
             M.login(user, pwd)
     except Exception as e:  # noqa: BLE001
         return False, f"imap login failed: {type(e).__name__}: {e}", {}
-    return True, "", {"host": host, "user": user}
+    return True, "", {"host": host, "user": user, "verified": "live-login"}
 
 
 def check_watched_folders(cfg: Config) -> tuple[bool, str, dict]:
@@ -237,14 +253,25 @@ _CHECKS: dict = {
 
 def run_all(
     conn: sqlite3.Connection, cfg: Config,
+    *, network: bool = False,
 ) -> dict[str, HealthStatus]:
     """Run every registered check + persist results. Returns the
-    full status dict."""
+    full status dict.
+
+    ``network=True`` opts into checks that make real network calls
+    (currently: live IMAP login). Used by ``secondbrain doctor``
+    for ad-hoc triage but NOT by the hourly daemon job — that runs
+    shape-only to avoid auth-log spam on the IMAP server.
+    """
     _ensure_schema(conn)
     out: dict[str, HealthStatus] = {}
     for name, fn in _CHECKS.items():
         try:
-            ok, err, extra = fn(cfg)
+            # Pass network kwarg only to checks that accept it.
+            try:
+                ok, err, extra = fn(cfg, network=network)
+            except TypeError:
+                ok, err, extra = fn(cfg)
         except Exception as e:  # noqa: BLE001
             ok, err, extra = False, f"check raised: {e}", {}
         _persist(conn, name=name, ok=ok, error=err, extra=extra)

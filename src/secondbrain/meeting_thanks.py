@@ -614,13 +614,12 @@ def generate_thanks_draft(
     # the inbox replies.
     from . import email_assist
 
-    voice_profile = email_assist.get_voice_profile(conn)
-    voice_block = (
-        email_assist._format_voice_profile_block(voice_profile)
-        if voice_profile is not None
-        else "(no voice profile yet — fall back to general rules: "
-             "warm but concise, match the inferred tone)"
-    )
+    # Round 11 — use the curated bootstrap profile when no real one
+    # exists yet (mirrors the round-10 #5 fix in email_assist).
+    # Otherwise thank-you drafts on a fresh install would drop to
+    # generic-LLM voice — exactly what the round-7 work tried to kill.
+    voice_profile = email_assist.get_voice_profile_or_default(conn)
+    voice_block = email_assist._format_voice_profile_block(voice_profile)
     embedder = None
     try:
         from .embedder import make_embedder
@@ -689,8 +688,15 @@ def generate_thanks_draft(
     # Voice critique loop — only when a profile exists. Mirrors the
     # email_assist behaviour so thank-you drafts get the same
     # voice-fidelity guarantees.
+    # Skip critique against the bootstrap profile (n_samples=0) —
+    # nothing user-specific to grade against, same logic as
+    # email_assist.generate_draft.
     critique_text = ""
-    if voice_profile is not None and primary:
+    if (
+        voice_profile is not None
+        and voice_profile.n_samples > 0
+        and primary
+    ):
         critique_text = email_assist.critique_draft_against_voice(
             draft=primary, profile=voice_profile, cfg=cfg,
             conn=conn,

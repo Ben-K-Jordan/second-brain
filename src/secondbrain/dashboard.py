@@ -1113,12 +1113,12 @@ _NAV_GROUPS = [
         ("Daily",      "/briefing"),
     ]),
     ("System", [
-        ("Overview",  "/"),
-        ("Health",    "/health/system"),
-        ("Audit",     "/audit"),
-        ("Folders",   "/folders"),
-        ("Queries",   "/queries"),
-        ("Ingest",    "/ingest"),
+        ("Overview",     "/"),
+        ("Diagnostics",  "/health/system"),
+        ("Audit",        "/audit"),
+        ("Folders",      "/folders"),
+        ("Queries",      "/queries"),
+        ("Ingest",       "/ingest"),
     ]),
 ]
 
@@ -1160,7 +1160,7 @@ def _layout(title: str, body: str, active: str = "") -> str:
         <nav>
             {primary_html}
             <details class="nav-more">
-                <summary>More ▾</summary>
+                <summary>More ▾<span class="nav-badge urgent" data-badge="health"></span></summary>
                 <div class="nav-more-pop">{more_html}</div>
             </details>
         </nav>
@@ -3921,6 +3921,21 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         done_rows = tasks_mod.list_recent_done(conn, limit=20)
         now = time.time()
 
+        # Round 11 — pre-resolve recipient + due hint for tasks the
+        # round-9-C structured extractor populated. Single bulk
+        # query for any open task with a recipient, instead of N+1.
+        person_names: dict[int, str] = {}
+        recipient_ids = {t.recipient_person_id for t in open_rows
+                         if t.recipient_person_id}
+        if recipient_ids:
+            placeholders = ",".join("?" * len(recipient_ids))
+            for r in conn.execute(
+                f"SELECT id, display_name FROM people "
+                f"WHERE id IN ({placeholders})",
+                list(recipient_ids),
+            ).fetchall():
+                person_names[int(r["id"])] = r["display_name"]
+
         def _row(t, *, mark_done: bool) -> str:
             age_d = max(0, int((now - t.created_at) // 86400))
             age_html = (
@@ -3932,6 +3947,21 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f'{escape(t.source_title)}</a></span>'
                 if t.source_path != "manual" else ""
             )
+            # Round 11 — surface recipient + due hint when known.
+            extras = []
+            if t.recipient_person_id and t.recipient_person_id in person_names:
+                name = person_names[t.recipient_person_id]
+                extras.append(
+                    f'→ <a href="/person?id={t.recipient_person_id}">'
+                    f'{escape(name)}</a>'
+                )
+            if t.due_hint:
+                extras.append(f'due {escape(t.due_hint)}')
+            extras_html = (
+                f' <span class="muted" style="font-size:11px;">'
+                f'· {" · ".join(extras)}</span>'
+                if extras else ""
+            )
             done_btn = (
                 f'<form method="post" action="/tasks/{t.id}/done" '
                 f'style="display:inline">'
@@ -3941,7 +3971,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             )
             return (
                 f'<div class="stat">'
-                f'<span><code>#{t.id}</code> {escape(t.text)}{src}</span>'
+                f'<span><code>#{t.id}</code> {escape(t.text)}'
+                f'{extras_html}{src}</span>'
                 f'<span class="v">{age_html} {done_btn}</span>'
                 f'</div>'
             )
@@ -4825,7 +4856,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 "<code>secondbrain doctor</code> in a terminal."
                 "</p></div>"
             )
-            return HTMLResponse(_layout("Health", body, ""))
+            # Round 11 — pass an active slug that matches NO nav item
+            # so we don't highlight the Personal/Health (Oura) entry
+            # by accident. The page title in the H1 tells the user
+            # where they are.
+            return HTMLResponse(_layout("Diagnostics", body, "diagnostics"))
         items = []
         for s in statuses:
             ok_marker = "✓" if s.ok else "✗"
@@ -4856,7 +4891,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             + "".join(items)
             + "</div>"
         )
-        return HTMLResponse(_layout("Health", body, ""))
+        return HTMLResponse(_layout("Diagnostics", body, "diagnostics"))
 
     @app.get("/audit", response_class=HTMLResponse)
     def audit_view():
@@ -4932,12 +4967,34 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f"color:var(--bad);'>{escape(r.error)}</div>"
                 if r.error else ""
             )
+            # Round 11 — clickable links to the underlying surface.
+            # Draft / thanks-draft → /drafts. File-scoped actions →
+            # /file?path=… (we look up the path on demand).
+            link_html = ""
+            if r.kind in ("draft", "thanks_draft", "thanks_regen"):
+                link_html = (
+                    " <a href='/drafts' class='muted' "
+                    "style='font-size:11px;'>→ drafts</a>"
+                )
+            elif r.file_id:
+                # Resolve file_id to path on the fly (cheap).
+                frow = conn.execute(
+                    "SELECT path FROM files WHERE id = ?",
+                    (r.file_id,),
+                ).fetchone()
+                if frow:
+                    fp = urllib.parse.quote_plus(frow["path"])
+                    link_html = (
+                        f" <a href='/file?path={fp}' class='muted' "
+                        f"style='font-size:11px;'>→ source</a>"
+                    )
             items.append(
                 f"<div class='stat' style='align-items:flex-start;'>"
                 f"<span style='flex:1;'>"
                 f"<span class='muted' style='font-size:11px;'>{when}</span> "
                 f"<strong>{escape(r.kind)}</strong> "
                 f"<span class='muted'>{escape(r.model[:24])}</span>"
+                f"{link_html}"
                 f"<div style='margin-top:2px;'>"
                 f"{escape(r.summary)}</div>"
                 f"{err_html}"
@@ -5348,6 +5405,17 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             # surface as urgent so the user is nudged to act.
             if n_thanks >= 3:
                 out["urgent"]["thanks"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        # Round 11 — surface stale health failures as the badge on
+        # the (out-of-primary-nav) Audit slot. Visible from every
+        # page so a broken integration doesn't hide for days.
+        try:
+            from . import health_checks
+            stale = health_checks.stale_failures(conn)
+            out["health"] = len(stale)
+            if stale:
+                out["urgent"]["health"] = True
         except Exception:  # noqa: BLE001
             pass
         return out

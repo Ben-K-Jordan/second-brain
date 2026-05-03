@@ -318,7 +318,15 @@ def classify_one(
         if cfg is None:
             return None
     try:
-        result = classifier(from_, subject, body, cfg)
+        # Try the new audit-aware kwargs first; fall back to legacy
+        # signature for stub classifiers in tests.
+        try:
+            result = classifier(
+                from_, subject, body, cfg,
+                conn=conn, file_id=file_id,
+            )
+        except TypeError:
+            result = classifier(from_, subject, body, cfg)
     except Exception as e:  # noqa: BLE001
         log.warning("email_assist: classify crashed: %s", e)
         return None
@@ -378,20 +386,30 @@ def _default_classifier(
     local Ollama call asking for the single label string. Confidence
     drops because local models are noisier on classification, but
     the daemon stays running.
+
+    Round 11 (#6 follow-up) — every classification call now writes
+    one row to ``ai_actions`` regardless of which path it took,
+    matching the audit coverage of the analyze + draft pipeline.
     """
     import os
 
-    # Round 10 (#4 fix) — redact raw email body before sending to
-    # Anthropic. Phase 88 patterns (API keys, JWTs, SSNs) get masked
-    # at prompt-assembly time, not just at render time. The triage
-    # classifier doesn't need to see secrets — it works on subject /
-    # sender / general tone.
+    # Round 10 (#4) — redact body before send.
     body_clip = _safe_for_prompt(body, max_chars=4000)
     prompt = _TRIAGE_PROMPT.format(
         from_=from_ or "(unknown)",
         subject=subject or "(no subject)",
         body=body_clip,
     )
+
+    # Track audit state across the multi-path try-Anthropic-then-local
+    # flow. We emit one ai_actions row at the end regardless of which
+    # branch ran.
+    used_model = "claude-haiku-4-5"
+    audit_status = "no_provider"
+    audit_error = ""
+    audit_cents = 0.0
+    response_chars = 0
+    result: dict = {}
 
     # ---- Primary: Anthropic ----
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -403,6 +421,7 @@ def _default_classifier(
             from .budget import (
                 BudgetExceededError,
                 check_budget,
+                estimate_cost,
                 record_usage,
             )
             try:
@@ -420,53 +439,94 @@ def _default_classifier(
                     feature="email_triage",
                     note=f"email_triage/{from_[:30]}",
                 )
+                try:
+                    audit_cents = estimate_cost(
+                        "claude-haiku-4-5",
+                        input_tokens=resp.usage.input_tokens,
+                        output_tokens=resp.usage.output_tokens,
+                    ).cents
+                except Exception:  # noqa: BLE001
+                    audit_cents = 0.0
                 text = "".join(
                     b.text for b in resp.content if b.type == "text"
                 ).strip()
+                response_chars = len(text)
                 if text.startswith("```"):
                     text = re.sub(r"^```\w*\s*", "", text)
                     text = re.sub(r"\s*```\s*$", "", text)
                 try:
                     parsed = json.loads(text)
                     if parsed:
-                        return parsed
+                        audit_status = "success"
+                        result = parsed
                 except json.JSONDecodeError:
-                    pass
+                    audit_status = "parse_error"
+                    audit_error = "JSON parse failed"
             except BudgetExceededError as e:
                 log.info(
                     "email_assist: budget exhausted, trying local LLM: %s", e,
                 )
+                audit_status = "budget_exceeded"
+                audit_error = str(e)
             except anthropic.APIError as e:
                 log.info(
                     "email_assist: API error, trying local LLM: %s", e,
                 )
+                audit_status = "api_error"
+                audit_error = str(e)
 
-    # ---- Fallback: local Ollama ----
-    try:
-        from . import local_llm
-    except ImportError:
-        return {}
-    if not local_llm.is_available(cfg):
-        return {}
-    local_prompt = (
-        "Classify this email into exactly one label: urgent, response, "
-        "informational, newsletter, automated.\n"
-        "Reply with only the single word label.\n\n"
-        f"From: {from_}\nSubject: {subject}\n\n{body_clip}"
+    # ---- Fallback: local Ollama (only if primary didn't succeed) ----
+    if not result:
+        try:
+            from . import local_llm
+        except ImportError:
+            local_llm = None  # type: ignore[assignment]
+        if local_llm is not None and local_llm.is_available(cfg):
+            local_prompt = (
+                "Classify this email into exactly one label: urgent, "
+                "response, informational, newsletter, automated.\n"
+                "Reply with only the single word label.\n\n"
+                f"From: {from_}\nSubject: {subject}\n\n{body_clip}"
+            )
+            out = local_llm.complete(
+                local_prompt, cfg=cfg, max_tokens=20,
+            )
+            if out is not None:
+                used_model = out.model
+                response_chars = len(out.text)
+                label_raw = (
+                    out.text.strip().lower().split()[0]
+                    if out.text.strip() else ""
+                )
+                label = label_raw.strip(".,;:'\"")
+                if label in {
+                    "urgent", "response", "informational",
+                    "newsletter", "automated",
+                }:
+                    result = {
+                        "label": label,
+                        "confidence": 0.6,
+                        "rationale": "local-llm",
+                    }
+                    audit_status = "fallback_local"
+                    log.info(
+                        "email_assist: classified via local LLM (%s) → %s",
+                        out.model, label,
+                    )
+                else:
+                    audit_status = "parse_error"
+                    audit_error = f"local label out of range: {label_raw!r}"
+
+    label_summary = result.get("label", "(unparsed)") if result else "(failed)"
+    _maybe_audit(
+        conn, kind="classify", feature="email_triage",
+        model=used_model, status=audit_status,
+        prompt_chars=len(prompt), response_chars=response_chars,
+        cents=audit_cents,
+        summary=f"classified email from {(from_ or '')[:60]} → {label_summary}",
+        error=audit_error, file_id=file_id,
     )
-    out = local_llm.complete(local_prompt, cfg=cfg, max_tokens=20)
-    if out is None:
-        return {}
-    label_raw = out.text.strip().lower().split()[0] if out.text.strip() else ""
-    label = label_raw.strip(".,;:'\"")
-    if label not in {
-        "urgent", "response", "informational", "newsletter", "automated",
-    }:
-        return {}
-    log.info(
-        "email_assist: classified via local LLM (%s) → %s", out.model, label,
-    )
-    return {"label": label, "confidence": 0.6, "rationale": "local-llm"}
+    return result
 
 
 def classify_due(

@@ -2949,7 +2949,13 @@ def thanks_draft(
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    network: bool = typer.Option(
+        False, "--network",
+        help="Include real network calls (live IMAP login). Slower; "
+             "the hourly daemon uses shape-only checks instead.",
+    ),
+) -> None:
     """Round 10 (#1 + #9) — health check across every fragile
     integration: Google Calendar OAuth, IMAP creds, API keys, local
     LLM, watched folders. Useful "is the system actually wired up?"
@@ -2959,7 +2965,7 @@ def doctor() -> None:
     cfg = load_config()
     conn, _ = _open_state(cfg)
     console.print("\n[bold cyan]Running health checks…[/]")
-    statuses = health_checks.run_all(conn, cfg)
+    statuses = health_checks.run_all(conn, cfg, network=network)
     table = Table(show_header=True, box=None, title="Health checks")
     table.add_column("check")
     table.add_column("ok")
