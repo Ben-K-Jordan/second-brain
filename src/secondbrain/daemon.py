@@ -381,10 +381,22 @@ def _build_daemon_scheduler(
         ),
     ))
 
-    # Phase 72: weekly review — Sundays only, at most once per week.
+    # Round 16 (Phase B): weekly review upgraded to a personal letter
+    # via Sonnet (see weekly_letter.py). Old stats-only path is kept
+    # as a fallback and still runs IF the new path is somehow disabled.
+    from .weekly_letter import run_weekly_letter_if_due
     sched.register(Job(
         name="weekly_review",
         schedule=IntervalSchedule(seconds=60 * 60),  # check hourly
+        fn=lambda cfg, conn: run_weekly_letter_if_due(cfg, conn),
+    ))
+    # Keep the old stats-only review around as a safety net — if the
+    # LLM-based one ever stops generating (budget zeroed, key removed),
+    # we still want SOME synthesis Sundays. Cooldown 8 days so it only
+    # fires when the new one didn't.
+    sched.register(Job(
+        name="weekly_review_fallback",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=8 * 24),
         fn=lambda cfg, conn, embedder: run_weekly_review_if_due(
             cfg, conn, embedder,
         ),
@@ -551,6 +563,16 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _health_check(conn, cfg),
     ))
 
+    # Round 16 (Phase C): run notification detectors hourly. Each
+    # detector is idempotent (UNIQUE key in notifications table) so
+    # re-fires no-op. Tray pop is a separate concern (see _tray_loop).
+    from .notifications import run_detectors_if_due as _notif_detect
+    sched.register(Job(
+        name="notification_detectors",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _notif_detect(conn),
+    ))
+
     return sched
 
 
@@ -670,9 +692,32 @@ def run_tray(cfg: Config) -> None:
         ),
     )
 
+    # Round 16 (Phase C) — background thread that polls the
+    # notifications table and pops up to 3 high/med-urgency entries
+    # via pystray every 30 seconds. Detection itself happens in the
+    # scheduler job (hourly); this loop just surfaces what's been
+    # detected. Daemon thread so it dies with the icon.
+    _notif_stop = threading.Event()
+
+    def _notif_loop():
+        from . import notifications as notif_mod
+        while not _notif_stop.is_set():
+            try:
+                notif_mod.pop_to_tray(conn, icon, max_per_tick=3)
+            except Exception:  # noqa: BLE001
+                log.exception("tray: notification pop failed")
+            # 30s cadence — frequent enough for "you got an urgent
+            # email 5 minutes ago" but not annoying.
+            _notif_stop.wait(30)
+
+    threading.Thread(
+        target=_notif_loop, name="sb-tray-notifs", daemon=True,
+    ).start()
+
     try:
         icon.run()
     finally:
+        _notif_stop.set()
         log.info("stopping watcher...")
         watcher.stop()
         try:

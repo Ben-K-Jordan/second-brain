@@ -110,6 +110,7 @@ def all_connectors() -> list[type[Connector]]:
     from .google_drive import GoogleDriveConnector
     from .hacker_news import HackerNewsConnector
     from .imap_email import ImapEmailConnector
+    from .imessage import IMessageConnector
     from .jobs import JobsConnector
     from .linear import LinearConnector
     from .mastodon import MastodonConnector
@@ -131,6 +132,7 @@ def all_connectors() -> list[type[Connector]]:
         BrowserHistoryConnector,
         ObsidianConnector,
         XArchiveConnector,
+        IMessageConnector,        # Round 16 (Phase D) — Apple chat.db
         # Network-bound APIs (small/cheap first)
         JobsConnector,            # public ATS APIs - quick
         CanvasConnector,          # LMS API - quick, scoped to active courses

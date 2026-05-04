@@ -309,6 +309,163 @@ def daily_briefing(hours: int = 24) -> str:
 
 
 @mcp.tool()
+def list_chat_conversations(limit: int = 20) -> str:
+    """Round 16 (Phase F): list dashboard chat conversations.
+
+    The dashboard's ``/chat`` page persists every conversation in the
+    same SQLite as the brain. This tool surfaces them to MCP clients
+    (Claude Desktop, etc.) so you can pick up a conversation across
+    surfaces — start it on the dashboard at lunch, continue it from
+    Claude Desktop after dinner.
+
+    Returns a markdown table: id, last-updated, title, message count.
+    """
+    from datetime import datetime
+
+    from .db import chat_list_conversations
+
+    _, conn, _, _ = _get_state()
+    rows = chat_list_conversations(conn, limit=limit)
+    if not rows:
+        return "_No chat conversations yet._"
+    lines = ["| id | last updated | title | msgs |",
+             "|----|--------------|-------|------|"]
+    for r in rows:
+        when = datetime.fromtimestamp(r["updated_at"]).strftime("%Y-%m-%d %H:%M")
+        title = (r["title"] or "(untitled)")[:60].replace("|", "\\|")
+        lines.append(f"| {r['id']} | {when} | {title} | {r['n_messages']} |")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_chat_conversation(conversation_id: int, max_messages: int = 50) -> str:
+    """Fetch the message history for a dashboard chat conversation.
+
+    Use after ``list_chat_conversations`` to pick up where you left
+    off on the dashboard. Returns the messages as Markdown so you can
+    quote them back conversationally.
+    """
+    import json
+
+    from .db import chat_get_conversation, chat_get_messages
+
+    _, conn, _, _ = _get_state()
+    conv = chat_get_conversation(conn, conversation_id)
+    if conv is None:
+        return f"_Conversation #{conversation_id} not found._"
+    rows = chat_get_messages(conn, conversation_id)
+    if max_messages and len(rows) > max_messages:
+        rows = rows[-max_messages:]
+        truncated = True
+    else:
+        truncated = False
+    lines = [
+        f"# {conv['title'] or 'Conversation'}",
+        f"_Conversation #{conversation_id}, "
+        f"{len(rows)} message(s) shown_",
+        "",
+    ]
+    if truncated:
+        lines.append("_(showing only the most recent " +
+                     str(max_messages) + " messages)_\n")
+    if conv["system_prompt"]:
+        lines.append("**System prompt:** " + conv["system_prompt"][:300])
+        lines.append("")
+    for row in rows:
+        role = row["role"]
+        try:
+            content = json.loads(row["content_json"])
+        except (json.JSONDecodeError, TypeError):
+            content = row["content_json"]
+        if isinstance(content, list):
+            # Tool blocks — just stringify text parts.
+            text = " ".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
+        else:
+            text = str(content)
+        lines.append(f"### {role}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def append_chat_message(
+    conversation_id: int, role: str, text: str,
+) -> str:
+    """Append a message to a dashboard chat conversation.
+
+    This lets an MCP-side conversation feed back into the dashboard
+    history. Use it when you want to log "asked Claude about X via
+    Claude Desktop" so the dashboard's ``/chat/{id}`` view shows
+    the full cross-surface conversation. Role must be 'user' or
+    'assistant'.
+
+    Returns the new message id.
+    """
+    import json
+
+    from .db import chat_append_message, chat_get_conversation
+
+    _, conn, _, _ = _get_state()
+    if role not in ("user", "assistant"):
+        return f"_Bad role {role!r}; must be 'user' or 'assistant'._"
+    if chat_get_conversation(conn, conversation_id) is None:
+        return f"_Conversation #{conversation_id} not found._"
+    mid = chat_append_message(
+        conn, conversation_id, role, json.dumps(text),
+    )
+    return f"OK: appended message #{mid} to conversation #{conversation_id}"
+
+
+@mcp.tool()
+def create_chat_conversation(title: str) -> str:
+    """Start a new dashboard chat conversation. Returns the new id.
+
+    Pair with ``append_chat_message`` to seed the conversation with
+    the user/assistant turns from an MCP-side exchange.
+    """
+    from .db import chat_create_conversation
+
+    _, conn, _, _ = _get_state()
+    cid = chat_create_conversation(conn, title.strip() or "(untitled)")
+    return f"OK: created conversation #{cid} ({title.strip()})"
+
+
+@mcp.tool()
+def weekly_review(regenerate: bool = False) -> str:
+    """Round 16 (Phase B): Show this week's personal letter — a Sonnet-written
+    synthesis of what happened across email, journal, tasks, habits, health,
+    meetings, and insights.
+
+    Default: returns the existing letter for this week (cached, idempotent).
+    Pass ``regenerate=True`` to force a fresh LLM call (replaces the existing
+    letter for this week).
+
+    The letter is also generated automatically by the daemon every Sunday.
+    Use this tool from a chat to ask "what did I do this week?" — Claude will
+    pull the letter and reference it conversationally.
+    """
+    from . import weekly_letter
+
+    cfg, conn, _, _ = _get_state()
+    if regenerate:
+        letter = weekly_letter.generate_and_save(cfg, conn, overwrite=True)
+        prefix = "**(Just regenerated)**\n\n"
+    else:
+        letter = weekly_letter.latest_letter(conn)
+        if letter is None:
+            # No letter yet — generate one now.
+            letter = weekly_letter.generate_and_save(cfg, conn)
+            prefix = "**(Generated on first request)**\n\n"
+        else:
+            prefix = ""
+    return prefix + letter.letter_md
+
+
+@mcp.tool()
 def sync_source(source: str = "all") -> str:
     """Pull recent documents from a connector (github / notion / browser /
     calendar) into the index. Use 'all' to run every configured connector.

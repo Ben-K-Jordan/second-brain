@@ -228,18 +228,20 @@ def test_svg_sparkline_handles_single_point():
 
 # ============================ Nav redesign (v3 round 5) ==============
 
-def test_primary_nav_is_six_items():
-    """The redesign caps the primary nav at 6 items so it doesn't
-    wrap. Verifying the constant directly so a future addition has
-    to think twice."""
+def test_primary_nav_is_eight_items():
+    """The redesign capped the primary nav at 6, then round 16
+    raised the cap to 8 to add Review (weekly letter) and Inbox
+    (proactive notifications). Pin the new shape so we don't drift
+    further without a deliberate decision."""
     from secondbrain.dashboard import _PRIMARY_NAV
 
-    assert len(_PRIMARY_NAV) == 6
+    assert len(_PRIMARY_NAV) == 8
     labels = {item[0] for item in _PRIMARY_NAV}
     # Daily-use anchor items must all be present.
-    # Round 8: Thanks displaced Insights to primary nav; Insights
-    # now lives under "Knowledge" in the More dropdown.
-    assert {"Brief", "Chat", "Tasks", "Search", "Drafts", "Thanks"} == labels
+    assert {
+        "Brief", "Review", "Chat", "Tasks", "Search",
+        "Drafts", "Thanks", "Inbox",
+    } == labels
 
 
 def test_nav_groups_cover_all_pages():

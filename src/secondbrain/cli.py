@@ -2603,29 +2603,102 @@ def review(
     ),
     save: bool = typer.Option(
         False, "--save",
-        help="Also index the review as a doc (review://YYYY-MM-DD).",
+        help="Also index the review as a doc (review://YYYY-MM-DD). "
+             "Only applies in --stats-only mode; the LLM letter is "
+             "auto-saved to its own table.",
+    ),
+    regenerate: bool = typer.Option(
+        False, "--regenerate",
+        help="Force a fresh LLM call even if this week already has a "
+             "letter. Replaces the existing one.",
+    ),
+    history: bool = typer.Option(
+        False, "--history",
+        help="List recent letters (titles + dates) instead of showing "
+             "the latest one.",
+    ),
+    stats_only: bool = typer.Option(
+        False, "--stats-only",
+        help="Use the legacy stats-only review (no LLM call). Useful "
+             "when you want a quick rollup without spending Anthropic.",
     ),
 ) -> None:
-    """Phase 72: weekly review — what happened this week, lingering
-    items, top topics, health, insights."""
-    from .synthesis import (
-        assemble_weekly_review,
-        format_weekly_review_md,
-        index_weekly_review,
-    )
+    """Round 16 (Phase B): weekly review — a personal letter generated
+    by Claude Sonnet that synthesizes the week across email, journal,
+    tasks, habits, health, meetings, and insights.
 
+    Default: regenerate-or-show this week's letter. ``--regenerate``
+    forces a fresh LLM call. ``--history`` lists recent letters.
+    ``--stats-only`` falls back to the older bullet-list review.
+    """
+    from datetime import datetime
     cfg = load_config()
     conn, embedder = _open_state(cfg)
-    if save:
-        vp = index_weekly_review(conn, embedder, cfg)
-        if vp:
-            console.print(f"[green]✓[/] Indexed {vp}")
-        else:
-            console.print("[red]Failed to index review.[/]")
+
+    if stats_only:
+        from .synthesis import (
+            assemble_weekly_review,
+            format_weekly_review_md,
+            index_weekly_review,
+        )
+        if save:
+            vp = index_weekly_review(conn, embedder, cfg)
+            if vp:
+                console.print(f"[green]✓[/] Indexed {vp}")
+            else:
+                console.print("[red]Failed to index review.[/]")
+                conn.close()
+                raise typer.Exit(code=1)
+        review_obj = assemble_weekly_review(conn)
+        md = format_weekly_review_md(review_obj)
+    else:
+        from . import weekly_letter
+        if history:
+            rows = weekly_letter.list_letters(conn, limit=12)
+            if not rows:
+                console.print("[yellow]No letters yet. Run "
+                              "[cyan]secondbrain review[/cyan] to "
+                              "generate the first one.[/]")
+                conn.close()
+                return
+            from rich.table import Table
+            table = Table(show_header=True, box=None,
+                          title="Recent weekly letters")
+            table.add_column("Week ending")
+            table.add_column("Generated")
+            table.add_column("Model", style="dim")
+            table.add_column("¢", style="dim")
+            for letter in rows:
+                gen = datetime.fromtimestamp(letter.generated_at).strftime(
+                    "%Y-%m-%d %H:%M",
+                )
+                table.add_row(
+                    letter.week_end, gen, letter.model,
+                    f"{letter.cost_cents:.2f}",
+                )
+            console.print(table)
             conn.close()
-            raise typer.Exit(code=1)
-    review_obj = assemble_weekly_review(conn)
-    md = format_weekly_review_md(review_obj)
+            return
+        # Generate (or fetch existing).
+        console.print(
+            "[cyan]Assembling signals + writing letter…[/] "
+            "(this is a 5-15 second Sonnet call when LLM-backed; "
+            "stats-only fallback is instant)",
+        )
+        letter = weekly_letter.generate_and_save(
+            cfg, conn, overwrite=regenerate,
+        )
+        md = letter.letter_md
+        # Trailing footer for transparency.
+        gen = datetime.fromtimestamp(letter.generated_at).strftime(
+            "%Y-%m-%d %H:%M",
+        )
+        md += (
+            f"\n\n---\n"
+            f"_Generated {gen} · model {letter.model} · "
+            f"{letter.cost_cents:.2f}¢_\n"
+        )
+
     if markdown:
         print(md)
     else:
@@ -3033,20 +3106,32 @@ def backup(
         ...,
         help="Destination file for the backup (e.g. ~/Backups/sb-2025-01.db). "
              "Parent directory must exist; the file is created if absent and "
-             "overwritten if present.",
+             "overwritten if present. Add .age suffix when --encrypt is set.",
+    ),
+    encrypt: bool = typer.Option(
+        False, "--encrypt/--no-encrypt",
+        help="Encrypt the backup with a passphrase. Uses AES-256-GCM with "
+             "PBKDF2-HMAC-SHA256 key derivation (600k iterations). "
+             "The passphrase is read from $SECONDBRAIN_BACKUP_PASSPHRASE if "
+             "set, otherwise prompted interactively.",
     ),
 ) -> None:
-    """Round 15 (audit-found gap C1) — back up the SQLite index safely.
+    """Round 15 + 16 — back up the SQLite index safely (optionally encrypted).
 
     The DB runs in WAL mode, so naive ``cp index.db dest.db`` skips
     the uncommitted WAL pages and gives a corrupt restore. This
     command uses ``sqlite3.Connection.backup()`` which is online-safe
     (works while the daemon is running) and WAL-aware.
 
-    Restore by copying the backup file back to ``<data_dir>/index.db``
-    while the daemon is stopped.
+    With ``--encrypt``, the backup is written through AES-256-GCM with
+    a key derived from your passphrase via PBKDF2 (600k iterations).
+    The output is a self-describing binary format readable by
+    ``secondbrain restore``.
+
+    Restore: ``secondbrain restore <backup-file>`` (encrypted or not).
     """
     import sqlite3
+    import tempfile
 
     cfg = load_config()
     src_path = cfg.db_path
@@ -3055,21 +3140,176 @@ def backup(
         raise typer.Exit(code=1)
     out = out.expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pull passphrase up-front so we fail fast on a typo.
+    passphrase: str | None = None
+    if encrypt:
+        passphrase = _read_backup_passphrase(confirm=True)
+        if not passphrase:
+            console.print("[red]Empty passphrase rejected.[/]")
+            raise typer.Exit(code=1)
+
     console.print(
-        f"[cyan]Backing up {src_path} → {out}[/]",
+        f"[cyan]Backing up {src_path} → {out}"
+        + (" (encrypted)" if encrypt else "")
+        + "[/]",
     )
-    src = sqlite3.connect(str(src_path))
-    dest = sqlite3.connect(str(out))
+
+    # Always backup to a temp .db first, then optionally encrypt-stream
+    # to the final destination. Keeps the encrypt path simple.
+    with tempfile.NamedTemporaryFile(
+        suffix=".db", delete=False,
+    ) as tf:
+        tmp_path = Path(tf.name)
     try:
-        with dest:
-            src.backup(dest)
+        src = sqlite3.connect(str(src_path))
+        dest = sqlite3.connect(str(tmp_path))
+        try:
+            with dest:
+                src.backup(dest)
+        finally:
+            dest.close()
+            src.close()
+        if encrypt and passphrase:
+            from . import backup as backup_mod
+            backup_mod.encrypt_file(tmp_path, out, passphrase)
+        else:
+            # Atomic move: write next to the dest then rename so a
+            # crash mid-copy doesn't leave a half-written file at out.
+            import shutil
+            shutil.move(str(tmp_path), str(out))
+            tmp_path = Path("")  # sentinel: don't unlink
     finally:
-        dest.close()
-        src.close()
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     size_mb = out.stat().st_size / (1024 * 1024)
     console.print(
-        f"[green]✓[/] Backup written: {out} ({size_mb:.1f} MB)",
+        f"[green]✓[/] Backup written: {out} ({size_mb:.1f} MB)"
+        + (" — encrypted; remember your passphrase!" if encrypt else ""),
     )
+
+
+@app.command()
+def restore(
+    src: Path = typer.Argument(
+        ...,
+        help="Backup file to restore from (created by `secondbrain backup`). "
+             "Encrypted files are auto-detected by magic bytes.",
+    ),
+    out: Path = typer.Option(
+        None, "--out",
+        help="Destination DB path. Defaults to <data_dir>/index.db. "
+             "WARNING: overwrites the destination if it exists.",
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Overwrite destination without confirmation.",
+    ),
+) -> None:
+    """Round 16 (Phase E) — restore the SQLite index from a backup.
+
+    Auto-detects encrypted backups by their magic bytes. Encrypted
+    backups prompt for the passphrase (or read $SECONDBRAIN_BACKUP_PASSPHRASE).
+
+    By default writes to ``<data_dir>/index.db``. Stop the daemon
+    first if it's running — restoring while a writer holds the
+    DB will fail or corrupt.
+    """
+    import shutil
+    import tempfile
+
+    cfg = load_config()
+    src = src.expanduser().resolve()
+    if not src.exists():
+        console.print(f"[red]Backup file not found: {src}[/]")
+        raise typer.Exit(code=1)
+    out_path = (out.expanduser().resolve() if out else cfg.db_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from . import backup as backup_mod
+    is_encrypted = backup_mod.is_encrypted_file(src)
+
+    if out_path.exists() and not force:
+        console.print(
+            f"[yellow]Destination {out_path} exists.[/] Pass "
+            f"[cyan]--force[/] to overwrite.",
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[cyan]Restoring {src}"
+        + (" (encrypted)" if is_encrypted else "")
+        + f" → {out_path}[/]",
+    )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".db", delete=False,
+    ) as tf:
+        tmp_path = Path(tf.name)
+    try:
+        if is_encrypted:
+            passphrase = _read_backup_passphrase(confirm=False)
+            if not passphrase:
+                console.print("[red]Empty passphrase rejected.[/]")
+                raise typer.Exit(code=1)
+            try:
+                backup_mod.decrypt_file(src, tmp_path, passphrase)
+            except backup_mod.BadPassphraseError:
+                console.print(
+                    "[red]Decryption failed — wrong passphrase or "
+                    "corrupted file.[/]",
+                )
+                raise typer.Exit(code=1) from None
+        else:
+            shutil.copyfile(str(src), str(tmp_path))
+        # Sanity-check the restored file is a valid SQLite DB.
+        import sqlite3
+        try:
+            test_conn = sqlite3.connect(str(tmp_path))
+            test_conn.execute("PRAGMA quick_check").fetchone()
+            test_conn.close()
+        except sqlite3.Error as e:
+            console.print(f"[red]Restored file failed integrity check: {e}[/]")
+            raise typer.Exit(code=1) from e
+        # Atomic replace: shutil.move handles cross-device.
+        if out_path.exists():
+            out_path.unlink()
+        shutil.move(str(tmp_path), str(out_path))
+        tmp_path = Path("")
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    size_mb = out_path.stat().st_size / (1024 * 1024)
+    console.print(
+        f"[green]✓[/] Restored: {out_path} ({size_mb:.1f} MB)\n"
+        f"[yellow]Restart the daemon if it was running.[/]",
+    )
+
+
+def _read_backup_passphrase(confirm: bool) -> str:
+    """Read the passphrase from env or prompt. With ``confirm=True``
+    (used on backup), prompts twice and verifies they match."""
+    import os
+
+    env = os.environ.get("SECONDBRAIN_BACKUP_PASSPHRASE", "")
+    if env:
+        return env
+    import getpass
+    p1 = getpass.getpass("Passphrase: ")
+    if not p1:
+        return ""
+    if confirm:
+        p2 = getpass.getpass("Confirm passphrase: ")
+        if p1 != p2:
+            console.print("[red]Passphrases do not match.[/]")
+            return ""
+    return p1
 
 
 audit_app = typer.Typer(

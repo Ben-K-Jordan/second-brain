@@ -188,6 +188,10 @@ class Config:
     # Obsidian: vault root directories. Both this and OBSIDIAN_VAULTS work;
     # the connector parses frontmatter + resolves [[wikilinks]] for retrieval.
     obsidian_vaults: tuple[str, ...] = ()
+    # iMessage: path to Apple's chat.db. macOS default is
+    # ~/Library/Messages/chat.db. On Windows / Linux you'd copy the
+    # file from a Mac. Both this and IMESSAGE_DB_PATH env work.
+    imessage_db_path: str = ""
     # Jobs connector: companies to watch on each ATS provider. The slug is
     # whatever appears in the public board URL - e.g. anthropic.com's
     # Greenhouse board is at boards.greenhouse.io/anthropic, so the slug
@@ -578,6 +582,8 @@ def load_config(path: Path | None = None) -> Config:
             cfg.substack_feeds = tuple(data["substack_feeds"])
         if "obsidian_vaults" in data:
             cfg.obsidian_vaults = tuple(data["obsidian_vaults"])
+        if "imessage_db_path" in data:
+            cfg.imessage_db_path = str(data["imessage_db_path"])
         if "jobs_greenhouse" in data:
             cfg.jobs_greenhouse = tuple(data["jobs_greenhouse"])
         if "jobs_lever" in data:

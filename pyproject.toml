@@ -27,6 +27,8 @@ dependencies = [
     # chat call.
     "anthropic>=0.40",
     "requests>=2.32",
+    # Round 16 (Phase E) — AES-256-GCM encrypted backups.
+    "cryptography>=43.0",
 ]
 
 [project.optional-dependencies]
