@@ -1556,6 +1556,439 @@ def list_ai_actions(
     return "\n".join(lines)
 
 
+# ============================ Round 19 — EA MCP tools ==============
+
+
+@mcp.tool()
+def list_followups(direction: str = "", limit: int = 30) -> str:
+    """Round 19 (Phase EA-1) — list open follow-ups.
+
+    direction: "outgoing" (you owe), "incoming" (others owe you),
+               or "" for both.
+    Returns a Markdown summary, redacted for safety.
+    """
+    from . import followups
+    _, conn, _, _ = _get_state()
+    rows = followups.list_open(
+        conn,
+        direction=direction or None,
+        limit=max(1, min(int(limit or 30), 200)),
+    )
+    if not rows:
+        return "_No open follow-ups._"
+    lines = ["# Open follow-ups", ""]
+    out_rows = [r for r in rows if r.direction == "outgoing"]
+    in_rows = [r for r in rows if r.direction == "incoming"]
+    if out_rows and (not direction or direction == "outgoing"):
+        lines.append(f"## You owe ({len(out_rows)})")
+        for r in out_rows:
+            age_days = (
+                int((time.time() - r.promised_at) / 86400.0)
+                if r.promised_at else None
+            )
+            age = f" · {age_days}d" if age_days is not None else ""
+            who = f" → {_safe(r.person_name)}" if r.person_name else ""
+            lines.append(
+                f"- **{_safe(r.topic)}**{who}{age}"
+            )
+        lines.append("")
+    if in_rows and (not direction or direction == "incoming"):
+        lines.append(f"## Owed to you ({len(in_rows)})")
+        for r in in_rows:
+            age_days = (
+                int((time.time() - r.promised_at) / 86400.0)
+                if r.promised_at else None
+            )
+            age = f" · {age_days}d" if age_days is not None else ""
+            who = f" ← {_safe(r.person_name)}" if r.person_name else ""
+            lines.append(f"- **{_safe(r.topic)}**{who}{age}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_followup(
+    direction: str,
+    topic: str,
+    description: str,
+    person_name: str = "",
+    due_iso_date: str = "",
+) -> str:
+    """Manually add a follow-up. direction must be 'outgoing' or
+    'incoming'. due_iso_date is "YYYY-MM-DD" or "" for none."""
+    from . import followups
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    person_id: int | None = None
+    if person_name:
+        try:
+            p = people_mod.find_person_by_name(conn, person_name)
+            if p:
+                person_id = int(p.id)
+        except Exception:
+            pass
+    due_at: float | None = None
+    if due_iso_date:
+        try:
+            from datetime import date as _date
+            from datetime import datetime as _dt
+            d = _date.fromisoformat(due_iso_date)
+            due_at = _dt(d.year, d.month, d.day).timestamp()
+        except (ValueError, TypeError):
+            return f"_Bad due_iso_date: {due_iso_date!r}_"
+    new_id = followups.add_followup(
+        conn,
+        direction=direction,
+        topic=topic,
+        description=description,
+        person_id=person_id,
+        person_name=person_name,
+        source_kind="manual",
+        due_at=due_at,
+        promised_at=time.time(),
+        confidence=1.0,
+        extracted_by="manual",
+    )
+    return (
+        f"OK: added follow-up #{new_id}"
+        if new_id else "_Failed to add follow-up._"
+    )
+
+
+@mcp.tool()
+def resolve_followup(followup_id: int) -> str:
+    """Mark a follow-up as resolved (no longer pending)."""
+    from . import followups
+    _, conn, _, _ = _get_state()
+    if followups.mark_resolved(conn, followup_id):
+        return f"OK: follow-up #{followup_id} resolved."
+    return f"_Follow-up #{followup_id} not found or already resolved._"
+
+
+@mcp.tool()
+def build_agenda(person_id: int = 0, person_name: str = "") -> str:
+    """Round 19 (Phase EA-2) — build a 1:1 agenda.
+
+    Pass either person_id (preferred) or person_name (resolved via
+    alias / canonical_name / display_name LIKE). Returns a Markdown
+    pre-meeting card with last meeting, open follow-ups (both
+    directions), recent email threads, journal mentions, and shared
+    topics.
+    """
+    from . import agenda
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    if not person_id and person_name:
+        p = people_mod.find_person_by_name(conn, person_name)
+        if p is None:
+            return f"_No person matched {person_name!r}._"
+        person_id = int(p.id)
+    if not person_id:
+        return "_Need person_id or person_name._"
+    result = agenda.build_agenda(conn, person_id)
+    if result is None:
+        return f"_Person #{person_id} not found._"
+    return agenda.render_markdown(result)
+
+
+@mcp.tool()
+def capture_meeting(file_id: int, overwrite: bool = False) -> str:
+    """Round 19 (Phase EA-3) — extract decisions / action items /
+    open questions / recap draft from a meeting transcript.
+
+    The transcript must already be indexed in the brain (file_id
+    points at a kind='audio_video' or kind='transcript' file).
+    Action items flow into the followups tracker. Returns the
+    capture as Markdown, including the recap draft you can copy/edit.
+    """
+    from . import meeting_capture
+    cfg, conn, _, _ = _get_state()
+    cap = meeting_capture.capture(
+        conn, cfg, file_id, overwrite=overwrite,
+    )
+    if cap is None:
+        return f"_Capture failed for file #{file_id}._"
+    lines = [f"# Meeting capture: {_safe(cap.title)}", ""]
+    if cap.decisions:
+        lines.append("## Decisions")
+        for d in cap.decisions:
+            lines.append(f"- **{_safe(d.text)}**")
+            if d.rationale:
+                lines.append(f"  - {_safe(d.rationale)}")
+        lines.append("")
+    if cap.actions:
+        lines.append("## Action items")
+        for a in cap.actions:
+            due = f" · _due: {a.due_hint}_" if a.due_hint else ""
+            lines.append(
+                f"- **{_safe(a.owner)}** — {_safe(a.description)}{due}",
+            )
+        lines.append("")
+    if cap.open_questions:
+        lines.append("## Open questions")
+        for q in cap.open_questions:
+            lines.append(f"- {_safe(q)}")
+        lines.append("")
+    if cap.recap_draft:
+        lines.append("## Recap draft")
+        lines.append(_safe(cap.recap_draft))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_meeting_captures(limit: int = 10) -> str:
+    """List recent meeting captures."""
+    from . import meeting_capture
+    _, conn, _, _ = _get_state()
+    rows = meeting_capture.list_recent(
+        conn, limit=max(1, min(int(limit), 50)),
+    )
+    if not rows:
+        return "_No captures yet._"
+    lines = ["| When | Title | Decisions | Actions |",
+             "|------|-------|-----------|---------|"]
+    for r in rows:
+        when = time.strftime("%m-%d %H:%M", time.localtime(r.captured_at))
+        lines.append(
+            f"| {when} | {_safe(r.title)[:40]} | "
+            f"{len(r.decisions)} | {len(r.actions)} |"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_overdue_contacts(tier: str = "vip", limit: int = 10) -> str:
+    """Round 19 (Phase EA-5) — list people whose cadence target has
+    passed (you should reach out)."""
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    tier_filter = (
+        [tier] if tier in ("vip", "regular", "casual") else None
+    )
+    rows = people_mod.list_overdue_contacts(
+        conn,
+        limit=max(1, min(int(limit), 50)),
+        tier_filter=tier_filter,
+    )
+    if not rows:
+        return "_Everyone is in good standing._"
+    lines = ["# Overdue contacts", ""]
+    for o in rows:
+        lines.append(
+            f"- **{_safe(o.person.display_name)}** "
+            f"({o.person.tier}) — "
+            f"{o.days_since_contact}d since contact "
+            f"({o.days_overdue}d past target)"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def set_person_tier(
+    person_id: int = 0,
+    person_name: str = "",
+    tier: str = "regular",
+    cadence_days: int = 0,
+) -> str:
+    """Round 19 (Phase EA-5) — set a person's tier (vip|regular|casual)
+    and optional cadence target (days). cadence_days=0 clears.
+
+    Pass person_id (preferred) or person_name."""
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    if not person_id and person_name:
+        p = people_mod.find_person_by_name(conn, person_name)
+        if p is None:
+            return f"_No person matched {person_name!r}._"
+        person_id = int(p.id)
+    if not person_id:
+        return "_Need person_id or person_name._"
+    try:
+        people_mod.set_field(
+            conn, person_id, tier=tier,
+            cadence_days=int(cadence_days) if cadence_days else 0,
+        )
+    except ValueError as e:
+        return f"_Invalid: {e}_"
+    return f"OK: person #{person_id} → tier={tier} cadence={cadence_days}d"
+
+
+@mcp.tool()
+def gift_ideas_for(
+    person_id: int = 0, person_name: str = "",
+) -> str:
+    """Round 19 (Phase EA-7) — generate (or fetch) 3 gift ideas
+    for a person. Cached after first call."""
+    from . import gift_ideas
+    from . import people as people_mod
+    cfg, conn, _, _ = _get_state()
+    if not person_id and person_name:
+        p = people_mod.find_person_by_name(conn, person_name)
+        if p is None:
+            return f"_No person matched {person_name!r}._"
+        person_id = int(p.id)
+    if not person_id:
+        return "_Need person_id or person_name._"
+    ideas = gift_ideas.generate_for_person(conn, cfg, person_id)
+    if ideas is None or not ideas.ideas:
+        return "_Could not generate ideas (no API key, no profile data, or budget exceeded)._"
+    p = people_mod.get_person(conn, person_id)
+    name = p.display_name if p else f"#{person_id}"
+    lines = [f"# Gift ideas for {_safe(name)}", ""]
+    for i in ideas.ideas:
+        price = f" ({i.price_range})" if i.price_range else ""
+        lines.append(f"## {_safe(i.title)}{price}")
+        lines.append(_safe(i.description))
+        if i.why:
+            lines.append(f"\n_Why: {_safe(i.why)}_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def morning_triage(hours: int = 48, limit: int = 10) -> str:
+    """Round 19 (Phase EA-6) — ranked list of emails that need your
+    decision today. Order: VIP × urgency × age."""
+    from . import triage_queue
+    _, conn, _, _ = _get_state()
+    queue = triage_queue.build_queue(
+        conn, hours=hours, max_items=max(1, min(int(limit), 30)),
+    )
+    if not queue:
+        return "_Inbox zero — nothing in window needs your decision._"
+    lines = ["# Morning triage", ""]
+    for it in queue:
+        vip = " · VIP" if it.is_vip else ""
+        draft = (
+            f" · _draft #{it.draft_id} ready_"
+            if it.has_draft else ""
+        )
+        lines.append(
+            f"- **[{it.label}]** {_safe(it.from_display)}: "
+            f"{_safe(it.subject) or '(no subject)'} "
+            f"({int(it.age_hours)}h{vip}{draft})"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def end_of_day() -> str:
+    """Round 19 (Phase EA-9) — end-of-day wrap-up: today's metrics,
+    items slipping past a week, tomorrow's calendar."""
+    from . import eod_wrapup
+    _, conn, _, _ = _get_state()
+    return eod_wrapup.render_markdown(eod_wrapup.build_wrapup(conn))
+
+
+@mcp.tool()
+def remind_if(
+    description: str,
+    condition_kind: str,
+    fire_after_iso: str = "",
+    email_from: str = "",
+    followup_id: int = 0,
+) -> str:
+    """Round 19 (Phase EA-10) — create a conditional reminder.
+
+    condition_kind:
+      - "date_passed": fires at fire_after_iso (YYYY-MM-DD or
+        YYYY-MM-DDTHH:MM:SS).
+      - "no_reply_from": fires at fire_after_iso if no email from
+        email_from has arrived since the reminder was created.
+      - "followup_unresolved": fires at fire_after_iso if followup_id
+        is still status='open'.
+    """
+    from . import conditional_reminders
+    _, conn, _, _ = _get_state()
+    fire_after: float | None = None
+    if fire_after_iso:
+        try:
+            from datetime import datetime as _dt
+            fire_after = _dt.fromisoformat(fire_after_iso).timestamp()
+        except ValueError:
+            return f"_Bad fire_after_iso: {fire_after_iso!r}_"
+    cond: dict = {}
+    if condition_kind == "no_reply_from":
+        if not email_from:
+            return "_no_reply_from needs email_from._"
+        cond = {"email": email_from, "since_ts": time.time()}
+    elif condition_kind == "followup_unresolved":
+        if not followup_id:
+            return "_followup_unresolved needs followup_id._"
+        cond = {"followup_id": int(followup_id)}
+    elif condition_kind == "date_passed":
+        if fire_after is None:
+            return "_date_passed needs fire_after_iso._"
+    else:
+        return (
+            f"_Unsupported condition_kind {condition_kind!r}; "
+            f"try date_passed, no_reply_from, followup_unresolved._"
+        )
+    try:
+        rid = conditional_reminders.add_reminder(
+            conn,
+            description=description,
+            condition_kind=condition_kind,
+            condition=cond,
+            fire_after=fire_after,
+        )
+    except ValueError as e:
+        return f"_{e}_"
+    return f"OK: reminder #{rid} scheduled."
+
+
+@mcp.tool()
+def find_open_time_slots(
+    days_ahead: int = 7,
+    duration_minutes: int = 30,
+    earliest_hour: int = 9,
+    latest_hour: int = 17,
+    busy_events_json: str = "[]",
+) -> str:
+    """Round 19 (Phase EA-4) — find candidate meeting slots.
+
+    The CALLER (typically Claude itself via the Google Calendar MCP)
+    fetches the busy events and passes them as JSON via
+    ``busy_events_json``. Each event must have ``start`` and ``end``
+    with ``dateTime`` (ISO) keys, matching the Google Calendar
+    list_events shape. Returns ranked candidate slots in human-
+    readable Markdown.
+    """
+    import json as _json
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
+    from . import scheduling
+    try:
+        events = _json.loads(busy_events_json or "[]")
+    except _json.JSONDecodeError as e:
+        return f"_Bad busy_events_json: {e}_"
+    busy = scheduling.parse_busy_blocks(events)
+    today = _date.today()
+    slots = scheduling.find_open_slots(
+        busy,
+        window_start=today,
+        window_end=today + _td(days=max(1, int(days_ahead))),
+        prefs=scheduling.SchedulingPrefs(
+            duration_minutes=int(duration_minutes),
+            earliest_hour=int(earliest_hour),
+            latest_hour=int(latest_hour),
+        ),
+    )
+    if not slots:
+        return "_No open slots in window._"
+    lines = ["# Open slots", ""]
+    for s in slots:
+        dow = s.start.strftime("%A")
+        date_str = s.start.strftime("%b %d").replace(" 0", " ")
+        time_range = (
+            f"{scheduling._fmt_time(s.start)}–"
+            f"{scheduling._fmt_time(s.end)}"
+        )
+        lines.append(f"- {dow} {date_str} · {time_range}")
+    return "\n".join(lines)
+
+
 def run() -> None:
     """Run the MCP server over stdio. Used by `secondbrain serve`."""
     _get_state()  # warm caches before we start serving

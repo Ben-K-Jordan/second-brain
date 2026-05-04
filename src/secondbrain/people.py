@@ -75,6 +75,19 @@ class Person:
     first_seen_at: float = 0.0
     last_seen_at: float = 0.0
     mention_count: int = 0
+    # Round 19 (Phase EA-5) — VIP tiering + cadence.
+    # tier ∈ {'vip', 'regular', 'casual'}. Affects email triage
+    # urgency (vip → always urgent), agenda priority, cadence
+    # overdue threshold (vip = tighter expectations).
+    tier: str = "regular"
+    # cadence_days = "I want to be in touch with this person every
+    # N days". NULL = no target. Cadence detector compares against
+    # last_contact_at to surface overdue contacts.
+    cadence_days: int | None = None
+    # last_contact_at = unix ts of the most recent inferred contact:
+    # email send/recv, calendar attendance, journal mention, iMessage.
+    # Computed by ``_refresh_last_contact``.
+    last_contact_at: float | None = None
 
 
 @dataclass
@@ -256,9 +269,44 @@ def find_by_alias(
         "SELECT p.* FROM people p "
         "JOIN person_aliases a ON a.person_id = p.id "
         "WHERE a.alias_lower = ? LIMIT 1",
-        (alias.strip().lower(),),
+        (canonicalize(alias.strip()),),
     ).fetchone()
     return _row_to_person(row) if row else None
+
+
+def find_person_by_name(
+    conn: sqlite3.Connection, name: str,
+) -> Person | None:
+    """Round 19 — best-effort name resolution for the followups
+    extractor and other callers that have a free-text name only.
+
+    Tries (in order): exact alias match, exact canonical_name match,
+    case-insensitive display_name LIKE. Returns None if no match.
+    """
+    name_clean = name.strip()
+    if not name_clean:
+        return None
+    # 1. Alias / canonical match (the strongest signal).
+    by_alias = find_by_alias(conn, name_clean)
+    if by_alias is not None:
+        return by_alias
+    canon = canonicalize(name_clean)
+    row = conn.execute(
+        "SELECT * FROM people WHERE canonical_name = ? LIMIT 1",
+        (canon,),
+    ).fetchone()
+    if row:
+        return _row_to_person(row)
+    # 2. LIKE fallback for partial display_name match — but only
+    # accept it when there's a single hit (else it's ambiguous).
+    rows = conn.execute(
+        "SELECT * FROM people WHERE LOWER(display_name) LIKE ? "
+        "LIMIT 2",
+        (f"%{canon}%",),
+    ).fetchall()
+    if len(rows) == 1:
+        return _row_to_person(rows[0])
+    return None
 
 
 def list_people(
@@ -515,9 +563,15 @@ def set_field(
     *, email: str | None = None, company: str | None = None,
     role: str | None = None, notes: str | None = None,
     birthday: str | None = None,
+    tier: str | None = None,
+    cadence_days: int | None = None,
 ) -> bool:
     """Update one or more profile fields. Empty string clears; None
-    leaves unchanged. Returns True iff at least one value changed."""
+    leaves unchanged. Returns True iff at least one value changed.
+
+    Round 19 — also accepts tier (vip/regular/casual) and
+    cadence_days (target contact frequency, NULL clears).
+    """
     updates: list[str] = []
     params: list = []
     for col, value in [
@@ -527,6 +581,18 @@ def set_field(
         if value is not None:
             updates.append(f"{col} = ?")
             params.append(value)
+    if tier is not None:
+        if tier not in ("vip", "regular", "casual"):
+            raise ValueError(
+                f"tier must be vip|regular|casual; got {tier!r}",
+            )
+        updates.append("tier = ?")
+        params.append(tier)
+    if cadence_days is not None:
+        # Allow 0 to mean "unset" since None is "leave unchanged".
+        cd = int(cadence_days) if int(cadence_days) > 0 else None
+        updates.append("cadence_days = ?")
+        params.append(cd)
     if not updates:
         return False
     params.append(person_id)
@@ -702,6 +768,10 @@ def materialize_from_entities(
 # ============================ helpers =================================
 
 def _row_to_person(row: sqlite3.Row) -> Person:
+    # Round 19 — older DBs may not have tier/cadence/last_contact yet
+    # (the migration in db.py adds them on next init_schema), so be
+    # defensive about column access.
+    keys = row.keys() if hasattr(row, "keys") else ()
     return Person(
         id=int(row["id"]),
         canonical_name=row["canonical_name"],
@@ -714,6 +784,17 @@ def _row_to_person(row: sqlite3.Row) -> Person:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         mention_count=int(row["mention_count"]),
+        tier=(row["tier"] if "tier" in keys else "regular") or "regular",
+        cadence_days=(
+            int(row["cadence_days"])
+            if "cadence_days" in keys and row["cadence_days"] is not None
+            else None
+        ),
+        last_contact_at=(
+            float(row["last_contact_at"])
+            if "last_contact_at" in keys and row["last_contact_at"] is not None
+            else None
+        ),
     )
 
 
@@ -731,3 +812,141 @@ def link_after_index(conn: sqlite3.Connection, file_id: int) -> None:
         link_file_mentions(conn, file_id)
     except Exception as e:  # noqa: BLE001
         log.warning("people: link_after_index for %s failed: %s", file_id, e)
+
+
+# ============================ Round 19 — VIP / cadence ===============
+
+
+@dataclass
+class CadenceOverdue:
+    person: Person
+    days_since_contact: int
+    days_overdue: int  # over the cadence target
+
+
+def _vip_default_cadence(tier: str) -> int:
+    """Default cadence_days when tier is set but cadence_days is null.
+    VIPs every 14 days, regular every 60, casual not surfaced unless
+    explicit."""
+    return {"vip": 14, "regular": 60}.get(tier, 0)
+
+
+def refresh_last_contact(
+    conn: sqlite3.Connection,
+    person_id: int,
+) -> float | None:
+    """Recompute ``people.last_contact_at`` for one person from the
+    most-recent signal we have: a person_mentions row, an email-kind
+    file mentioning them, or a journal entry. Returns the new value
+    (None if no contact found)."""
+    # The strongest signal: latest mention timestamp.
+    row = conn.execute(
+        "SELECT MAX(mtime) AS m FROM person_mentions WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()
+    last_ts: float | None = (
+        float(row["m"]) if row and row["m"] is not None else None
+    )
+    # Also consider last_seen_at (it's already a maintained signal).
+    p_row = conn.execute(
+        "SELECT last_seen_at FROM people WHERE id = ?", (person_id,),
+    ).fetchone()
+    if p_row and p_row["last_seen_at"]:
+        seen = float(p_row["last_seen_at"])
+        last_ts = max(last_ts, seen) if last_ts else seen
+    conn.execute(
+        "UPDATE people SET last_contact_at = ? WHERE id = ?",
+        (last_ts, person_id),
+    )
+    conn.commit()
+    return last_ts
+
+
+def refresh_all_last_contacts(conn: sqlite3.Connection) -> int:
+    """Recompute every person's last_contact_at. Returns the number
+    of rows touched. Cheap — single grouped query under the hood."""
+    cur = conn.execute("""
+        UPDATE people SET last_contact_at = (
+            SELECT MAX(COALESCE(
+                (SELECT MAX(mtime) FROM person_mentions m
+                    WHERE m.person_id = people.id),
+                0
+            ), people.last_seen_at)
+        )
+    """)
+    conn.commit()
+    return cur.rowcount
+
+
+def list_overdue_contacts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 20,
+    tier_filter: list[str] | None = None,
+) -> list[CadenceOverdue]:
+    """List people whose cadence target has passed.
+
+    A person is "overdue" when:
+      - cadence_days IS NOT NULL AND
+      - last_contact_at + cadence_days*86400 < now
+    Tier 'vip' people without explicit cadence_days inherit
+    ``_vip_default_cadence``. 'casual' people need explicit cadence
+    to ever be surfaced.
+    """
+    now = time.time()
+    sql = "SELECT * FROM people WHERE 1=1"
+    params: list = []
+    if tier_filter:
+        placeholders = ",".join("?" for _ in tier_filter)
+        sql += f" AND tier IN ({placeholders})"
+        params.extend(tier_filter)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    out: list[CadenceOverdue] = []
+    for row in rows:
+        p = _row_to_person(row)
+        cd = p.cadence_days
+        if cd is None:
+            cd = _vip_default_cadence(p.tier)
+        if not cd:
+            continue
+        if p.last_contact_at is None:
+            # Never had recorded contact — surface VIPs immediately.
+            if p.tier == "vip":
+                out.append(CadenceOverdue(
+                    person=p, days_since_contact=999,
+                    days_overdue=999 - cd,
+                ))
+            continue
+        days_since = int((now - p.last_contact_at) / 86400.0)
+        days_over = days_since - cd
+        if days_over > 0:
+            out.append(CadenceOverdue(
+                person=p,
+                days_since_contact=days_since,
+                days_overdue=days_over,
+            ))
+    out.sort(key=lambda r: r.days_overdue, reverse=True)
+    return out[:limit]
+
+
+def list_vips(conn: sqlite3.Connection) -> list[Person]:
+    """Quick filter for the email triage path — VIP emails always
+    promote to 'urgent' regardless of body content (round 19)."""
+    rows = conn.execute(
+        "SELECT * FROM people WHERE tier = 'vip' "
+        "ORDER BY display_name ASC",
+    ).fetchall()
+    return [_row_to_person(r) for r in rows]
+
+
+def is_vip_email(conn: sqlite3.Connection, email: str) -> bool:
+    """O(1) check used by email_assist to short-circuit the
+    classifier for VIP senders."""
+    if not email:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM people WHERE tier = 'vip' "
+        "AND LOWER(email) = LOWER(?) LIMIT 1",
+        (email.strip(),),
+    ).fetchone()
+    return row is not None

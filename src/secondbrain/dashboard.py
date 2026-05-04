@@ -51,6 +51,17 @@ from .search import hybrid_search
 log = logging.getLogger(__name__)
 
 
+# Round 19 — module-level redact helper used by EA-feature routes.
+# Wraps safety.redact_text but tolerates the import being unavailable
+# (import-time dep cycle prevention; same pattern as elsewhere).
+def _safe(text):  # noqa: ANN001
+    try:
+        from .safety import redact_text
+        return redact_text(text or "")
+    except ImportError:
+        return text or ""
+
+
 def _extension_token_path(cfg: Config) -> Path:
     return cfg.data_dir / "extension_token.txt"
 
@@ -4443,6 +4454,462 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             '</style>'
         )
         return HTMLResponse(_layout("Timeline", body, "timeline"))
+
+    # ============================ Round 19 — EA features ==============
+
+    @app.get("/followups", response_class=HTMLResponse)
+    def followups_page():
+        """Round 19 (Phase EA-1) — bidirectional commitment tracker."""
+        from . import followups as fu_mod
+
+        _, conn, _, _ = get_state()
+        out_rows = fu_mod.list_open(
+            conn, direction="outgoing", limit=100,
+        )
+        in_rows = fu_mod.list_open(
+            conn, direction="incoming", limit=100,
+        )
+        overdue = fu_mod.list_overdue(conn)
+
+        def _redact(s):
+            return _safe(s)
+
+        def _row_html(f, kind: str) -> str:
+            age_days = (
+                int((time.time() - f.promised_at) / 86400.0)
+                if f.promised_at else None
+            )
+            age_str = f"{age_days}d" if age_days is not None else "—"
+            due_str = ""
+            overdue_class = ""
+            if f.due_at:
+                from datetime import date as _date
+                due_d = _date.fromtimestamp(f.due_at).isoformat()
+                if f.due_at < time.time():
+                    overdue_class = "fu-overdue"
+                    due_str = (
+                        f' <span class="muted">overdue '
+                        f'(was {escape(due_d)})</span>'
+                    )
+                else:
+                    due_str = (
+                        f' <span class="muted">due {escape(due_d)}'
+                        f'</span>'
+                    )
+            person_link = ""
+            if f.person_id:
+                person_link = (
+                    f'<a class="muted" href="/person?id={f.person_id}">'
+                    f'{escape(_redact(f.person_name)) or "—"}</a>'
+                )
+            elif f.person_name:
+                person_link = (
+                    f'<span class="muted">'
+                    f'{escape(_redact(f.person_name))}</span>'
+                )
+            else:
+                person_link = '<span class="muted">—</span>'
+            source_link = ""
+            if f.source_file_id:
+                source_link = (
+                    f' <a class="muted" '
+                    f'href="/file?file_id={f.source_file_id}">'
+                    f'(source)</a>'
+                )
+            return (
+                f'<div class="fu-row {overdue_class}" id="fu{f.id}">'
+                f'<div class="fu-meta">'
+                f'  {person_link} <span class="muted">·</span>'
+                f'  <span class="muted">{age_str} old</span>'
+                f'  {due_str}{source_link}'
+                f'</div>'
+                f'<div class="fu-topic">{escape(_redact(f.topic))}</div>'
+                f'<div class="fu-desc muted">'
+                f'{escape(_redact(f.description))}</div>'
+                f'<div class="fu-actions">'
+                f'  <form method="post" '
+                f'    action="/followups/{f.id}/resolve" '
+                f'    style="display:inline;">'
+                f'    <button type="submit">resolve</button>'
+                f'  </form>'
+                f'  <form method="post" '
+                f'    action="/followups/{f.id}/dismiss" '
+                f'    style="display:inline;">'
+                f'    <button type="submit" '
+                f'      style="background:#222;">dismiss</button>'
+                f'  </form>'
+                f'</div>'
+                f'</div>'
+            )
+
+        out_html = "".join(_row_html(f, "out") for f in out_rows) or (
+            '<div class="muted">_(nothing pending — clean slate)_</div>'
+        )
+        in_html = "".join(_row_html(f, "in") for f in in_rows) or (
+            '<div class="muted">_(nothing pending — clean slate)_</div>'
+        )
+        overdue_strip = ""
+        if overdue:
+            overdue_strip = (
+                f'<div class="card fu-overdue-strip">'
+                f'<strong>{len(overdue)} overdue</strong>'
+                f' — items past their due date'
+                f'</div>'
+            )
+        body = (
+            f'<h1>Follow-ups</h1>'
+            f'<p class="muted">'
+            f'  Bidirectional commitment tracker. Outgoing = you owe '
+            f'  others; Incoming = others owe you.'
+            f'</p>'
+            f'{overdue_strip}'
+            f'<div class="fu-cols">'
+            f'  <section class="card">'
+            f'    <h2>You owe ({len(out_rows)})</h2>'
+            f'    {out_html}'
+            f'  </section>'
+            f'  <section class="card">'
+            f'    <h2>Owed to you ({len(in_rows)})</h2>'
+            f'    {in_html}'
+            f'  </section>'
+            f'</div>'
+            '<style>'
+            '.fu-cols { display: grid; grid-template-columns: 1fr 1fr; '
+            '  gap: var(--s-3); margin-top: var(--s-3); }'
+            '@media (max-width: 800px) { .fu-cols { '
+            '  grid-template-columns: 1fr; } }'
+            '.fu-row { padding: var(--s-2) 0; '
+            '  border-bottom: 1px dashed var(--border); }'
+            '.fu-row:last-child { border-bottom: none; }'
+            '.fu-row.fu-overdue { border-left: 2px solid var(--red); '
+            '  padding-left: var(--s-2); }'
+            '.fu-meta { font-size: 11px; }'
+            '.fu-topic { font-weight: bold; margin-top: 2px; }'
+            '.fu-desc { font-size: 12.5px; margin-top: 2px; }'
+            '.fu-actions { margin-top: var(--s-1); }'
+            '.fu-actions button { font-size: 11px; '
+            '  padding: 2px 8px; margin-right: 4px; }'
+            '.fu-overdue-strip { background: rgba(255,77,77,0.10); '
+            '  border-color: var(--red); margin-top: var(--s-3); }'
+            '</style>'
+        )
+        return HTMLResponse(_layout("Follow-ups", body, "followups"))
+
+    @app.post("/followups/{followup_id:int}/resolve")
+    def followup_resolve(followup_id: int, request: Request):
+        from . import followups as fu_mod
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        fu_mod.mark_resolved(conn, followup_id)
+        return RedirectResponse(url="/followups", status_code=303)
+
+    @app.post("/followups/{followup_id:int}/dismiss")
+    def followup_dismiss(followup_id: int, request: Request):
+        from . import followups as fu_mod
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        fu_mod.mark_dismissed(conn, followup_id)
+        return RedirectResponse(url="/followups", status_code=303)
+
+    @app.get("/agenda", response_class=HTMLResponse)
+    def agenda_page(id: int = 0):  # noqa: A002
+        """Round 19 (Phase EA-2) — agenda index OR per-person card.
+
+        Without ``?id=`` shows a list of people to pick from.
+        With ``?id=`` renders the 1:1 agenda for that person.
+        """
+        from . import agenda as agenda_mod
+        from . import people as people_mod
+
+        _, conn, _, _ = get_state()
+        if id:
+            result = agenda_mod.build_agenda(conn, id)
+            if result is None:
+                return HTMLResponse(
+                    "<h1>Person not found</h1>", status_code=404,
+                )
+            md = agenda_mod.render_markdown(result)
+            body = (
+                f'<h1>1:1 with {escape(_safe(result.person_name))}</h1>'
+                f'<p class="muted">'
+                f'  {result.total_items} item(s) on the table.'
+                f'</p>'
+                f'<div class="briefing-body">'
+                f'{_markdown_to_html_block(md)}'
+                f'</div>'
+                f'<details style="margin-top:var(--s-4);">'
+                f'<summary class="muted">Markdown source</summary>'
+                f'<pre style="white-space:pre-wrap;">{escape(md)}</pre>'
+                f'</details>'
+                f'<p style="margin-top:var(--s-4);">'
+                f'<a class="link-btn" href="/agenda">'
+                f'← all people</a></p>'
+            )
+            return HTMLResponse(_layout(
+                f"Agenda · {result.person_name}", body, "agenda",
+            ))
+        # Index: list recent people for picking.
+        recent = people_mod.list_people(conn, order="recent", limit=30)
+        rows_html = "".join(
+            f'<li><a href="/agenda?id={p.id}">'
+            f'{escape(_safe(p.display_name))}</a>'
+            + (
+                ' <span class="tag">VIP</span>'
+                if p.tier == "vip" else ""
+            )
+            + (
+                f' <span class="muted">({escape(_safe(p.role))})</span>'
+                if p.role else ""
+            )
+            + '</li>'
+            for p in recent
+        )
+        body = (
+            f'<h1>Agenda</h1>'
+            f'<p class="muted">'
+            f'  Pick a person to build a 1:1 agenda. Pulls open '
+            f'  follow-ups, recent emails, journal mentions, and '
+            f'  shared topics into a single pre-meeting card.'
+            f'</p>'
+            f'<ul class="agenda-people">{rows_html}</ul>'
+            '<style>'
+            '.agenda-people { list-style: none; padding: 0; }'
+            '.agenda-people li { padding: var(--s-1) 0; }'
+            '.tag { font-size: 10px; padding: 1px 6px; '
+            '  background: var(--green-soft); color: var(--green); '
+            '  border-radius: var(--r); margin-left: 4px; }'
+            '</style>'
+        )
+        return HTMLResponse(_layout("Agenda", body, "agenda"))
+
+    @app.get("/triage", response_class=HTMLResponse)
+    def triage_page():
+        """Round 19 (Phase EA-6) — morning email triage queue."""
+        from . import triage_queue
+
+        _, conn, _, _ = get_state()
+        queue = triage_queue.build_queue(conn)
+        if not queue:
+            body = (
+                '<h1>Triage</h1>'
+                '<div class="empty card">'
+                '  <p>Inbox zero — nothing in the last 48h needs '
+                '  your decision.</p></div>'
+            )
+            return HTMLResponse(_layout("Triage", body, "triage"))
+        items_html = []
+        for it in queue:
+            vip_badge = (
+                '<span class="tag urgent">VIP</span>'
+                if it.is_vip else ""
+            )
+            label_class = {
+                "urgent": "urgent", "follow_up": "warn",
+                "review": "muted", "fyi": "muted",
+            }.get(it.label, "muted")
+            draft_link = (
+                f' · <a href="/drafts">draft #{it.draft_id} ready</a>'
+                if it.has_draft else ""
+            )
+            items_html.append(
+                f'<div class="triage-row">'
+                f'  <div class="triage-meta">'
+                f'    <span class="tag {label_class}">{it.label}</span>'
+                f'    {vip_badge}'
+                f'    <span class="muted">'
+                f'    {escape(_safe(it.from_display))}</span>'
+                f'    <span class="muted">·</span>'
+                f'    <span class="muted">{int(it.age_hours)}h</span>'
+                f'  </div>'
+                f'  <div class="triage-subject">'
+                f'    <a href="/file?file_id={it.file_id}">'
+                f'    {escape(_safe(it.subject)) or "(no subject)"}</a>'
+                f'    {draft_link}'
+                f'  </div>'
+                f'</div>'
+            )
+        body = (
+            f'<h1>Triage queue</h1>'
+            f'<p class="muted">'
+            f'  {len(queue)} email(s) need your decision today, '
+            f'  ranked by VIP × urgency × age.'
+            f'</p>'
+            + "".join(items_html)
+            + '<style>'
+            '.triage-row { padding: var(--s-2); '
+            '  border-bottom: 1px dashed var(--border); }'
+            '.triage-meta { font-size: 11px; }'
+            '.triage-subject { margin-top: 2px; }'
+            '.tag { font-size: 10px; padding: 1px 6px; '
+            '  border-radius: var(--r); margin-right: 4px; }'
+            '.tag.urgent { background: rgba(255,77,77,0.10); '
+            '  color: var(--red); }'
+            '.tag.warn { background: rgba(255,183,0,0.10); '
+            '  color: var(--amber); }'
+            '</style>'
+        )
+        return HTMLResponse(_layout("Triage", body, "triage"))
+
+    @app.get("/gifts", response_class=HTMLResponse)
+    def gifts_page():
+        """Round 19 (Phase EA-7) — birthday gift ideas."""
+        from . import gift_ideas
+
+        cfg, conn, _, _ = get_state()
+        try:
+            entries = gift_ideas.list_for_upcoming_birthdays(
+                conn, cfg, auto_generate=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            entries = []
+            log.warning("gifts page: %s", e)
+        if not entries:
+            body = (
+                '<h1>Gift ideas</h1>'
+                '<div class="empty card">'
+                '  <p>No birthdays in the next 14 days.</p></div>'
+            )
+            return HTMLResponse(_layout("Gifts", body, "gifts"))
+        rows_html = []
+        for p, days_until, ideas in entries:
+            ideas_html = ""
+            if ideas and ideas.ideas:
+                ideas_html = "<ul class='gift-ideas'>" + "".join(
+                    f"<li><strong>{escape(_safe(i.title))}</strong>"
+                    + (
+                        f" <span class='muted'>{escape(i.price_range)}</span>"
+                        if i.price_range else ""
+                    )
+                    + f"<br><span>{escape(_safe(i.description))}</span>"
+                    + (
+                        f"<br><em class='muted'>{escape(_safe(i.why))}</em>"
+                        if i.why else ""
+                    )
+                    + "</li>"
+                    for i in ideas.ideas
+                ) + "</ul>"
+            else:
+                ideas_html = (
+                    f'<form method="post" '
+                    f'action="/gifts/{p.id}/generate" '
+                    f'style="display:inline;">'
+                    f'<button type="submit">Generate ideas</button>'
+                    f'</form>'
+                )
+            rows_html.append(
+                f'<div class="card gift-card">'
+                f'<h3>{escape(_safe(p.display_name))}'
+                f'  <span class="muted">'
+                f'  · birthday in {days_until}d</span></h3>'
+                f'{ideas_html}'
+                f'</div>'
+            )
+        body = (
+            '<h1>Gift ideas</h1>'
+            '<p class="muted">Birthdays in the next 14 days. '
+            'Click "generate" to get 3 AI-suggested gifts.</p>'
+            + "".join(rows_html)
+            + '<style>'
+            '.gift-card { margin-bottom: var(--s-3); }'
+            '.gift-ideas { padding-left: var(--s-4); }'
+            '.gift-ideas li { margin-bottom: var(--s-2); }'
+            '</style>'
+        )
+        return HTMLResponse(_layout("Gifts", body, "gifts"))
+
+    @app.post("/gifts/{person_id:int}/generate")
+    def gifts_generate(person_id: int, request: Request):
+        from . import gift_ideas
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        cfg, conn, _, _ = get_state()
+        try:
+            gift_ideas.generate_for_person(
+                conn, cfg, person_id, overwrite=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("gifts/generate failed: %s", e)
+        return RedirectResponse(url="/gifts", status_code=303)
+
+    @app.get("/threads", response_class=HTMLResponse)
+    def threads_page():
+        """Round 19 (Phase EA-8) — standing-thread tracker."""
+        from . import standing_threads
+
+        _, conn, _, _ = get_state()
+        rows = standing_threads.list_threads(conn, limit=30)
+        if not rows:
+            body = (
+                '<h1>Standing threads</h1>'
+                '<div class="empty card">'
+                '  <p>No long-running threads detected yet. '
+                '  The detector runs hourly and needs ≥5 emails over '
+                '  ≥14 days to flag a thread.</p></div>'
+            )
+            return HTMLResponse(_layout("Threads", body, "threads"))
+        rows_html = []
+        for t in rows:
+            from datetime import date as _date
+            first = _date.fromtimestamp(t.first_message_at).isoformat()
+            last = _date.fromtimestamp(t.last_message_at).isoformat()
+            summary_html = (
+                f'<p>{escape(_safe(t.summary_md))}</p>'
+                if t.summary_md else
+                f'<form method="post" '
+                f'action="/threads/{t.id}/summarize" '
+                f'style="display:inline;">'
+                f'<button type="submit">Summarize</button>'
+                f'</form>'
+            )
+            rows_html.append(
+                f'<div class="card">'
+                f'<h3>{escape(_safe(t.topic))}</h3>'
+                f'<p class="muted">'
+                f'{t.n_messages} message(s) · {first} → {last}'
+                f'</p>'
+                f'{summary_html}'
+                f'</div>'
+            )
+        body = (
+            '<h1>Standing threads</h1>'
+            '<p class="muted">Long-running conversations across '
+            'people / topics. Click summarize for a Sonnet-generated '
+            'recap of decisions + open questions.</p>'
+            + "".join(rows_html)
+        )
+        return HTMLResponse(_layout("Threads", body, "threads"))
+
+    @app.post("/threads/{thread_id:int}/summarize")
+    def threads_summarize(thread_id: int, request: Request):
+        from . import standing_threads
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        cfg, conn, _, _ = get_state()
+        try:
+            standing_threads.summarize(
+                conn, cfg, thread_id, force=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("threads/summarize failed: %s", e)
+        return RedirectResponse(url="/threads", status_code=303)
+
+    @app.get("/eod", response_class=HTMLResponse)
+    def eod_page():
+        """Round 19 (Phase EA-9) — end-of-day wrap-up."""
+        from . import eod_wrapup
+
+        _, conn, _, _ = get_state()
+        w = eod_wrapup.build_wrapup(conn)
+        md = eod_wrapup.render_markdown(w)
+        body = (
+            f'<h1>End of day</h1>'
+            f'<div class="briefing-body">'
+            f'{_markdown_to_html_block(md)}'
+            f'</div>'
+        )
+        return HTMLResponse(_layout("EOD", body, "eod"))
 
     # --- Phase 47: tasks view -----------------------------------------
 

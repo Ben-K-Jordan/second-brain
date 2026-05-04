@@ -226,6 +226,33 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             "ALTER TABLE watchlist_runs ADD COLUMN new_count INTEGER NOT NULL DEFAULT 0"
         )
 
+    # Round 19 migration — VIP tiering + cadence on people.
+    # tier        ∈ {'vip', 'regular', 'casual'} affects email triage
+    #             urgency + agenda priority + cadence-overdue threshold.
+    # cadence_days NULL = no target; integer = "I want to talk to this
+    #             person every N days" (cadence detector compares against
+    #             last_contact_at to surface "overdue contact" notifs).
+    # last_contact_at = unix ts of the most recent inferred contact —
+    #             email send/recv, calendar attendance, iMessage, journal
+    #             mention. Computed by `people._refresh_last_contact`.
+    people_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(people)")
+    }
+    if people_cols and "tier" not in people_cols:
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN tier TEXT "
+            "NOT NULL DEFAULT 'regular'"
+        )
+    if people_cols and "cadence_days" not in people_cols:
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN cadence_days INTEGER"
+        )
+    if people_cols and "last_contact_at" not in people_cols:
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN last_contact_at REAL"
+        )
+
     # Chat conversations: each conversation has many turns, each turn has a
     # role (user / assistant) and a content blob. Citations are stored per
     # assistant turn so we can re-render past chats with their sources.
@@ -395,6 +422,11 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             first_seen_at REAL NOT NULL,
             last_seen_at REAL NOT NULL,
             mention_count INTEGER NOT NULL DEFAULT 0,
+            -- Round 19 — EA tiering / cadence. New columns mirror
+            -- the migration block lower in init_schema for old DBs.
+            tier TEXT NOT NULL DEFAULT 'regular',
+            cadence_days INTEGER,
+            last_contact_at REAL,
             UNIQUE(canonical_name)
         );
         CREATE INDEX IF NOT EXISTS idx_people_email ON people(email);

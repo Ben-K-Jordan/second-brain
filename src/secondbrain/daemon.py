@@ -573,6 +573,70 @@ def _build_daemon_scheduler(
         fn=lambda cfg, conn: _notif_detect(conn),
     ))
 
+    # ============================ Round 19 — EA jobs ===============
+
+    # EA-1: extract follow-ups from new emails / journal / meeting
+    # transcripts. Per-feature budget bucket "followups" caps spend.
+    # 30-minute cadence so a fresh email gets tracked within half an
+    # hour without burning Haiku tokens on every tick.
+    from .followups import extract_from_recent_inputs as _fu_extract
+    sched.register(Job(
+        name="followup_extractor",
+        schedule=IntervalSchedule(seconds=30 * 60),
+        fn=lambda cfg, conn: _fu_extract(conn, cfg, hours=24),
+    ))
+
+    # EA-3: meeting capture for newly indexed transcripts. Slow
+    # cadence (60 min) since this is one Sonnet call per transcript
+    # and the user usually doesn't have many meetings per hour.
+    from .meeting_capture import daemon_capture_recent as _mc_daemon
+    sched.register(Job(
+        name="meeting_capture",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _mc_daemon(conn, cfg, hours=48),
+    ))
+
+    # EA-5: refresh per-person last_contact_at so cadence overdue
+    # detection has fresh data. Cheap query (single grouped UPDATE);
+    # 60-minute cadence is plenty.
+    from .people import refresh_all_last_contacts as _refresh_contacts
+    sched.register(Job(
+        name="last_contact_refresh",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda conn: _refresh_contacts(conn),
+    ))
+
+    # EA-8: standing thread detection — find clusters of correspondence
+    # that look like long-running threads. Slow cadence; the LLM
+    # summarisation is on-demand from the dashboard, not auto-fired.
+    from .standing_threads import detect_threads as _st_detect
+    sched.register(Job(
+        name="standing_threads_detect",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=6),
+        fn=lambda conn: _st_detect(conn),
+    ))
+
+    # EA-9: end-of-day wrap-up — fires once per day, gated by a
+    # local-time check so it actually lands at the user's evening.
+    from .eod_wrapup import daemon_post_eod_notification as _eod_post
+    sched.register(Job(
+        name="eod_wrapup",
+        schedule=DailyAtSchedule(
+            local_time=getattr(cfg, "eod_send_time", "18:00"),
+            cooldown_hours=20,
+        ),
+        fn=lambda conn: _eod_post(conn),
+    ))
+
+    # EA-10: conditional reminders — poll every 5 min so "fire after
+    # Friday" doesn't drift far past the actual time.
+    from .conditional_reminders import check_and_fire as _cr_check
+    sched.register(Job(
+        name="conditional_reminders",
+        schedule=IntervalSchedule(seconds=5 * 60),
+        fn=lambda conn: _cr_check(conn),
+    ))
+
     return sched
 
 
