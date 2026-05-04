@@ -263,12 +263,16 @@ header .kbd-hint:hover {
         grid-template-columns: repeat(2, 1fr);
     }
 }
-@media (max-width: 480px) {
+@media (max-width: 800px) {
     .nav-more-pop {
         min-width: 220px; max-width: calc(100vw - 16px);
         grid-template-columns: 1fr;
     }
-    /* Header itself wraps so primary-nav buttons + brand stay visible. */
+    /* Header itself wraps so primary-nav buttons + brand stay visible.
+       Round 16 raised primary nav to 8 items (added Review + Inbox);
+       round-17 audit flagged that this would wrap on 1024px. Bumping
+       the wrap threshold from 480px to 800px so narrow laptops get
+       a clean two-row nav instead of a single-row overflow. */
     header { flex-wrap: wrap; }
     header nav { flex-wrap: wrap; }
 }
@@ -4128,13 +4132,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/notifications", response_class=HTMLResponse)
     def notifications_page():
-
         from . import notifications as notif_mod
         _, conn, _, _ = get_state()
-        # Surface what's been detected lazily so the page always
-        # reflects current state (idempotent + cheap).
+        # Round 17 fix (audit-found perf gap) — call the throttled
+        # variant so a tab-refresh storm doesn't trigger 7 detectors
+        # × full-table scans per load. Hourly scheduler is the source
+        # of truth; this is just a "freshen on visit" hook.
         try:
-            notif_mod.detect_all(conn)
+            notif_mod.detect_all_throttled(conn)
         except Exception:  # noqa: BLE001
             pass
         pending = notif_mod.list_pending(conn, limit=50)

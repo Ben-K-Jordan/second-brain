@@ -15,7 +15,7 @@ The codebase is one Python package (`secondbrain/`) that ships with:
 - **A local LLM chat surface** that runs Anthropic Claude (Sonnet 4.5 by default) grounded in your brain. Multi-turn, persisted, with the same conversation visible across the dashboard, the CLI, and Claude Desktop.
 - **An MCP server** (`secondbrain serve`) exposing 50+ tools so Claude Desktop / Claude Code / Cursor can search, summarize, draft, and reason over your knowledge base.
 - **A typer-based CLI** with 30+ commands. Lists below.
-- **30+ data connectors**: Gmail, Google Calendar, Google Drive, IMAP, GitHub, Linear, Notion, Slack, Reddit, Hacker News, Pocket, Substack, RSS, Bluesky, Mastodon, Obsidian vaults, browser history, X/Twitter archive, Oura, Readwise, Canvas LMS, jobs (Greenhouse/Lever/Ashby), Apple iMessage chat.db, and more.
+- **27 data connectors**: Gmail, Google Calendar, Google Drive, IMAP, GitHub, Linear, Notion, Slack, Reddit, Hacker News, Pocket, Substack, RSS, Bluesky, Mastodon, Obsidian vaults, browser history, X/Twitter archive, Oura, Readwise, Canvas LMS, jobs (Greenhouse/Lever/Ashby), Apple iMessage chat.db, and more.
 - **Email assistance**: triage incoming mail by urgency, draft replies in your voice (extracted from your sent-mail patterns), generate thank-you notes after meetings.
 - **Daily brief + weekly letter**: morning email digest (`secondbrain brief send`); Sunday personal letter from Claude Sonnet that synthesizes the week (`secondbrain review`).
 - **Smart notifications**: tray pop-ups for time-sensitive things only — urgent emails, birthdays in 3 days, broken integrations, missed habits.

@@ -485,7 +485,11 @@ def test_palette_includes_diagnostics():
 
 def test_nav_has_responsive_breakpoints():
     """The CSS must include @media queries for narrow viewports so
-    the More dropdown doesn't overflow on phones."""
+    the More dropdown doesn't overflow on phones.
+
+    Round 17 raised the nav-wrap breakpoint from 480px to 800px so
+    8-item primary nav (Round 16 added Review + Inbox) wraps cleanly
+    on narrow laptops instead of overflowing in a single row."""
     from secondbrain.dashboard import CSS
     assert "@media (max-width: 720px)" in CSS
-    assert "@media (max-width: 480px)" in CSS
+    assert "@media (max-width: 800px)" in CSS

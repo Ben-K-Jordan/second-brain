@@ -283,13 +283,31 @@ class IMessageConnector:
         # Apple's database. The URI form forces RO; we also copy the
         # file to a temp first because Apple holds open handles on it
         # and SQLite WAL on a live file can confuse our reader.
+        #
+        # Round 17 fix (audit-found gap C-tempfile) — write the temp
+        # copy under ``cfg.data_dir / .tmp`` instead of the OS default
+        # tempdir (/tmp on Linux, %TEMP% on Windows). Modern systems
+        # are user-only by default but historically /tmp was world-
+        # readable; this avoids leaking the entire chat history to
+        # other users on a shared machine. Also chmod 0o600 explicitly
+        # for belt-and-suspenders on Linux/macOS (Windows ignores).
         import shutil
         import tempfile
+        tmp_dir = cfg.data_dir / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_dir.chmod(0o700)
+        except OSError:
+            pass  # Windows
         with tempfile.NamedTemporaryFile(
-            suffix=".db", delete=False,
+            suffix=".db", delete=False, dir=str(tmp_dir),
         ) as tf:
             tmp_path = Path(tf.name)
         try:
+            try:
+                tmp_path.chmod(0o600)
+            except OSError:
+                pass  # Windows
             try:
                 shutil.copyfile(str(path), str(tmp_path))
                 # Also copy the WAL + shm if present (Apple uses WAL).

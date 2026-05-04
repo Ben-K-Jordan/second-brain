@@ -3160,9 +3160,11 @@ def backup(
     with tempfile.NamedTemporaryFile(
         suffix=".db", delete=False,
     ) as tf:
-        tmp_path = Path(tf.name)
+        tmp_path: Path | None = Path(tf.name)
     try:
         src = sqlite3.connect(str(src_path))
+        # mypy / runtime: tmp_path is non-None here.
+        assert tmp_path is not None
         dest = sqlite3.connect(str(tmp_path))
         try:
             with dest:
@@ -3178,9 +3180,15 @@ def backup(
             # crash mid-copy doesn't leave a half-written file at out.
             import shutil
             shutil.move(str(tmp_path), str(out))
-            tmp_path = Path("")  # sentinel: don't unlink
+            # Round 17 fix (audit-found gap H1) — proper sentinel.
+            # Previously we set ``Path("")`` here, which is truthy
+            # AND ``Path("").exists()`` returns True (resolves to
+            # CWD), so the cleanup `unlink()` ran against the wrong
+            # path. None-as-sentinel + explicit ``is not None`` check
+            # avoids the trap.
+            tmp_path = None
     finally:
-        if tmp_path and tmp_path.exists():
+        if tmp_path is not None and tmp_path.exists():
             try:
                 tmp_path.unlink()
             except OSError:
@@ -3248,8 +3256,9 @@ def restore(
     with tempfile.NamedTemporaryFile(
         suffix=".db", delete=False,
     ) as tf:
-        tmp_path = Path(tf.name)
+        tmp_path: Path | None = Path(tf.name)
     try:
+        assert tmp_path is not None
         if is_encrypted:
             passphrase = _read_backup_passphrase(confirm=False)
             if not passphrase:
@@ -3278,9 +3287,10 @@ def restore(
         if out_path.exists():
             out_path.unlink()
         shutil.move(str(tmp_path), str(out_path))
-        tmp_path = Path("")
+        # Round 17 fix (audit-found gap H1) — None sentinel; see backup().
+        tmp_path = None
     finally:
-        if tmp_path and tmp_path.exists():
+        if tmp_path is not None and tmp_path.exists():
             try:
                 tmp_path.unlink()
             except OSError:

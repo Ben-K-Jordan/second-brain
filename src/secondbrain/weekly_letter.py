@@ -383,16 +383,30 @@ def _signal_goals(conn: sqlite3.Connection) -> list[dict]:
 def _signal_top_entities(
     conn: sqlite3.Connection, week_cutoff: float,
 ) -> list[dict]:
-    """People / orgs / projects mentioned across the week's docs."""
+    """People / orgs / projects mentioned across the week's docs.
+
+    Round 17 fix (audit-found gap H4) — proper GROUP BY. The earlier
+    version selected ``e.text, e.label`` while grouping only by
+    ``e.text_lower``; SQLite tolerates this but returns *some*
+    arbitrary row's text/label. So if the same person showed up as
+    "Sarah" and "sarah" in two different docs, the surfaced casing
+    was non-deterministic; if an entity had two labels (PERSON in
+    one doc, ORG in another) we surfaced an arbitrary one.
+
+    Fix: aggregate text via MIN() (deterministic) and group by both
+    text_lower AND label so PERSON-vs-ORG of the same surface form
+    don't collapse into one row with a wrong label.
+    """
     try:
         rows = conn.execute(
-            "SELECT e.text, e.label, COUNT(DISTINCT c.file_id) AS n "
+            "SELECT MIN(e.text) AS text, e.label, "
+            "       COUNT(DISTINCT c.file_id) AS n "
             "FROM entities e JOIN chunks c ON c.id = e.chunk_id "
             "JOIN files f ON f.id = c.file_id "
             "WHERE f.indexed_at >= ? "
             "  AND e.label IN "
             "      ('PERSON','ORG','PRODUCT','WORK_OF_ART','EVENT','GPE') "
-            "GROUP BY e.text_lower ORDER BY n DESC LIMIT 12",
+            "GROUP BY e.text_lower, e.label ORDER BY n DESC LIMIT 12",
             (week_cutoff,),
         ).fetchall()
     except sqlite3.OperationalError:
@@ -677,6 +691,21 @@ def generate_letter(
     if not text:
         return fallback, "fallback:stats", cost
     # Audit log so the user can see what model + cost / time.
+    # Round 17 (audit-found gap C2) — explicitly enumerate the
+    # personal-data signals that went outbound. The `summary` is what
+    # shows up in /audit; the user grepping "what did I send to
+    # Anthropic last Sunday?" sees journal-entry count + flag at a
+    # glance, not just a raw `prompt_chars=X` number.
+    n_journal = len(signals.journal)
+    has_health = bool(signals.health)
+    has_meetings = bool(signals.meetings)
+    summary_bits = [f"weekly letter for {signals.week_end}"]
+    if n_journal:
+        summary_bits.append(f"sent {n_journal} journal day(s)")
+    if has_health:
+        summary_bits.append("incl. health metrics")
+    if has_meetings:
+        summary_bits.append("incl. meeting snippets")
     try:
         from . import ai_audit
         ai_audit.record_action(
@@ -685,7 +714,13 @@ def generate_letter(
             prompt_chars=len(prompt),
             response_chars=len(text),
             cents=cost,
-            summary=f"weekly letter for {signals.week_end}",
+            summary=" — ".join(summary_bits),
+            extra={
+                "n_journal_entries": n_journal,
+                "has_health_signals": has_health,
+                "has_meeting_snippets": has_meetings,
+                "n_top_entities": len(signals.top_entities),
+            },
         )
     except Exception:  # noqa: BLE001
         pass
@@ -820,25 +855,33 @@ def _save_letter(
     cost_cents: float,
     overwrite: bool = False,
 ) -> WeeklyLetter:
-    """Persist (or replace) a letter for the given week_end."""
+    """Persist (or replace) a letter for the given week_end.
+
+    Round 17 fix (audit-found gap E2) — wrap the DELETE + INSERT in
+    a single transaction. If a crash hit between the two on
+    overwrite=True, the row was gone with no replacement.
+    """
     _ensure_schema(conn)
     payload = (
         signals.week_start, signals.week_end,
         json.dumps(signals.to_dict(), default=str),
         letter_md, model, cost_cents, time.time(),
     )
-    if overwrite:
+    # ``with conn`` opens an implicit transaction; commits on success
+    # and rolls back on exception. Round-15 used the same pattern in
+    # indexer.py for the analogous file+chunks atomic-write fix.
+    with conn:
+        if overwrite:
+            conn.execute(
+                "DELETE FROM weekly_letters WHERE week_end = ?",
+                (signals.week_end,),
+            )
         conn.execute(
-            "DELETE FROM weekly_letters WHERE week_end = ?",
-            (signals.week_end,),
+            "INSERT INTO weekly_letters"
+            "(week_start, week_end, signals_json, letter_md, model, "
+            " cost_cents, generated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            payload,
         )
-    conn.execute(
-        "INSERT INTO weekly_letters"
-        "(week_start, week_end, signals_json, letter_md, model, "
-        " cost_cents, generated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        payload,
-    )
-    conn.commit()
     return latest_letter(conn) or _row_to_letter({
         "id": 0,
         **dict(zip(

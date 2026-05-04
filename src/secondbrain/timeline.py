@@ -334,7 +334,17 @@ def parse_window(
 
     ``when='2025-04-12'`` → that day; ``when=None`` → today.
     ``days=N`` widens to N days ending at ``when`` (inclusive).
+
+    Round 17 fix (audit-found gap A-window) — clamp ``days`` to
+    >= 1. Previously ``days=0`` silently produced a 1-day window
+    (start = end), and ``days=-3`` yielded a future-shifted window
+    via the negative timedelta. Now both raise ValueError so a CLI /
+    MCP caller passing nonsense gets immediate feedback.
     """
+    if days < 1:
+        raise ValueError(
+            f"days must be >= 1; got {days}",
+        )
     if when:
         try:
             end_d = date.fromisoformat(when)
@@ -342,7 +352,7 @@ def parse_window(
             end_d = date.today()
     else:
         end_d = date.today()
-    start_d = end_d - timedelta(days=max(0, days - 1))
+    start_d = end_d - timedelta(days=days - 1)
     since = datetime(start_d.year, start_d.month, start_d.day).timestamp()
     until = (
         datetime(end_d.year, end_d.month, end_d.day) + timedelta(days=1)

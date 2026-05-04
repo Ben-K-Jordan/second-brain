@@ -344,6 +344,11 @@ def get_chat_conversation(conversation_id: int, max_messages: int = 50) -> str:
     Use after ``list_chat_conversations`` to pick up where you left
     off on the dashboard. Returns the messages as Markdown so you can
     quote them back conversationally.
+
+    Round 17 fix (audit-found gap H2): every message body, the
+    title, and the system prompt pass through ``_safe`` (which
+    applies ``redact_text``) on their way out. Secrets pasted into
+    a previous turn don't get exfiltrated to the LLM consumer.
     """
     import json
 
@@ -360,7 +365,7 @@ def get_chat_conversation(conversation_id: int, max_messages: int = 50) -> str:
     else:
         truncated = False
     lines = [
-        f"# {conv['title'] or 'Conversation'}",
+        f"# {_safe(conv['title']) or 'Conversation'}",
         f"_Conversation #{conversation_id}, "
         f"{len(rows)} message(s) shown_",
         "",
@@ -369,7 +374,9 @@ def get_chat_conversation(conversation_id: int, max_messages: int = 50) -> str:
         lines.append("_(showing only the most recent " +
                      str(max_messages) + " messages)_\n")
     if conv["system_prompt"]:
-        lines.append("**System prompt:** " + conv["system_prompt"][:300])
+        lines.append(
+            "**System prompt:** " + _safe(conv["system_prompt"][:300]),
+        )
         lines.append("")
     for row in rows:
         role = row["role"]
@@ -386,7 +393,7 @@ def get_chat_conversation(conversation_id: int, max_messages: int = 50) -> str:
         else:
             text = str(content)
         lines.append(f"### {role}")
-        lines.append(text)
+        lines.append(_safe(text))
         lines.append("")
     return "\n".join(lines)
 
@@ -403,6 +410,12 @@ def append_chat_message(
     the full cross-surface conversation. Role must be 'user' or
     'assistant'.
 
+    Round 17 fix (audit-found gap H2): the persisted text passes
+    through ``_safe`` (redact_text) so secrets pasted into Claude
+    Desktop don't land in the dashboard chat history unmasked, where
+    they'd be visible to anyone reading the page or fetched back via
+    ``get_chat_conversation``.
+
     Returns the new message id.
     """
     import json
@@ -414,8 +427,9 @@ def append_chat_message(
         return f"_Bad role {role!r}; must be 'user' or 'assistant'._"
     if chat_get_conversation(conn, conversation_id) is None:
         return f"_Conversation #{conversation_id} not found._"
+    redacted = _safe(text)
     mid = chat_append_message(
-        conn, conversation_id, role, json.dumps(text),
+        conn, conversation_id, role, json.dumps(redacted),
     )
     return f"OK: appended message #{mid} to conversation #{conversation_id}"
 

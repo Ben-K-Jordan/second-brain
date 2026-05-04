@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from dataclasses import dataclass
@@ -44,6 +45,16 @@ from datetime import date, timedelta
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+
+# Round 17 fix (audit-found gap E1) — serialise writes to the
+# notifications table. The tray notification thread, the scheduler
+# thread, and FastAPI dashboard request workers all share the same
+# writer connection (Round 1 design choice). sqlite3 connections are
+# not thread-safe by default; concurrent commits can interleave the
+# cursor state and corrupt fetches. Round 13 added an identical lock
+# for ai_audit; this is the equivalent for notifications.
+_WRITE_LOCK = threading.RLock()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -140,17 +151,32 @@ def enqueue(
     (UNIQUE on key means re-fires no-op).
     """
     import json
-    _ensure_schema(conn)
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO notifications"
-        "(key, kind, urgency, title, body, href, payload_json, "
-        " status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-        (key, kind, urgency, title, body, href,
-         json.dumps(payload or {}), time.time()),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    # Round 17 fix: serialise schema-init AND INSERT + commit so
+    # concurrent writers (tray thread, scheduler, dashboard workers)
+    # can't interleave OR race on the lazy schema setup. Mirrors the
+    # round-13 _AUDIT_WRITE_LOCK pattern in ai_audit.
+    with _WRITE_LOCK:
+        try:
+            _ensure_schema(conn)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO notifications"
+                "(key, kind, urgency, title, body, href, payload_json, "
+                " status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (key, kind, urgency, title, body, href,
+                 json.dumps(payload or {}), time.time()),
+            )
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                # INSERT OR IGNORE hit UNIQUE conflict → no
+                # transaction was opened → commit() raises. Safe to
+                # ignore; the row already exists from a prior call.
+                pass
+            return cur.rowcount > 0
+        except Exception as e:  # noqa: BLE001
+            log.debug("notifications: enqueue failed: %s", e)
+            return False
 
 
 def list_pending(
@@ -187,36 +213,88 @@ def count_pending(conn: sqlite3.Connection) -> int:
 
 def mark_shown(conn: sqlite3.Connection, notification_id: int) -> None:
     _ensure_schema(conn)
-    conn.execute(
-        "UPDATE notifications SET status = 'shown', shown_at = ? "
-        "WHERE id = ? AND status = 'pending'",
-        (time.time(), notification_id),
-    )
-    conn.commit()
+    with _WRITE_LOCK:
+        try:
+            conn.execute(
+                "UPDATE notifications SET status = 'shown', shown_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (time.time(), notification_id),
+            )
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # nothing to commit (no row matched)
+        except Exception as e:  # noqa: BLE001
+            log.debug("notifications: mark_shown failed: %s", e)
 
 
 def mark_dismissed(conn: sqlite3.Connection, notification_id: int) -> None:
     _ensure_schema(conn)
-    conn.execute(
-        "UPDATE notifications SET status = 'dismissed', dismissed_at = ? "
-        "WHERE id = ?",
-        (time.time(), notification_id),
-    )
-    conn.commit()
+    with _WRITE_LOCK:
+        try:
+            conn.execute(
+                "UPDATE notifications SET status = 'dismissed', "
+                "dismissed_at = ? WHERE id = ?",
+                (time.time(), notification_id),
+            )
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        except Exception as e:  # noqa: BLE001
+            log.debug("notifications: mark_dismissed failed: %s", e)
 
 
 def dismiss_all(conn: sqlite3.Connection) -> int:
+    """Round 17 fix (audit-found gap D2) — only dismisses 'pending'.
+
+    The earlier version flipped both 'pending' AND 'shown' rows to
+    'dismissed', overwriting the ``shown_at`` history of items the
+    user had already seen via tray pop. The user-facing semantics of
+    'Dismiss all' is "clear my pending inbox" — already-shown items
+    aren't pending and shouldn't be touched.
+    """
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE notifications SET status = 'dismissed', dismissed_at = ? "
-        "WHERE status IN ('pending', 'shown')",
-        (time.time(),),
-    )
-    conn.commit()
-    return cur.rowcount
+    with _WRITE_LOCK:
+        try:
+            cur = conn.execute(
+                "UPDATE notifications SET status = 'dismissed', "
+                "dismissed_at = ? WHERE status = 'pending'",
+                (time.time(),),
+            )
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            return cur.rowcount
+        except Exception as e:  # noqa: BLE001
+            log.debug("notifications: dismiss_all failed: %s", e)
+            return 0
 
 
 # ============================ detectors ===============================
+
+
+def _safe_date_in_year(year: int, month: int, day: int) -> date | None:
+    """Round 17 fix (audit-found gap H3) — handle Feb 29 in non-leap
+    years by remapping to Feb 28. Without this, anyone born on Feb 29
+    silently gets zero birthday notifications in non-leap years
+    (because ``date(2025, 2, 29)`` raises ``ValueError`` and the
+    ``except`` swallows the entire person).
+
+    Returns the resolved date or None if month/day is fundamentally
+    invalid (e.g. day=99).
+    """
+    try:
+        return date(year, month, day)
+    except ValueError:
+        # Most common failure: Feb 29 in non-leap year.
+        if month == 2 and day == 29:
+            try:
+                return date(year, 2, 28)
+            except ValueError:
+                return None
+        return None
 
 
 def _detect_email_urgent(conn: sqlite3.Connection) -> int:
@@ -274,9 +352,13 @@ def _detect_birthdays(conn: sqlite3.Connection) -> int:
                 mm, dd = int(parts[0]), int(parts[1])
             else:
                 continue
-            this_year = date(today.year, mm, dd)
+            this_year = _safe_date_in_year(today.year, mm, dd)
+            if this_year is None:
+                continue
             if this_year < today:
-                this_year = date(today.year + 1, mm, dd)
+                this_year = _safe_date_in_year(today.year + 1, mm, dd)
+                if this_year is None:
+                    continue
         except (ValueError, IndexError):
             continue
         if today <= this_year <= horizon:
@@ -479,6 +561,30 @@ def detect_all(conn: sqlite3.Connection) -> dict:
     if total:
         log.info("notifications: detected %d new (%s)", total, out)
     return out
+
+
+# Round 17 fix (audit-found gap B-throttle) — the dashboard
+# /notifications page used to call detect_all() on every load,
+# which means a full people-table scan + email scan per page hit.
+# Throttle to once per ``_DETECT_THROTTLE_SEC`` so refreshing the
+# page doesn't hammer the DB. The hourly scheduler still fires
+# unconditionally for guaranteed freshness.
+_DETECT_THROTTLE_SEC = 60.0
+_last_detect_ts: float = 0.0
+_detect_throttle_lock = threading.Lock()
+
+
+def detect_all_throttled(conn: sqlite3.Connection) -> dict | None:
+    """Same as ``detect_all`` but no-ops when called more often than
+    every ``_DETECT_THROTTLE_SEC`` seconds. Returns the detector
+    summary dict, or None when throttled."""
+    global _last_detect_ts
+    now = time.time()
+    with _detect_throttle_lock:
+        if now - _last_detect_ts < _DETECT_THROTTLE_SEC:
+            return None
+        _last_detect_ts = now
+    return detect_all(conn)
 
 
 # ============================ tray surfacer ===========================
