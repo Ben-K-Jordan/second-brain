@@ -201,6 +201,16 @@ class Config:
     # ~/Library/Messages/chat.db. On Windows / Linux you'd copy the
     # file from a Mac. Both this and IMESSAGE_DB_PATH env work.
     imessage_db_path: str = ""
+    # Round 20 — global scheduling defaults. Per-person overrides
+    # in scheduling_prefs override these.
+    scheduling_earliest_hour: int = 9        # don't propose < 9am local
+    scheduling_latest_hour: int = 17         # don't propose > 5pm local
+    scheduling_buffer_minutes: int = 15      # padding around busy events
+    # EOD wrap-up time (round 19; explicit here for completeness).
+    eod_send_time: str = "18:00"
+    # User's display name for prompts ("Ben"). Used by followups +
+    # meeting_capture + nudge drafter to refer to the user.
+    user_name: str = ""
     # Jobs connector: companies to watch on each ATS provider. The slug is
     # whatever appears in the public board URL - e.g. anthropic.com's
     # Greenhouse board is at boards.greenhouse.io/anthropic, so the slug

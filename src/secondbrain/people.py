@@ -950,3 +950,84 @@ def is_vip_email(conn: sqlite3.Connection, email: str) -> bool:
         (email.strip(),),
     ).fetchone()
     return row is not None
+
+
+def infer_cadence_for_person(
+    conn: sqlite3.Connection, person_id: int,
+    *,
+    min_contacts: int = 4,
+    lookback_days: int = 365,
+) -> int | None:
+    """Round 20 — infer the user's typical contact frequency with
+    one person from their mention history.
+
+    Heuristic: pull the person_mentions timestamps over the last
+    ``lookback_days``. If we have at least ``min_contacts``, compute
+    the median inter-arrival gap in days and round to a sensible
+    bucket (7, 14, 30, 60, 90).
+
+    Returns the suggested cadence_days (rounded), or None if not
+    enough signal. Caller decides whether to apply it.
+    """
+    cutoff = time.time() - lookback_days * 86400
+    rows = conn.execute(
+        "SELECT mtime FROM person_mentions "
+        "WHERE person_id = ? AND mtime >= ? "
+        "ORDER BY mtime ASC",
+        (person_id, cutoff),
+    ).fetchall()
+    if len(rows) < min_contacts:
+        return None
+    gaps_days: list[float] = []
+    prev = float(rows[0]["mtime"])
+    for r in rows[1:]:
+        cur = float(r["mtime"])
+        gap = (cur - prev) / 86400.0
+        if gap >= 0.5:  # ignore same-day repeats
+            gaps_days.append(gap)
+        prev = cur
+    if not gaps_days:
+        return None
+    gaps_days.sort()
+    median_days = gaps_days[len(gaps_days) // 2]
+    # Round to a sensible bucket — 7, 14, 30, 60, 90.
+    buckets = [7, 14, 30, 60, 90]
+    closest = min(buckets, key=lambda b: abs(b - median_days))
+    return closest
+
+
+def auto_apply_inferred_cadence(
+    conn: sqlite3.Connection,
+    *,
+    only_for_tier: tuple[str, ...] = ("vip", "regular"),
+    only_if_unset: bool = True,
+    max_updates: int = 50,
+) -> int:
+    """Walk people in the given tiers, infer cadence_days for each
+    that meets the signal threshold, and persist if (a) we have
+    enough data and (b) cadence_days isn't already set when
+    ``only_if_unset`` is True. Returns count updated."""
+    placeholders = ",".join("?" * len(only_for_tier))
+    rows = conn.execute(
+        f"SELECT id, cadence_days FROM people "
+        f"WHERE tier IN ({placeholders}) "
+        f"ORDER BY mention_count DESC LIMIT ?",
+        (*only_for_tier, max_updates * 4),
+    ).fetchall()
+    n_updated = 0
+    for r in rows:
+        if n_updated >= max_updates:
+            break
+        if only_if_unset and r["cadence_days"] is not None:
+            continue
+        suggested = infer_cadence_for_person(conn, int(r["id"]))
+        if suggested is None:
+            continue
+        conn.execute(
+            "UPDATE people SET cadence_days = ? WHERE id = ?",
+            (suggested, int(r["id"])),
+        )
+        n_updated += 1
+    if n_updated:
+        conn.commit()
+    return n_updated

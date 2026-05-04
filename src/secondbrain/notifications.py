@@ -544,6 +544,133 @@ def _parse_due_hint(hint: str, today: date) -> date | None:
     return None
 
 
+def _detect_followup_overdue(conn: sqlite3.Connection) -> int:
+    """Round 20 — followups whose due_at has passed.
+
+    Idempotent key: ``followup_overdue:<id>`` — fires once per
+    overdue followup. If the user resolves and a new followup
+    re-uses the same id (impossible in practice), the key still
+    matches and we no-op."""
+    # Make sure the round-20 ``snooze_until`` column exists before
+    # we reference it. The followups schema is round 19; the
+    # snooze_until extension is round 20 in followups_ops.
+    try:
+        from . import followups_ops
+        followups_ops._ensure_extended_schema(conn)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = conn.execute(
+            "SELECT id, topic, person_name, due_at, direction "
+            "FROM followups "
+            "WHERE status = 'open' AND due_at IS NOT NULL "
+            "  AND due_at < ? "
+            "  AND (snooze_until IS NULL OR snooze_until <= ?) "
+            "LIMIT 50",
+            (time.time(), time.time()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    n = 0
+    for r in rows:
+        urgency = "high" if r["direction"] == "outgoing" else "med"
+        action = "send" if r["direction"] == "outgoing" else "nudge"
+        body = (
+            f"Past due — {action} reply to "
+            f"{r['person_name'] or '(unknown)'}"
+        )
+        if enqueue(
+            conn,
+            key=f"followup_overdue:{r['id']}",
+            kind="followup_overdue",
+            urgency=urgency,
+            title=f"Overdue: {r['topic']}",
+            body=body,
+            href=f"/followups#fu{r['id']}",
+            payload={
+                "followup_id": int(r["id"]),
+                "direction": r["direction"],
+            },
+        ):
+            n += 1
+    return n
+
+
+def _detect_followup_stale(conn: sqlite3.Connection) -> int:
+    """Round 20 — incoming followups that have been pending too long.
+
+    "Sarah said she'd review by Tuesday" — if no resolution after
+    14 days, surface a "want to nudge?" notification.
+    """
+    try:
+        from . import followups_ops
+        followups_ops._ensure_extended_schema(conn)
+    except Exception:  # noqa: BLE001
+        pass
+    cutoff = time.time() - 14 * 86400
+    try:
+        rows = conn.execute(
+            "SELECT id, topic, person_name, promised_at FROM followups "
+            "WHERE status = 'open' AND direction = 'incoming' "
+            "  AND COALESCE(promised_at, created_at) < ? "
+            "  AND (snooze_until IS NULL OR snooze_until <= ?) "
+            "LIMIT 30",
+            (cutoff, time.time()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    n = 0
+    for r in rows:
+        days = int(
+            (time.time() - float(r["promised_at"] or 0)) / 86400.0,
+        )
+        if enqueue(
+            conn,
+            key=f"followup_stale:{r['id']}",
+            kind="followup_stale",
+            urgency="low",
+            title=f"Stale: {r['topic']}",
+            body=(
+                f"{r['person_name'] or 'they'} owed this "
+                f"{days}d ago. Want to nudge?"
+            ),
+            href=f"/followups#fu{r['id']}",
+            payload={"followup_id": int(r["id"])},
+        ):
+            n += 1
+    return n
+
+
+def _detect_cadence_overdue(conn: sqlite3.Connection) -> int:
+    """Round 20 — VIPs the user hasn't reached out to within their
+    cadence target."""
+    try:
+        from . import people as people_mod
+        overdue = people_mod.list_overdue_contacts(
+            conn, limit=20, tier_filter=["vip"],
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for o in overdue:
+        if enqueue(
+            conn,
+            key=f"cadence_overdue:{o.person.id}:"
+                f"{int(time.time() / 86400)}",  # one per day per person
+            kind="cadence_overdue",
+            urgency="med",
+            title=f"Reach out: {o.person.display_name}",
+            body=(
+                f"VIP, {o.days_since_contact}d since contact "
+                f"({o.days_overdue}d past target)"
+            ),
+            href=f"/person?id={o.person.id}",
+            payload={"person_id": int(o.person.id)},
+        ):
+            n += 1
+    return n
+
+
 def detect_all(conn: sqlite3.Connection) -> dict:
     """Run every detector. Returns a per-detector count of newly-enqueued
     notifications. Safe to call repeatedly — each detector uses
@@ -556,6 +683,10 @@ def detect_all(conn: sqlite3.Connection) -> dict:
         "review_ready": _detect_review_ready(conn),
         "draft_pending": _detect_draft_pending(conn),
         "task_overdue": _detect_task_overdue(conn),
+        # Round 20 detectors —
+        "followup_overdue": _detect_followup_overdue(conn),
+        "followup_stale": _detect_followup_stale(conn),
+        "cadence_overdue": _detect_cadence_overdue(conn),
     }
     total = sum(out.values())
     if total:

@@ -33,12 +33,132 @@ this data as context.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
+import weakref as _weakref
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
+
+_SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Round 20 — agenda persistence + per-person notes bucket.
+
+    ``agenda_notes`` is a free-form per-person "things to bring up
+    next time" stash the user can append to anytime. Round-19's
+    aggregation queries are still real-time; this just adds the
+    user-curated layer on top.
+    """
+    try:
+        if conn in _SCHEMA_INITIALIZED:
+            return
+    except TypeError:
+        pass
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS agenda_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL REFERENCES people(id)
+                ON DELETE CASCADE,
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'discussed', 'dropped')),
+            created_at REAL NOT NULL,
+            discussed_at REAL,
+            tags_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_agenda_notes_person
+            ON agenda_notes(person_id, status);
+    """)
+    conn.commit()
+    try:
+        _SCHEMA_INITIALIZED.add(conn)
+    except TypeError:
+        pass
+
+
+@dataclass
+class AgendaNote:
+    id: int
+    person_id: int
+    text: str
+    status: str
+    created_at: float
+    discussed_at: float | None
+    tags: list[str]
+
+
+def add_note(
+    conn: sqlite3.Connection, person_id: int, text: str,
+    *, tags: list[str] | None = None,
+) -> int:
+    """Add a "want to bring up with X" note. Idempotent? No — duplicates
+    are allowed since a user might genuinely want to surface the same
+    topic twice."""
+    _ensure_schema(conn)
+    try:
+        from .safety import redact_text
+        text = redact_text(text)
+    except ImportError:
+        pass
+    cur = conn.execute(
+        "INSERT INTO agenda_notes(person_id, text, created_at, tags_json) "
+        "VALUES (?, ?, ?, ?)",
+        (person_id, text, time.time(), json.dumps(tags or [])),
+    )
+    conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+def list_notes(
+    conn: sqlite3.Connection, person_id: int,
+    *,
+    status: str = "pending", limit: int = 50,
+) -> list[AgendaNote]:
+    _ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT * FROM agenda_notes "
+        "WHERE person_id = ? AND status = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (person_id, status, limit),
+    ).fetchall()
+    return [
+        AgendaNote(
+            id=int(r["id"]),
+            person_id=int(r["person_id"]),
+            text=r["text"] or "",
+            status=r["status"],
+            created_at=float(r["created_at"]),
+            discussed_at=r["discussed_at"],
+            tags=json.loads(r["tags_json"] or "[]"),
+        )
+        for r in rows
+    ]
+
+
+def mark_discussed(conn: sqlite3.Connection, note_id: int) -> bool:
+    _ensure_schema(conn)
+    cur = conn.execute(
+        "UPDATE agenda_notes SET status='discussed', discussed_at=? "
+        "WHERE id = ? AND status = 'pending'",
+        (time.time(), note_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def drop_note(conn: sqlite3.Connection, note_id: int) -> bool:
+    _ensure_schema(conn)
+    cur = conn.execute(
+        "UPDATE agenda_notes SET status='dropped', discussed_at=? "
+        "WHERE id = ? AND status = 'pending'",
+        (time.time(), note_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 @dataclass
@@ -65,6 +185,9 @@ class Agenda:
     journal_notes: list[AgendaItem]
     shared_topics: list[AgendaItem]
     generated_at: float
+    # Round 20 — user-curated agenda notes ("things to bring up
+    # next time we meet") for this person.
+    user_notes: list[AgendaItem] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         from dataclasses import asdict
@@ -79,6 +202,7 @@ class Agenda:
             + len(self.open_email_threads)
             + len(self.journal_notes)
             + len(self.shared_topics)
+            + len(self.user_notes)
         )
 
 
@@ -331,6 +455,20 @@ def build_agenda(
     shared = _shared_topics(
         conn, person_id, days=shared_topic_days,
     )
+    # Round 20 — user-curated notes.
+    user_notes_items: list[AgendaItem] = []
+    try:
+        for n in list_notes(conn, person_id, status="pending"):
+            age = max(0, int((time.time() - n.created_at) / 86400.0))
+            user_notes_items.append(AgendaItem(
+                kind="user_note",
+                title=_redact(n.text),
+                detail=", ".join(n.tags) if n.tags else "",
+                age_days=float(age),
+                extra={"note_id": n.id},
+            ))
+    except Exception:  # noqa: BLE001
+        pass
     return Agenda(
         person_id=p.id,
         person_name=p.display_name,
@@ -343,6 +481,7 @@ def build_agenda(
         journal_notes=journal,
         shared_topics=shared,
         generated_at=time.time(),
+        user_notes=user_notes_items,
     )
 
 
@@ -358,6 +497,21 @@ def render_markdown(agenda: Agenda) -> str:
     if agenda.total_items == 0:
         lines.append("_(nothing pending — clean slate)_")
         return "\n".join(lines)
+
+    # User-curated "things to bring up" come FIRST — this is what
+    # the user explicitly flagged for next-time. The rest is just
+    # context.
+    if agenda.user_notes:
+        lines.append("## Things to bring up")
+        for n in agenda.user_notes:
+            tag_str = f"  _[{n.detail}]_" if n.detail else ""
+            age_str = (
+                f"  · {int(n.age_days)}d"
+                if n.age_days is not None and n.age_days >= 1
+                else ""
+            )
+            lines.append(f"- {n.title}{tag_str}{age_str}")
+        lines.append("")
 
     if agenda.last_meeting:
         lines.append("## Last meeting")

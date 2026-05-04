@@ -271,6 +271,13 @@ class DailyBrief:
     # that have brain-grounded prep available. Free-form so we don't
     # need to import meeting_prep types here.
     upcoming_preps: list = field(default_factory=list)
+    # Round 20 — EA-shaped sections: open follow-ups (both
+    # directions, capped) and morning triage queue summary. Both
+    # are populated by ``_followups_section`` / ``_triage_section``
+    # (see helpers below) and are stored as opaque list[dict] /
+    # dict so this dataclass doesn't pull the modules at import.
+    followups_open: list[dict] = field(default_factory=list)
+    triage_today: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -314,6 +321,9 @@ def assemble_brief(cfg: Config, conn: sqlite3.Connection) -> DailyBrief:
         stale_connections=_stale_connections_section(conn),
         upcoming_preps=_upcoming_preps_section(cfg, conn),
         stale_health=_stale_health_section(conn),
+        # Round 20 EA additions —
+        followups_open=_followups_section(conn),
+        triage_today=_triage_section(conn),
     )
     # Revisit suggestions only fire on quiet days — otherwise we'd
     # bury the time-sensitive content.
@@ -623,6 +633,62 @@ def _stale_health_section(conn: sqlite3.Connection) -> list:
     except Exception as e:  # noqa: BLE001
         log.warning("daily brief: stale health check failed: %s", e)
         return []
+
+
+def _followups_section(conn: sqlite3.Connection) -> list[dict]:
+    """Round 20 — open follow-ups (both directions, with overdue
+    surfaced first). Returned as opaque dicts so DailyBrief stays
+    decoupled from the followups module's dataclass shape."""
+    try:
+        from . import followups, followups_ops
+        # Get the visible-open list (excludes snoozed) for both
+        # directions. Cap to 10 total so we don't overwhelm the brief.
+        out_rows = followups_ops.list_visible_open(
+            conn, direction="outgoing", limit=6,
+        )
+        in_rows = followups_ops.list_visible_open(
+            conn, direction="incoming", limit=6,
+        )
+        # Surface overdue first.
+        rows = sorted(
+            out_rows + in_rows,
+            key=lambda f: (
+                0 if (f.due_at and f.due_at < time.time()) else 1,
+                f.due_at or float("inf"),
+                -(f.promised_at or 0),
+            ),
+        )[:10]
+        return followups.serialise_for_brief(rows)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: followups section failed: %s", e)
+        return []
+
+
+def _triage_section(conn: sqlite3.Connection) -> dict:
+    """Round 20 — count + top-3 senders for the morning triage
+    queue. Saves the user a click on quiet days; on busy days hints
+    at the magnitude. Format: {"count": int, "top_senders": [str]}."""
+    try:
+        from . import triage_queue
+        queue = triage_queue.build_queue(
+            conn, hours=48, max_items=12,
+        )
+        if not queue:
+            return {"count": 0, "top_senders": []}
+        senders: list[str] = []
+        seen: set[str] = set()
+        for it in queue:
+            who = it.from_display or it.from_email or "(unknown)"
+            if who in seen:
+                continue
+            seen.add(who)
+            senders.append(who)
+            if len(senders) >= 3:
+                break
+        return {"count": len(queue), "top_senders": senders}
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily brief: triage section failed: %s", e)
+        return {"count": 0, "top_senders": []}
 
 
 def _weekly_review_due(conn: sqlite3.Connection) -> bool:
@@ -1097,12 +1163,22 @@ def _iter_section_blocks(brief: DailyBrief) -> Iterator[str]:
         yield _render_assignments(brief.assignments_due_soon)
     if brief.open_action_items:
         yield _render_action_items(brief.open_action_items)
+    # Round 20 — open follow-ups (both directions) right after
+    # action items so the user sees their full "open threads"
+    # surface in one place.
+    if brief.followups_open:
+        yield _render_followups(brief.followups_open)
     if brief.health is not None and brief.health.metrics:
         yield _render_health(brief.health)
     if brief.email is not None and (
         brief.email.urgent or brief.email.response or brief.email.other
     ):
         yield _render_email(brief.email, brief.pending_email_drafts)
+    # Round 20 — morning triage queue summary right after the
+    # email section so the user sees "10 emails for triage today"
+    # alongside the urgent-vs-response counts.
+    if brief.triage_today and brief.triage_today.get("count"):
+        yield _render_triage(brief.triage_today)
     if brief.queue_top:
         yield _render_queue(brief.queue_top)
     if brief.watchlist_highlights:
@@ -1182,6 +1258,70 @@ def _render_action_items(items: list[ActionItem]) -> str:
     out.append("")
     out.append("_Run `secondbrain tasks done <id>` to close._")
     return "\n".join(out)
+
+
+def _render_followups(items: list[dict]) -> str:
+    """Round 20 — open follow-ups in both directions, with overdue
+    flagged inline. Each item is the dict produced by
+    ``followups.serialise_for_brief``."""
+    if not items:
+        return ""
+    out_outgoing = [r for r in items if r["direction"] == "outgoing"]
+    out_incoming = [r for r in items if r["direction"] == "incoming"]
+    out = ["## Open follow-ups", ""]
+    if out_outgoing:
+        out.append(f"**You owe ({len(out_outgoing)})**")
+        for r in out_outgoing:
+            person = r.get("person") or "(unknown)"
+            age = r.get("age_days")
+            age_str = (
+                f" · _{int(age)}d_" if age is not None and age >= 1
+                else ""
+            )
+            due_str = ""
+            if r.get("due_at") and r["due_at"] < time.time():
+                due_str = " · **overdue**"
+            elif r.get("due_at"):
+                from datetime import date as _date
+                due_iso = _date.fromtimestamp(r["due_at"]).isoformat()
+                due_str = f" · due {due_iso}"
+            out.append(
+                f"- {_safe(r['topic'])} → {_safe(person)}"
+                f"{age_str}{due_str}"
+            )
+    if out_incoming:
+        if out_outgoing:
+            out.append("")
+        out.append(f"**Owed to you ({len(out_incoming)})**")
+        for r in out_incoming:
+            person = r.get("person") or "(unknown)"
+            age = r.get("age_days")
+            age_str = (
+                f" · _{int(age)}d_" if age is not None and age >= 1
+                else ""
+            )
+            out.append(
+                f"- {_safe(r['topic'])} ← {_safe(person)}{age_str}"
+            )
+    out.append("")
+    out.append("_See [/followups](/followups)._")
+    return "\n".join(out)
+
+
+def _render_triage(triage: dict) -> str:
+    """Round 20 — morning email triage queue summary. ``triage`` is
+    a dict like {count: 7, top_senders: [...]}."""
+    n = triage.get("count") or 0
+    if not n:
+        return ""
+    senders = triage.get("top_senders") or []
+    bits = [f"## Morning triage — {n} email(s) need a decision"]
+    if senders:
+        sender_list = ", ".join(_safe(s) for s in senders)
+        bits.append(f"_Top: {sender_list}_")
+    bits.append("")
+    bits.append("_See [/triage](/triage) to walk through._")
+    return "\n".join(bits)
 
 
 def _render_health(snap: HealthSnapshot) -> str:

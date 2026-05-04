@@ -4458,23 +4458,71 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     # ============================ Round 19 — EA features ==============
 
     @app.get("/followups", response_class=HTMLResponse)
-    def followups_page():
-        """Round 19 (Phase EA-1) — bidirectional commitment tracker."""
+    def followups_page(
+        person_id: int = 0,
+        show: str = "active",  # 'active' (default), 'snoozed', 'history'
+    ):
+        """Round 19+20 — bidirectional commitment tracker.
+
+        Round 20 additions:
+          - ``?person_id=N`` filters to one person.
+          - ``?show=snoozed`` shows snoozed items.
+          - ``?show=history`` shows recently resolved/dismissed.
+          - Snooze / edit / nudge buttons inline per row.
+          - Header stats: open/overdue/avg-resolve-days.
+        """
         from . import followups as fu_mod
+        from . import followups_ops
 
         _, conn, _, _ = get_state()
-        out_rows = fu_mod.list_open(
-            conn, direction="outgoing", limit=100,
+        if show == "history":
+            history = followups_ops.list_resolved_history(conn, days=30)
+            rows_html = []
+            for f, elapsed in history:
+                elapsed_str = (
+                    f" · resolved in {int(elapsed/86400.0)}d"
+                    if elapsed else ""
+                )
+                kind = (
+                    "→" if f.direction == "outgoing" else "←"
+                )
+                rows_html.append(
+                    f'<div class="fu-row">'
+                    f'<div class="fu-meta">'
+                    f'<span class="muted">{escape(f.status)}</span>'
+                    f'{elapsed_str}</div>'
+                    f'<div>{kind} <strong>'
+                    f'{escape(_safe(f.topic))}</strong></div>'
+                    f'<div class="muted">'
+                    f'{escape(_safe(f.person_name)) or "—"}</div>'
+                    f'</div>'
+                )
+            body = (
+                f'<h1>Follow-up history</h1>'
+                f'<p class="muted">{len(history)} resolved/dismissed in '
+                f'the last 30 days.</p>'
+                f'<p><a href="/followups">← back to active</a></p>'
+                f'{"".join(rows_html)}'
+            )
+            return HTMLResponse(_layout("Follow-ups", body, "followups"))
+
+        include_snoozed = (show == "snoozed")
+        out_rows = followups_ops.list_visible_open(
+            conn, direction="outgoing",
+            person_id=(person_id or None),
+            include_snoozed=include_snoozed,
+            limit=100,
         )
-        in_rows = fu_mod.list_open(
-            conn, direction="incoming", limit=100,
+        in_rows = followups_ops.list_visible_open(
+            conn, direction="incoming",
+            person_id=(person_id or None),
+            include_snoozed=include_snoozed,
+            limit=100,
         )
         overdue = fu_mod.list_overdue(conn)
+        stats = followups_ops.compute_stats(conn)
 
-        def _redact(s):
-            return _safe(s)
-
-        def _row_html(f, kind: str) -> str:
+        def _row_html(f) -> str:
             age_days = (
                 int((time.time() - f.promised_at) / 86400.0)
                 if f.promised_at else None
@@ -4499,13 +4547,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             person_link = ""
             if f.person_id:
                 person_link = (
-                    f'<a class="muted" href="/person?id={f.person_id}">'
-                    f'{escape(_redact(f.person_name)) or "—"}</a>'
+                    f'<a class="muted" '
+                    f'href="/followups?person_id={f.person_id}">'
+                    f'{escape(_safe(f.person_name)) or "—"}</a>'
                 )
             elif f.person_name:
                 person_link = (
                     f'<span class="muted">'
-                    f'{escape(_redact(f.person_name))}</span>'
+                    f'{escape(_safe(f.person_name))}</span>'
                 )
             else:
                 person_link = '<span class="muted">—</span>'
@@ -4516,22 +4565,67 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                     f'href="/file?file_id={f.source_file_id}">'
                     f'(source)</a>'
                 )
+            # Snooze badge.
+            snooze_html = ""
+            try:
+                row = conn.execute(
+                    "SELECT snooze_until FROM followups WHERE id = ?",
+                    (f.id,),
+                ).fetchone()
+                if row and row["snooze_until"] and (
+                    row["snooze_until"] > time.time()
+                ):
+                    from datetime import date as _date
+                    until_d = _date.fromtimestamp(
+                        row["snooze_until"],
+                    ).isoformat()
+                    snooze_html = (
+                        f' <span class="tag warn">snoozed → '
+                        f'{escape(until_d)}</span>'
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            # Inline action buttons.
+            nudge_btn = (
+                f'  <form method="post" '
+                f'    action="/followups/{f.id}/nudge" '
+                f'    style="display:inline;">'
+                f'    <button type="submit" title="Draft nudge email">'
+                f'nudge</button>'
+                f'  </form>'
+            ) if f.direction == "incoming" else ""
+            unsnooze_btn = (
+                f'  <form method="post" '
+                f'    action="/followups/{f.id}/unsnooze" '
+                f'    style="display:inline;">'
+                f'    <button type="submit">unsnooze</button>'
+                f'  </form>'
+            ) if snooze_html else ""
             return (
                 f'<div class="fu-row {overdue_class}" id="fu{f.id}">'
                 f'<div class="fu-meta">'
                 f'  {person_link} <span class="muted">·</span>'
                 f'  <span class="muted">{age_str} old</span>'
-                f'  {due_str}{source_link}'
+                f'  {due_str}{source_link}{snooze_html}'
                 f'</div>'
-                f'<div class="fu-topic">{escape(_redact(f.topic))}</div>'
+                f'<div class="fu-topic">{escape(_safe(f.topic))}</div>'
                 f'<div class="fu-desc muted">'
-                f'{escape(_redact(f.description))}</div>'
+                f'{escape(_safe(f.description))}</div>'
                 f'<div class="fu-actions">'
                 f'  <form method="post" '
                 f'    action="/followups/{f.id}/resolve" '
                 f'    style="display:inline;">'
                 f'    <button type="submit">resolve</button>'
                 f'  </form>'
+                f'  <form method="post" '
+                f'    action="/followups/{f.id}/snooze" '
+                f'    style="display:inline;">'
+                f'    <input type="hidden" name="days" value="7">'
+                f'    <button type="submit" '
+                f'      title="Snooze 7d">snooze 7d</button>'
+                f'  </form>'
+                f'  {nudge_btn}'
+                f'  {unsnooze_btn}'
                 f'  <form method="post" '
                 f'    action="/followups/{f.id}/dismiss" '
                 f'    style="display:inline;">'
@@ -4542,12 +4636,52 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f'</div>'
             )
 
-        out_html = "".join(_row_html(f, "out") for f in out_rows) or (
+        out_html = "".join(_row_html(f) for f in out_rows) or (
             '<div class="muted">_(nothing pending — clean slate)_</div>'
         )
-        in_html = "".join(_row_html(f, "in") for f in in_rows) or (
+        in_html = "".join(_row_html(f) for f in in_rows) or (
             '<div class="muted">_(nothing pending — clean slate)_</div>'
         )
+
+        person_filter_html = ""
+        if person_id:
+            from . import people as people_mod
+            p = people_mod.get_person(conn, person_id)
+            if p:
+                person_filter_html = (
+                    f'<div class="card" style="background:'
+                    f'var(--green-soft);">'
+                    f'Filtering: <strong>{escape(_safe(p.display_name))}'
+                    f'</strong> '
+                    f'<a href="/followups">(clear)</a></div>'
+                )
+        view_toggle_html = (
+            f'<p class="muted">View: '
+            f'<a href="/followups">active</a> · '
+            f'<a href="/followups?show=snoozed">'
+            f'snoozed ({stats.snoozed_count})</a> · '
+            f'<a href="/followups?show=history">history</a></p>'
+        )
+
+        avg_str = (
+            f"{stats.avg_resolve_days_30d:.1f}d"
+            if stats.avg_resolve_days_30d is not None else "—"
+        )
+        stats_html = (
+            f'<div class="fu-stats">'
+            f'  <span><strong>{stats.open_outgoing}</strong> '
+            f'  you owe</span>'
+            f'  <span><strong>{stats.open_incoming}</strong> '
+            f'  owed to you</span>'
+            f'  <span><strong>{stats.overdue_count}</strong> '
+            f'  overdue</span>'
+            f'  <span class="muted">avg resolve: {avg_str}</span>'
+            f'  <span class="muted">resolved last 30d: '
+            f'  {stats.resolved_last_30d} '
+            f'  ({stats.auto_resolved_last_30d} auto)</span>'
+            f'</div>'
+        )
+
         overdue_strip = ""
         if overdue:
             overdue_strip = (
@@ -4562,6 +4696,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             f'  Bidirectional commitment tracker. Outgoing = you owe '
             f'  others; Incoming = others owe you.'
             f'</p>'
+            f'{stats_html}'
+            f'{view_toggle_html}'
+            f'{person_filter_html}'
             f'{overdue_strip}'
             f'<div class="fu-cols">'
             f'  <section class="card">'
@@ -4591,6 +4728,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             '  padding: 2px 8px; margin-right: 4px; }'
             '.fu-overdue-strip { background: rgba(255,77,77,0.10); '
             '  border-color: var(--red); margin-top: var(--s-3); }'
+            '.fu-stats { display: flex; gap: var(--s-3); '
+            '  flex-wrap: wrap; padding: var(--s-2) var(--s-3); '
+            '  background: var(--bg-card); '
+            '  border: 1px solid var(--border); '
+            '  border-radius: var(--r); margin: var(--s-2) 0; }'
+            '.fu-stats span { font-size: 12px; }'
+            '.tag { font-size: 10px; padding: 1px 6px; '
+            '  border-radius: var(--r); margin-left: 4px; }'
+            '.tag.warn { background: rgba(255,183,0,0.10); '
+            '  color: var(--amber); }'
             '</style>'
         )
         return HTMLResponse(_layout("Follow-ups", body, "followups"))
@@ -4910,6 +5057,336 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             f'</div>'
         )
         return HTMLResponse(_layout("EOD", body, "eod"))
+
+    # ============================ Round 20 — EA expansions ==============
+
+    # --- Followups ops (snooze, edit, nudge, bulk dismiss) ------------
+
+    @app.post("/followups/{followup_id:int}/snooze")
+    def followup_snooze(
+        followup_id: int, request: Request,
+        days: int = Form(7),
+    ):
+        from . import followups_ops
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        try:
+            followups_ops.snooze(conn, followup_id, days=days)
+        except ValueError as e:
+            return HTMLResponse(str(e), status_code=400)
+        return RedirectResponse(url="/followups", status_code=303)
+
+    @app.post("/followups/{followup_id:int}/unsnooze")
+    def followup_unsnooze(followup_id: int, request: Request):
+        from . import followups_ops
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        followups_ops.unsnooze(conn, followup_id)
+        return RedirectResponse(url="/followups", status_code=303)
+
+    @app.post("/followups/{followup_id:int}/edit")
+    def followup_edit(
+        followup_id: int, request: Request,
+        topic: str = Form(""),
+        description: str = Form(""),
+        due_iso: str = Form(""),
+    ):
+        from . import followups_ops
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        due_at: float | None = -1.0
+        if due_iso:
+            try:
+                from datetime import date as _date
+                from datetime import datetime as _dt
+                d = _date.fromisoformat(due_iso)
+                due_at = _dt(d.year, d.month, d.day).timestamp()
+            except (ValueError, TypeError):
+                due_at = -1.0
+        followups_ops.edit(
+            conn, followup_id,
+            topic=(topic or None) if topic else None,
+            description=(description or None) if description else None,
+            due_at=due_at,
+        )
+        return RedirectResponse(url="/followups", status_code=303)
+
+    @app.post("/followups/{followup_id:int}/nudge")
+    def followup_nudge(followup_id: int, request: Request):
+        """Generate a nudge-email draft + redirect to a preview page
+        (rendered inline as a separate route below)."""
+        from . import followups_ops
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        cfg, conn, _, _ = get_state()
+        try:
+            draft = followups_ops.draft_nudge(conn, cfg, followup_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("nudge draft failed: %s", e)
+            draft = None
+        if draft is None:
+            return HTMLResponse(
+                "<h1>Could not draft nudge</h1>"
+                "<p>No API key, budget exceeded, or LLM error. "
+                "Try again later.</p><p><a href='/followups'>← Back</a></p>",
+                status_code=200,
+            )
+        body = (
+            f'<h1>Nudge draft</h1>'
+            f'<p class="muted">Copy/paste into your email client. '
+            f'No data sent automatically.</p>'
+            f'<div class="card"><h2>Subject</h2>'
+            f'<pre>{escape(_safe(draft.get("subject", "")))}</pre>'
+            f'<h2>Body</h2>'
+            f'<pre style="white-space:pre-wrap;">'
+            f'{escape(_safe(draft.get("body", "")))}</pre></div>'
+            f'<p><a class="link-btn" href="/followups">'
+            f'← Back to follow-ups</a></p>'
+        )
+        return HTMLResponse(_layout("Nudge draft", body, "followups"))
+
+    @app.post("/followups/bulk_dismiss")
+    def followup_bulk_dismiss(
+        request: Request,
+        person_id: int = Form(0),
+        overdue_only: int = Form(0),
+        direction: str = Form(""),
+    ):
+        from . import followups_ops
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        followups_ops.bulk_dismiss(
+            conn,
+            person_id=person_id or None,
+            overdue_only=bool(overdue_only),
+            direction=direction or None,
+        )
+        return RedirectResponse(url="/followups", status_code=303)
+
+    # --- Capture detail page + edit + recap-sent flag ------------------
+
+    @app.get("/capture", response_class=HTMLResponse)
+    def capture_detail(file_id: int = 0):
+        """Per-meeting capture detail view — decisions / actions /
+        questions / recap draft + edit links."""
+        from . import meeting_capture
+        _, conn, _, _ = get_state()
+        if not file_id:
+            captures = meeting_capture.list_recent(conn, limit=30)
+            if not captures:
+                body = (
+                    '<h1>Meeting captures</h1>'
+                    '<div class="empty card"><p>No captures yet. '
+                    'Index a meeting transcript and the daemon will '
+                    'capture it within an hour.</p></div>'
+                )
+                return HTMLResponse(_layout("Captures", body, "capture"))
+            rows_html = []
+            for cap in captures:
+                when = time.strftime(
+                    "%Y-%m-%d %H:%M",
+                    time.localtime(cap.captured_at),
+                )
+                rows_html.append(
+                    f'<li><a href="/capture?file_id={cap.file_id}">'
+                    f'{escape(_safe(cap.title))}</a> '
+                    f'<span class="muted">· {when} · '
+                    f'{len(cap.decisions)} dec · '
+                    f'{len(cap.actions)} act</span></li>'
+                )
+            body = (
+                '<h1>Meeting captures</h1>'
+                f'<ul>{"".join(rows_html)}</ul>'
+            )
+            return HTMLResponse(_layout("Captures", body, "capture"))
+        cap = meeting_capture.get_capture(conn, file_id)
+        if cap is None:
+            return HTMLResponse(
+                "<h1>Capture not found</h1>", status_code=404,
+            )
+        md = meeting_capture.render_capture_markdown(cap)
+        sent_str = ""
+        if cap.recap_sent_at:
+            sent_str = (
+                f'<p class="muted">Recap sent '
+                f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(cap.recap_sent_at))}.</p>'
+            )
+        else:
+            sent_str = (
+                f'<form method="post" action="/capture/{cap.file_id}/recap_sent" '
+                f'style="display:inline;">'
+                f'<button type="submit">Mark recap as sent</button></form>'
+            )
+        edited_badge = (
+            ' <span class="tag">edited</span>'
+            if cap.user_edited else ""
+        )
+        body = (
+            f'<h1>Meeting capture{edited_badge}</h1>'
+            f'<p class="muted">file #{cap.file_id} · '
+            f'captured via {escape(cap.model)} · '
+            f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(cap.captured_at))}</p>'
+            f'<div class="briefing-body">'
+            f'{_markdown_to_html_block(md)}'
+            f'</div>'
+            f'{sent_str}'
+            '<style>.tag { font-size: 10px; padding: 1px 6px; '
+            ' background: var(--amber); color: #000; '
+            ' border-radius: var(--r); margin-left: 4px; }</style>'
+        )
+        return HTMLResponse(_layout(
+            f"Capture · {cap.title[:40]}", body, "capture",
+        ))
+
+    @app.post("/capture/{file_id:int}/recap_sent")
+    def capture_mark_recap_sent(file_id: int, request: Request):
+        from . import meeting_capture
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        meeting_capture.mark_recap_sent(conn, file_id)
+        return RedirectResponse(
+            url=f"/capture?file_id={file_id}", status_code=303,
+        )
+
+    # --- Per-person agenda notes + tier UI ----------------------------
+
+    @app.post("/agenda/{person_id:int}/note")
+    def agenda_add_note(
+        person_id: int, request: Request,
+        text: str = Form(""),
+    ):
+        from . import agenda
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        if text.strip():
+            agenda.add_note(conn, person_id, text.strip())
+        return RedirectResponse(
+            url=f"/agenda?id={person_id}", status_code=303,
+        )
+
+    @app.post("/agenda/note/{note_id:int}/discussed")
+    def agenda_note_discussed(note_id: int, request: Request):
+        from . import agenda
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        agenda.mark_discussed(conn, note_id)
+        return RedirectResponse(url="/agenda", status_code=303)
+
+    @app.post("/person/{person_id:int}/tier")
+    def person_set_tier(
+        person_id: int, request: Request,
+        tier: str = Form("regular"),
+        cadence_days: int = Form(0),
+    ):
+        from . import people as people_mod
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        try:
+            people_mod.set_field(
+                conn, person_id, tier=tier, cadence_days=cadence_days,
+            )
+        except ValueError as e:
+            return HTMLResponse(str(e), status_code=400)
+        return RedirectResponse(
+            url=f"/person?id={person_id}", status_code=303,
+        )
+
+    # --- Triage queue actions -----------------------------------------
+
+    @app.post("/triage/{file_id:int}/done")
+    def triage_done(file_id: int, request: Request):
+        from . import triage_queue
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        triage_queue.mark_done(conn, file_id)
+        return RedirectResponse(url="/triage", status_code=303)
+
+    @app.post("/triage/{file_id:int}/skip")
+    def triage_skip(file_id: int, request: Request):
+        from . import triage_queue
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        triage_queue.mark_skipped(conn, file_id)
+        return RedirectResponse(url="/triage", status_code=303)
+
+    @app.post("/triage/{file_id:int}/snooze")
+    def triage_snooze(
+        file_id: int, request: Request, hours: int = Form(24),
+    ):
+        from . import triage_queue
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        try:
+            triage_queue.snooze(conn, file_id, hours=hours)
+        except ValueError as e:
+            return HTMLResponse(str(e), status_code=400)
+        return RedirectResponse(url="/triage", status_code=303)
+
+    # --- Scheduling page ---------------------------------------------
+
+    @app.get("/scheduling", response_class=HTMLResponse)
+    def scheduling_page():
+        """Round 20 — find-time UI + recent proposals + per-person prefs."""
+        from . import scheduling as sched_mod
+        _, conn, _, _ = get_state()
+        proposals = sched_mod.list_recent_proposals(conn, limit=20)
+        prop_html = ""
+        if proposals:
+            rows = []
+            for p in proposals:
+                when = time.strftime(
+                    "%Y-%m-%d %H:%M",
+                    time.localtime(p["proposed_at"]),
+                )
+                outcome_class = {
+                    "scheduled": "good",
+                    "declined": "bad",
+                    "expired": "muted",
+                    "pending": "warn",
+                }.get(p["outcome"], "muted")
+                rows.append(
+                    f'<li><span class="tag {outcome_class}">'
+                    f'{p["outcome"]}</span> '
+                    f'{escape(_safe(p["person_name"]))} '
+                    f'<span class="muted">· {when}</span></li>'
+                )
+            prop_html = (
+                f'<h2>Recent proposals</h2><ul>{"".join(rows)}</ul>'
+            )
+        body = (
+            '<h1>Scheduling</h1>'
+            '<div class="card">'
+            '<p class="muted">'
+            '  This page logs scheduling proposals. To find time for '
+            '  a meeting, use the chat ("find me 30 min with Sarah '
+            '  next week") or the <code>find_open_time_slots</code> '
+            '  MCP tool with your calendar busy events.'
+            '</p>'
+            '</div>'
+            f'{prop_html}'
+            '<style>'
+            '.tag { font-size: 10px; padding: 1px 6px; '
+            '  border-radius: var(--r); margin-right: 4px; }'
+            '.tag.good { background: var(--green-soft); '
+            '  color: var(--green); }'
+            '.tag.bad { background: rgba(255,77,77,0.10); '
+            '  color: var(--red); }'
+            '.tag.warn { background: rgba(255,183,0,0.10); '
+            '  color: var(--amber); }'
+            '</style>'
+        )
+        return HTMLResponse(_layout("Scheduling", body, "scheduling"))
 
     # --- Phase 47: tasks view -----------------------------------------
 

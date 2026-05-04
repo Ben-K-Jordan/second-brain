@@ -1989,6 +1989,241 @@ def find_open_time_slots(
     return "\n".join(lines)
 
 
+# ============================ Round 20 — EA ops MCP tools =========
+
+
+@mcp.tool()
+def snooze_followup(followup_id: int, days: int = 7) -> str:
+    """Defer an open follow-up. Stays open but hidden until the
+    snooze passes."""
+    from . import followups_ops
+    _, conn, _, _ = _get_state()
+    try:
+        ok = followups_ops.snooze(conn, followup_id, days=days)
+    except ValueError as e:
+        return f"_{e}_"
+    return (
+        f"OK: follow-up #{followup_id} snoozed {days}d."
+        if ok else f"_Follow-up #{followup_id} not found or already closed._"
+    )
+
+
+@mcp.tool()
+def edit_followup(
+    followup_id: int,
+    topic: str = "",
+    description: str = "",
+    due_iso_date: str = "",
+) -> str:
+    """Update topic / description / due-date on an open follow-up.
+    Empty strings → no change. due_iso_date='clear' → remove due."""
+    from . import followups_ops
+    _, conn, _, _ = _get_state()
+    due_at: float | None = -1.0
+    if due_iso_date == "clear":
+        due_at = None
+    elif due_iso_date:
+        try:
+            from datetime import date as _date
+            from datetime import datetime as _dt
+            d = _date.fromisoformat(due_iso_date)
+            due_at = _dt(d.year, d.month, d.day).timestamp()
+        except (ValueError, TypeError):
+            return f"_Bad due_iso_date: {due_iso_date!r}_"
+    ok = followups_ops.edit(
+        conn, followup_id,
+        topic=(topic or None) if topic else None,
+        description=(description or None) if description else None,
+        due_at=due_at,
+    )
+    return (
+        f"OK: follow-up #{followup_id} updated."
+        if ok else "_No changes (or follow-up not found)._"
+    )
+
+
+@mcp.tool()
+def draft_nudge_email(followup_id: int) -> str:
+    """Generate a polite "checking in" email for a stale incoming
+    follow-up. Returns subject + body as Markdown — copy/paste into
+    your email client. Uses your voice profile."""
+    from . import followups_ops
+    cfg, conn, _, _ = _get_state()
+    draft = followups_ops.draft_nudge(conn, cfg, followup_id)
+    if draft is None:
+        return (
+            "_Could not draft nudge (no API key, budget exceeded, "
+            "or follow-up not eligible — must be incoming + open)._"
+        )
+    return (
+        f"# Nudge draft\n\n"
+        f"## Subject\n{_safe(draft.get('subject', ''))}\n\n"
+        f"## Body\n{_safe(draft.get('body', ''))}"
+    )
+
+
+@mcp.tool()
+def auto_resolve_followups(hours: int = 12) -> str:
+    """Manually trigger the auto-resolution pass — scans your recent
+    sent mail / journal entries for evidence that open outgoing
+    follow-ups are now done."""
+    from . import followups_ops
+    cfg, conn, _, _ = _get_state()
+    n = followups_ops.auto_resolve_from_sent_mail(
+        conn, cfg, hours=max(1, int(hours)),
+    )
+    return f"OK: auto-resolved {n} follow-up(s)."
+
+
+@mcp.tool()
+def followups_for_person(
+    person_id: int = 0,
+    person_name: str = "",
+    include_resolved: bool = False,
+) -> str:
+    """List all follow-ups (open + optionally resolved) for one
+    person. Useful before a 1:1."""
+    from . import followups_ops
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    if not person_id and person_name:
+        p = people_mod.find_person_by_name(conn, person_name)
+        if p is None:
+            return f"_No person matched {person_name!r}._"
+        person_id = int(p.id)
+    if not person_id:
+        return "_Need person_id or person_name._"
+    rows = followups_ops.list_for_person(
+        conn, person_id, include_resolved=include_resolved,
+    )
+    if not rows:
+        return "_No follow-ups for this person._"
+    lines = ["# Follow-ups", ""]
+    for r in rows:
+        kind = "→" if r.direction == "outgoing" else "←"
+        age = ""
+        if r.promised_at:
+            d = max(0, int((time.time() - r.promised_at) / 86400.0))
+            age = f" · {d}d"
+        status = (
+            "" if r.status == "open" else f" _[{r.status}]_"
+        )
+        lines.append(
+            f"- {kind} {_safe(r.topic)}{age}{status}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def followup_stats() -> str:
+    """Snapshot of the user's open / overdue / resolved follow-ups."""
+    from . import followups_ops
+    _, conn, _, _ = _get_state()
+    s = followups_ops.compute_stats(conn)
+    avg = (
+        f"{s.avg_resolve_days_30d:.1f}d"
+        if s.avg_resolve_days_30d is not None else "—"
+    )
+    return (
+        f"# Follow-up stats\n\n"
+        f"- {s.open_outgoing} you owe (open, non-snoozed)\n"
+        f"- {s.open_incoming} owed to you (open, non-snoozed)\n"
+        f"- {s.overdue_count} overdue\n"
+        f"- {s.snoozed_count} snoozed\n"
+        f"- {s.resolved_last_30d} resolved in last 30d "
+        f"({s.auto_resolved_last_30d} auto)\n"
+        f"- avg time to resolve: {avg}\n"
+    )
+
+
+@mcp.tool()
+def add_agenda_note(person_id: int = 0, person_name: str = "",
+                     text: str = "") -> str:
+    """Add a "want to bring up next time" note for a person. Surfaces
+    at the top of their 1:1 agenda."""
+    from . import agenda
+    from . import people as people_mod
+    _, conn, _, _ = _get_state()
+    if not person_id and person_name:
+        p = people_mod.find_person_by_name(conn, person_name)
+        if p is None:
+            return f"_No person matched {person_name!r}._"
+        person_id = int(p.id)
+    if not person_id or not text.strip():
+        return "_Need person_id or person_name + text._"
+    nid = agenda.add_note(conn, person_id, text.strip())
+    return f"OK: added agenda note #{nid}." if nid else "_Failed._"
+
+
+@mcp.tool()
+def edit_meeting_capture(
+    file_id: int,
+    title: str = "",
+    recap_draft: str = "",
+) -> str:
+    """User-side edit a meeting capture (override LLM extraction)."""
+    from . import meeting_capture
+    _, conn, _, _ = _get_state()
+    ok = meeting_capture.edit_capture(
+        conn, file_id,
+        title=(title or None) if title else None,
+        recap_draft=(recap_draft or None) if recap_draft else None,
+    )
+    return f"OK: capture #{file_id} edited." if ok else "_No changes._"
+
+
+@mcp.tool()
+def set_scheduling_prefs(
+    person_id: int,
+    preferred_weekdays: str = "",  # comma-separated 0-6
+    preferred_hours: str = "",      # comma-separated 0-23
+    avoid_weekdays: str = "",
+    duration_minutes: int = 0,
+    buffer_minutes: int = 0,
+) -> str:
+    """Persist per-person scheduling preferences. 0=Monday."""
+    from . import scheduling
+
+    def _parse(s):
+        if not s:
+            return []
+        try:
+            return [int(x) for x in s.split(",") if x.strip()]
+        except ValueError:
+            return []
+    _, conn, _, _ = _get_state()
+    scheduling.set_person_prefs(
+        conn, person_id,
+        preferred_weekdays=_parse(preferred_weekdays),
+        preferred_hours=_parse(preferred_hours),
+        avoid_weekdays=_parse(avoid_weekdays),
+        duration_minutes=(duration_minutes or None),
+        buffer_minutes=(buffer_minutes or None),
+    )
+    return f"OK: prefs saved for person #{person_id}."
+
+
+@mcp.tool()
+def triage_done(file_id: int) -> str:
+    """Mark an email as 'done' so it drops out of the morning queue."""
+    from . import triage_queue
+    _, conn, _, _ = _get_state()
+    triage_queue.mark_done(conn, file_id)
+    return f"OK: file #{file_id} marked done."
+
+
+@mcp.tool()
+def triage_snooze(file_id: int, hours: int = 24) -> str:
+    """Snooze an email out of the triage queue for N hours."""
+    from . import triage_queue
+    _, conn, _, _ = _get_state()
+    try:
+        triage_queue.snooze(conn, file_id, hours=hours)
+    except ValueError as e:
+        return f"_{e}_"
+    return f"OK: file #{file_id} snoozed {hours}h."
+
+
 def run() -> None:
     """Run the MCP server over stdio. Used by `secondbrain serve`."""
     _get_state()  # warm caches before we start serving

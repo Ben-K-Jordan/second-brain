@@ -27,11 +27,251 @@ calendar's own UI).
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
+import time as _time_mod
+import weakref as _weakref
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 log = logging.getLogger(__name__)
+
+_SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Round 20 — per-person scheduling preferences + outcome log.
+
+    ``scheduling_prefs`` stores per-person overrides ("Sarah prefers
+    Tue afternoons"). ``scheduling_proposals`` logs proposals we've
+    drafted for outcome tracking.
+    """
+    try:
+        if conn in _SCHEMA_INITIALIZED:
+            return
+    except TypeError:
+        pass
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scheduling_prefs (
+            person_id INTEGER PRIMARY KEY REFERENCES people(id)
+                ON DELETE CASCADE,
+            preferred_weekdays_json TEXT NOT NULL DEFAULT '[]',
+            preferred_hours_json TEXT NOT NULL DEFAULT '[]',
+            avoid_weekdays_json TEXT NOT NULL DEFAULT '[]',
+            duration_minutes INTEGER,
+            buffer_minutes INTEGER,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scheduling_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            person_name TEXT NOT NULL DEFAULT '',
+            slots_json TEXT NOT NULL DEFAULT '[]',
+            email_body TEXT NOT NULL DEFAULT '',
+            proposed_at REAL NOT NULL,
+            chosen_slot_iso TEXT,        -- which the recipient picked
+            outcome TEXT NOT NULL DEFAULT 'pending'
+                CHECK(outcome IN ('pending', 'scheduled',
+                                   'declined', 'expired'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduling_proposals_at
+            ON scheduling_proposals(proposed_at DESC);
+    """)
+    conn.commit()
+    try:
+        _SCHEMA_INITIALIZED.add(conn)
+    except TypeError:
+        pass
+
+
+@dataclass
+class PersonPrefs:
+    person_id: int
+    preferred_weekdays: list[int]
+    preferred_hours: list[int]
+    avoid_weekdays: list[int]
+    duration_minutes: int | None
+    buffer_minutes: int | None
+
+
+def get_person_prefs(
+    conn: sqlite3.Connection, person_id: int,
+) -> PersonPrefs | None:
+    _ensure_schema(conn)
+    row = conn.execute(
+        "SELECT * FROM scheduling_prefs WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return PersonPrefs(
+        person_id=int(row["person_id"]),
+        preferred_weekdays=json.loads(
+            row["preferred_weekdays_json"] or "[]",
+        ),
+        preferred_hours=json.loads(
+            row["preferred_hours_json"] or "[]",
+        ),
+        avoid_weekdays=json.loads(row["avoid_weekdays_json"] or "[]"),
+        duration_minutes=row["duration_minutes"],
+        buffer_minutes=row["buffer_minutes"],
+    )
+
+
+def set_person_prefs(
+    conn: sqlite3.Connection,
+    person_id: int,
+    *,
+    preferred_weekdays: list[int] | None = None,
+    preferred_hours: list[int] | None = None,
+    avoid_weekdays: list[int] | None = None,
+    duration_minutes: int | None = None,
+    buffer_minutes: int | None = None,
+) -> None:
+    """Upsert prefs. Lists default to [] when explicitly set; ints
+    are stored as-is (None means no override)."""
+    _ensure_schema(conn)
+    existing = get_person_prefs(conn, person_id)
+    pw = (
+        preferred_weekdays
+        if preferred_weekdays is not None
+        else (existing.preferred_weekdays if existing else [])
+    )
+    ph = (
+        preferred_hours
+        if preferred_hours is not None
+        else (existing.preferred_hours if existing else [])
+    )
+    aw = (
+        avoid_weekdays
+        if avoid_weekdays is not None
+        else (existing.avoid_weekdays if existing else [])
+    )
+    dm = (
+        duration_minutes
+        if duration_minutes is not None
+        else (existing.duration_minutes if existing else None)
+    )
+    bm = (
+        buffer_minutes
+        if buffer_minutes is not None
+        else (existing.buffer_minutes if existing else None)
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO scheduling_prefs"
+        "(person_id, preferred_weekdays_json, preferred_hours_json, "
+        " avoid_weekdays_json, duration_minutes, buffer_minutes, "
+        " updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            person_id, json.dumps(pw), json.dumps(ph),
+            json.dumps(aw), dm, bm, _time_mod.time(),
+        ),
+    )
+    conn.commit()
+
+
+def merge_with_global_prefs(
+    cfg, person_prefs: PersonPrefs | None,
+    *,
+    duration_minutes: int = 30,
+) -> SchedulingPrefs:
+    """Combine per-person overrides with global cfg.* defaults.
+
+    Falls back to round-19 defaults when nothing is configured.
+    """
+    earliest = int(getattr(cfg, "scheduling_earliest_hour", 9))
+    latest = int(getattr(cfg, "scheduling_latest_hour", 17))
+    default_buffer = int(getattr(cfg, "scheduling_buffer_minutes", 15))
+    p = person_prefs
+    return SchedulingPrefs(
+        duration_minutes=(
+            p.duration_minutes if p and p.duration_minutes
+            else duration_minutes
+        ),
+        earliest_hour=earliest,
+        latest_hour=latest,
+        preferred_weekdays=(p.preferred_weekdays if p else None) or None,
+        preferred_hours=(p.preferred_hours if p else None) or None,
+        avoid_weekdays=(p.avoid_weekdays if p else None) or None,
+        buffer_minutes=(
+            p.buffer_minutes if p and p.buffer_minutes
+            else default_buffer
+        ),
+    )
+
+
+def log_proposal(
+    conn: sqlite3.Connection,
+    *,
+    person_id: int | None,
+    person_name: str,
+    slots: list,
+    email_body: str,
+) -> int:
+    _ensure_schema(conn)
+    try:
+        from .safety import redact_text
+        person_name = redact_text(person_name)
+        email_body = redact_text(email_body)
+    except ImportError:
+        pass
+    slots_json = json.dumps([
+        {
+            "start_iso": s.start.isoformat(),
+            "end_iso": s.end.isoformat(),
+            "rank": s.rank,
+        } for s in slots
+    ])
+    cur = conn.execute(
+        "INSERT INTO scheduling_proposals"
+        "(person_id, person_name, slots_json, email_body, proposed_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (person_id, person_name, slots_json, email_body, _time_mod.time()),
+    )
+    conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+def list_recent_proposals(
+    conn: sqlite3.Connection, *, limit: int = 30,
+) -> list[dict]:
+    _ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT * FROM scheduling_proposals "
+        "ORDER BY proposed_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "person_id": r["person_id"],
+            "person_name": r["person_name"],
+            "slots": json.loads(r["slots_json"] or "[]"),
+            "email_body": r["email_body"],
+            "proposed_at": float(r["proposed_at"]),
+            "outcome": r["outcome"],
+            "chosen_slot_iso": r["chosen_slot_iso"],
+        }
+        for r in rows
+    ]
+
+
+def mark_proposal_outcome(
+    conn: sqlite3.Connection, proposal_id: int,
+    outcome: str, chosen_slot_iso: str = "",
+) -> bool:
+    if outcome not in ("scheduled", "declined", "expired"):
+        raise ValueError(f"bad outcome: {outcome!r}")
+    _ensure_schema(conn)
+    cur = conn.execute(
+        "UPDATE scheduling_proposals SET outcome = ?, "
+        "chosen_slot_iso = ? WHERE id = ?",
+        (outcome, chosen_slot_iso or None, proposal_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 @dataclass

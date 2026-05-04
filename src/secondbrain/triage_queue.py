@@ -30,9 +30,97 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+import weakref as _weakref
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+
+_SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Round 20 — triage state per file_id (snooze + done tracker).
+
+    Each row records the user's per-email triage decision so the
+    queue can hide processed items same-day and skip snoozed items
+    until ``snooze_until`` passes.
+    """
+    try:
+        if conn in _SCHEMA_INITIALIZED:
+            return
+    except TypeError:
+        pass
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS triage_state (
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            decision TEXT,           -- 'done' | 'snoozed' | 'skipped'
+            decided_at REAL,
+            snooze_until REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_triage_state_decision
+            ON triage_state(decision);
+    """)
+    conn.commit()
+    try:
+        _SCHEMA_INITIALIZED.add(conn)
+    except TypeError:
+        pass
+
+
+def mark_done(conn: sqlite3.Connection, file_id: int) -> bool:
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO triage_state"
+        "(file_id, decision, decided_at, snooze_until) "
+        "VALUES (?, 'done', ?, NULL)",
+        (file_id, time.time()),
+    )
+    conn.commit()
+    return True
+
+
+def mark_skipped(conn: sqlite3.Connection, file_id: int) -> bool:
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO triage_state"
+        "(file_id, decision, decided_at, snooze_until) "
+        "VALUES (?, 'skipped', ?, NULL)",
+        (file_id, time.time()),
+    )
+    conn.commit()
+    return True
+
+
+def snooze(
+    conn: sqlite3.Connection, file_id: int, hours: int = 24,
+) -> bool:
+    if hours < 1:
+        raise ValueError(f"hours must be >= 1; got {hours}")
+    _ensure_schema(conn)
+    until = time.time() + hours * 3600
+    conn.execute(
+        "INSERT OR REPLACE INTO triage_state"
+        "(file_id, decision, decided_at, snooze_until) "
+        "VALUES (?, 'snoozed', ?, ?)",
+        (file_id, time.time(), until),
+    )
+    conn.commit()
+    return True
+
+
+def done_count_today(conn: sqlite3.Connection) -> int:
+    """Count of file_ids the user marked 'done' since midnight."""
+    _ensure_schema(conn)
+    from datetime import date as _date
+    from datetime import datetime as _dt
+    from datetime import time as _time
+    midnight = _dt.combine(_date.today(), _time(0, 0)).timestamp()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM triage_state "
+        "WHERE decision = 'done' AND decided_at >= ?",
+        (midnight,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 @dataclass
@@ -108,26 +196,38 @@ def build_queue(
     """Build the morning triage queue. Looks at the last ``hours``
     of indexed email-kind files, joins to email_classifications +
     email_drafts, ranks, returns the top N."""
+    _ensure_schema(conn)
     cutoff = time.time() - hours * 3600
+    now = time.time()
     try:
         # email_drafts uses ``sent_at IS NULL`` to mean "still pending"
         # (no explicit status column). LEFT JOIN to the latest unsent
         # draft per file via a subquery so a file with multiple drafts
         # surfaces the freshest pending one.
+        # Round 20: also LEFT JOIN triage_state so we can hide
+        # 'done'/'skipped'/'snoozed' rows and surface only what
+        # actually needs the user.
         rows = conn.execute(
             "SELECT f.id AS file_id, f.path, f.indexed_at, "
             "       SUBSTR(c.text, 1, 400) AS preview, "
             "       ec.label, ec.confidence, "
-            "       ed.id AS draft_id "
+            "       ed.id AS draft_id, "
+            "       ts.decision AS triage_decision, "
+            "       ts.snooze_until AS triage_snooze_until "
             "FROM files f "
             "LEFT JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
             "LEFT JOIN email_classifications ec ON ec.file_id = f.id "
             "LEFT JOIN email_drafts ed ON ed.file_id = f.id "
             "    AND ed.sent_at IS NULL "
+            "LEFT JOIN triage_state ts ON ts.file_id = f.id "
             "WHERE f.indexed_at >= ? "
             "  AND (f.kind = 'email' OR f.kind = 'message') "
+            "  AND (ts.decision IS NULL "
+            "       OR ts.decision = 'snoozed' "
+            "         AND (ts.snooze_until IS NULL "
+            "              OR ts.snooze_until <= ?)) "
             "ORDER BY f.indexed_at DESC LIMIT 300",
-            (cutoff,),
+            (cutoff, now),
         ).fetchall()
     except sqlite3.OperationalError:
         return []

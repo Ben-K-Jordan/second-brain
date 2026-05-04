@@ -69,6 +69,15 @@ class MeetingCapture:
     recap_draft: str
     captured_at: float
     model: str
+    # Round 20 —
+    attendees: list[str] = None  # type: ignore[assignment]
+    calendar_event_id: str | None = None
+    user_edited: bool = False
+    recap_sent_at: float | None = None
+
+    def __post_init__(self):
+        if self.attendees is None:
+            self.attendees = []
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +90,10 @@ class MeetingCapture:
             "recap_draft": self.recap_draft,
             "captured_at": self.captured_at,
             "model": self.model,
+            "attendees": self.attendees,
+            "calendar_event_id": self.calendar_event_id,
+            "user_edited": self.user_edited,
+            "recap_sent_at": self.recap_sent_at,
         }
 
 
@@ -106,6 +119,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_meeting_captures_captured
             ON meeting_captures(captured_at DESC);
     """)
+    # Round 20 — attendee tracking + calendar event linkage.
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(meeting_captures)")
+    }
+    if "attendees_json" not in cols:
+        conn.execute(
+            "ALTER TABLE meeting_captures "
+            "ADD COLUMN attendees_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "calendar_event_id" not in cols:
+        conn.execute(
+            "ALTER TABLE meeting_captures "
+            "ADD COLUMN calendar_event_id TEXT"
+        )
+    if "user_edited" not in cols:
+        conn.execute(
+            "ALTER TABLE meeting_captures "
+            "ADD COLUMN user_edited INTEGER NOT NULL DEFAULT 0"
+        )
     conn.commit()
     try:
         _SCHEMA_INITIALIZED.add(conn)
@@ -114,6 +147,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _row_to_capture(row) -> MeetingCapture:
+    keys = row.keys() if hasattr(row, "keys") else ()
     return MeetingCapture(
         id=int(row["id"]),
         file_id=int(row["file_id"]) if row["file_id"] else 0,
@@ -128,6 +162,19 @@ def _row_to_capture(row) -> MeetingCapture:
         recap_draft=row["recap_draft"] or "",
         captured_at=float(row["captured_at"]),
         model=row["model"] or "",
+        attendees=(
+            json.loads(row["attendees_json"] or "[]")
+            if "attendees_json" in keys else []
+        ),
+        calendar_event_id=(
+            row["calendar_event_id"]
+            if "calendar_event_id" in keys else None
+        ),
+        user_edited=(
+            bool(row["user_edited"])
+            if "user_edited" in keys else False
+        ),
+        recap_sent_at=row["recap_sent_at"],
     )
 
 
@@ -140,6 +187,9 @@ You are an executive-assistant-grade meeting capture engine.
 You read a meeting transcript and produce a JSON object with:
 
   title: 3-7 word headline of what the meeting was about
+  attendees: array of names appearing in the transcript as speakers
+             or addressed parties. Includes the meeting owner if
+             named. Skip placeholder labels like "Speaker 1".
   decisions: array of {text, rationale} — concrete decisions made.
             Soft "we should think about X" is NOT a decision unless
             paired with an explicit conclusion.
@@ -309,6 +359,12 @@ def capture(
         if q
     ]
     recap_draft = str(parsed.get("recap_draft") or "")[:4000]
+    # Round 20 — extract attendees list from LLM output.
+    attendees = [
+        str(a)[:120]
+        for a in parsed.get("attendees") or []
+        if a and isinstance(a, str)
+    ]
     # Round 13 invariant — redact persisted text.
     try:
         from .safety import redact_text
@@ -330,6 +386,7 @@ def capture(
         ]
         open_questions = [redact_text(q) for q in open_questions]
         recap_draft = redact_text(recap_draft)
+        attendees = [redact_text(a) for a in attendees]
     except ImportError:
         pass
     now = time.time()
@@ -341,6 +398,7 @@ def capture(
         json.dumps(open_questions),
         recap_draft,
         now, model,
+        json.dumps(attendees),
     )
     # Round 17-style atomic transaction.
     with conn:
@@ -352,8 +410,9 @@ def capture(
         conn.execute(
             "INSERT OR REPLACE INTO meeting_captures"
             "(file_id, title, decisions_json, actions_json, "
-            " open_questions_json, recap_draft, captured_at, model) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " open_questions_json, recap_draft, captured_at, model, "
+            " attendees_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             payload,
         )
     # Audit log row so /audit shows what we did.
@@ -470,6 +529,139 @@ def mark_recap_sent(
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+# ============================ Round 20 — edits ===================
+
+
+def edit_capture(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    title: str | None = None,
+    decisions: list[dict] | None = None,
+    actions: list[dict] | None = None,
+    open_questions: list[str] | None = None,
+    recap_draft: str | None = None,
+    attendees: list[str] | None = None,
+    calendar_event_id: str | None = None,
+) -> bool:
+    """User-side edits override the LLM extraction. Sets
+    ``user_edited=1`` so re-running capture won't clobber. Returns
+    True if anything changed."""
+    _ensure_schema(conn)
+    try:
+        from .safety import redact_text
+    except ImportError:
+        def redact_text(s):
+            return s
+    updates: list[str] = []
+    params: list = []
+    if title is not None:
+        updates.append("title = ?")
+        params.append(redact_text(title)[:300])
+    if decisions is not None:
+        clean = [
+            asdict(Decision(
+                text=redact_text(str(d.get("text") or ""))[:500],
+                rationale=redact_text(
+                    str(d.get("rationale") or ""),
+                )[:500],
+            ))
+            for d in decisions if isinstance(d, dict) and d.get("text")
+        ]
+        updates.append("decisions_json = ?")
+        params.append(json.dumps(clean))
+    if actions is not None:
+        clean = [
+            asdict(ActionItem(
+                owner=str(a.get("owner") or "unassigned")[:120],
+                description=redact_text(
+                    str(a.get("description") or ""),
+                )[:500],
+                due_hint=str(a.get("due_hint") or "")[:120],
+            ))
+            for a in actions if isinstance(a, dict) and a.get("description")
+        ]
+        updates.append("actions_json = ?")
+        params.append(json.dumps(clean))
+    if open_questions is not None:
+        clean = [redact_text(str(q))[:300] for q in open_questions if q]
+        updates.append("open_questions_json = ?")
+        params.append(json.dumps(clean))
+    if recap_draft is not None:
+        updates.append("recap_draft = ?")
+        params.append(redact_text(recap_draft)[:4000])
+    if attendees is not None:
+        clean = [redact_text(str(a))[:120] for a in attendees if a]
+        updates.append("attendees_json = ?")
+        params.append(json.dumps(clean))
+    if calendar_event_id is not None:
+        updates.append("calendar_event_id = ?")
+        params.append(calendar_event_id[:200])
+    if not updates:
+        return False
+    updates.append("user_edited = 1")
+    params.append(file_id)
+    cur = conn.execute(
+        f"UPDATE meeting_captures SET {', '.join(updates)} "
+        f"WHERE file_id = ?",
+        params,
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def link_to_calendar_event(
+    conn: sqlite3.Connection, file_id: int, event_id: str,
+) -> bool:
+    """Persist a Google Calendar event ID alongside this capture so
+    a later "agenda for next 1:1 with Sarah" can match the meeting
+    series."""
+    return edit_capture(
+        conn, file_id,
+        calendar_event_id=str(event_id)[:200],
+    )
+
+
+def render_capture_markdown(cap: MeetingCapture) -> str:
+    """Round 20 — format a capture as Markdown for the dashboard
+    detail view + the recap-email copy/send flow."""
+    try:
+        from .safety import redact_text as _r
+    except ImportError:
+        def _r(s):
+            return s
+    lines = [f"# {_r(cap.title)}", ""]
+    if cap.attendees:
+        lines.append("**Attendees:** " + ", ".join(
+            _r(a) for a in cap.attendees
+        ))
+        lines.append("")
+    if cap.decisions:
+        lines.append("## Decisions")
+        for d in cap.decisions:
+            lines.append(f"- **{_r(d.text)}**")
+            if d.rationale:
+                lines.append(f"  - {_r(d.rationale)}")
+        lines.append("")
+    if cap.actions:
+        lines.append("## Action items")
+        for a in cap.actions:
+            due = f" · _due: {a.due_hint}_" if a.due_hint else ""
+            lines.append(
+                f"- **{_r(a.owner)}** — {_r(a.description)}{due}",
+            )
+        lines.append("")
+    if cap.open_questions:
+        lines.append("## Open questions")
+        for q in cap.open_questions:
+            lines.append(f"- {_r(q)}")
+        lines.append("")
+    if cap.recap_draft:
+        lines.append("## Recap draft")
+        lines.append(_r(cap.recap_draft))
+    return "\n".join(lines)
 
 
 def daemon_capture_recent(

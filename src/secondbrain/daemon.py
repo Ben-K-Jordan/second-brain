@@ -637,6 +637,32 @@ def _build_daemon_scheduler(
         fn=lambda conn: _cr_check(conn),
     ))
 
+    # ============================ Round 20 — EA jobs ===============
+
+    # Round 20: auto-resolve outgoing follow-ups by scanning recent
+    # sent mail / journal mentions. Hourly cadence — slow enough that
+    # cumulative LLM cost stays sub-cent / day at personal scale.
+    from .followups_ops import (
+        auto_resolve_from_sent_mail as _fu_auto_resolve,
+    )
+    sched.register(Job(
+        name="followups_auto_resolve",
+        schedule=IntervalSchedule(seconds=60 * 60),
+        fn=lambda cfg, conn: _fu_auto_resolve(conn, cfg, hours=12),
+    ))
+
+    # Round 20: weekly cadence inference. Only sets cadence_days
+    # for people who don't already have one set, so it never
+    # overrides explicit user choices.
+    from .people import (
+        auto_apply_inferred_cadence as _people_infer_cadence,
+    )
+    sched.register(Job(
+        name="cadence_inference",
+        schedule=CooldownSchedule(seconds=60 * 60, cooldown_hours=7 * 24),
+        fn=lambda conn: _people_infer_cadence(conn),
+    ))
+
     return sched
 
 
