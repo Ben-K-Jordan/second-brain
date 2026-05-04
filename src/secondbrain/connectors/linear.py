@@ -92,6 +92,8 @@ class LinearConnector:
     # --- helpers ----------------------------------------------------------
 
     def _iter_issues(self, s: requests.Session, cap: int) -> Iterator[ConnectorDocument]:
+        # Round 18 fix (audit-found gap M5) — honor 429 Retry-After.
+        from . import respect_retry_after
         cursor: str | None = None
         emitted = 0
         while emitted < cap:
@@ -104,6 +106,8 @@ class LinearConnector:
                 },
                 timeout=60,
             )
+            if respect_retry_after(r):
+                continue
             if r.status_code != 200:
                 log.warning("Linear issues fetch failed: %s %s", r.status_code, r.text[:200])
                 return

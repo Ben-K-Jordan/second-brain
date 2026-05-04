@@ -73,6 +73,15 @@ class PocketConnector:
                 except requests.RequestException as e:
                     log.warning("Pocket request failed: %s", e)
                     return
+                # Round 18 fix (audit-found gap M5) — honor 429.
+                # Pocket does set Retry-After on rate limits.
+                from . import respect_retry_after
+                if respect_retry_after(r):
+                    try:
+                        r = s.post(_API, json=payload, timeout=30)
+                    except requests.RequestException as e:
+                        log.warning("Pocket request failed (retry): %s", e)
+                        return
                 if r.status_code != 200:
                     # Never log r.text - Pocket echoes the request payload
                     # (consumer_key + access_token) in some error responses.

@@ -101,8 +101,18 @@ class MentionRow:
 # ============================ resolution ==============================
 
 def canonicalize(name: str) -> str:
-    """Lowercase + collapse whitespace. The de-dup key for ``people``."""
-    return " ".join(name.lower().split())
+    """Lowercase + collapse whitespace. The de-dup key for ``people``.
+
+    Round 18 fix (audit-found gap M7) — NFC-normalize Unicode before
+    casefolding. Without this, the same name typed via macOS keyboard
+    (which produces NFD: ``o`` + combining acute) and a connector
+    that produces NFC (single precomposed ``ó``) compared unequal,
+    creating duplicate ``people`` rows that no merge ever caught.
+    ``casefold`` is the Unicode-aware lowering that handles cases
+    like German ß → ss correctly.
+    """
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFC", name).casefold().split())
 
 
 def upsert_person(
@@ -161,7 +171,12 @@ def upsert_person(
 
 def add_alias(conn: sqlite3.Connection, person_id: int, alias: str) -> bool:
     """Register an alias. Idempotent — re-adds are no-ops. Returns True
-    if a new row landed."""
+    if a new row landed.
+
+    Round 18 fix (audit-found gap M7) — uses ``canonicalize`` for
+    ``alias_lower`` so NFC vs. NFD spellings of the same alias dedup
+    cleanly across reads/writes.
+    """
     a = alias.strip()
     if not a:
         return False
@@ -169,7 +184,7 @@ def add_alias(conn: sqlite3.Connection, person_id: int, alias: str) -> bool:
         "INSERT OR IGNORE INTO person_aliases"
         "(person_id, alias, alias_lower, created_at) "
         "VALUES (?, ?, ?, ?)",
-        (person_id, a, a.lower(), time.time()),
+        (person_id, a, canonicalize(a), time.time()),
     )
     conn.commit()
     return cur.rowcount > 0
@@ -181,7 +196,7 @@ def remove_alias(conn: sqlite3.Connection, alias: str) -> bool:
     a false positive."""
     cur = conn.execute(
         "DELETE FROM person_aliases WHERE alias_lower = ?",
-        (alias.strip().lower(),),
+        (canonicalize(alias.strip()),),
     )
     conn.commit()
     return cur.rowcount > 0

@@ -507,14 +507,22 @@ def _walk_cluster(
         member_ids.add(int(d["dst_file_id"]))
         pairwise_scores.append(float(d["score"]))
     # Second hop: keep candidates that link back to the seed cluster.
+    # Round 18 fix (audit-found gap L12) — materialise once. The
+    # earlier code expanded the same set twice in one expression
+    # (``*member_ids, *member_ids``); CPython does iterate
+    # consistently for ints under hash randomization within a single
+    # expression, but if a later refactor splits the call the two
+    # lists silently desync. List + reuse is provably safe.
+    member_ids_list = list(member_ids)
+    placeholders = ",".join(["?"] * len(member_ids_list))
     second_hop = conn.execute(
         f"SELECT dst_file_id, AVG(score) AS s "
         f"FROM backlinks "
-        f"WHERE src_file_id IN ({','.join(['?'] * len(member_ids))}) "
-        f"  AND dst_file_id NOT IN ({','.join(['?'] * len(member_ids))}) "
+        f"WHERE src_file_id IN ({placeholders}) "
+        f"  AND dst_file_id NOT IN ({placeholders}) "
         f"GROUP BY dst_file_id HAVING COUNT(*) >= 2 "
         f"ORDER BY s ASC LIMIT 5",
-        (*member_ids, *member_ids),
+        (*member_ids_list, *member_ids_list),
     ).fetchall()
     for r in second_hop:
         member_ids.add(int(r["dst_file_id"]))

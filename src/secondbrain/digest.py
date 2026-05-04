@@ -279,7 +279,13 @@ def send_digest(cfg: Config, conn) -> tuple[bool, str]:
             s.ehlo()
             s.login(cfg.digest_smtp_user, password)
             s.send_message(msg)
-    except (smtplib.SMTPException, OSError) as e:
+    except (smtplib.SMTPException, OSError, ValueError) as e:
+        # Round 18 fix (audit-found gap L13) — also catch ValueError.
+        # ``send_message`` on a malformed ``EmailMessage`` (e.g. a
+        # comma-separated To: line that fails RFC 5322 strict
+        # parsing) raises ValueError, which the prior except tuple
+        # missed → digest job crashed instead of recording a
+        # non-fatal failure.
         err = f"{type(e).__name__}: {e}"
         log.warning("digest send failed: %s", err)
         _record_run(conn, success=False, error=err,

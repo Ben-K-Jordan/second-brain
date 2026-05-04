@@ -166,6 +166,10 @@ class GmailConnector:
     def _iter_message_ids(
         self, s: requests.Session, query: str, cap: int
     ) -> Iterator[str]:
+        # Round 18 fix (audit-found gap M5) — honor 429 Retry-After.
+        # Gmail's per-user quota is 250 quota units / second; without
+        # backoff a busy mailbox sync gets throttled and truncates.
+        from . import respect_retry_after
         page_token: str | None = None
         emitted = 0
         while emitted < cap:
@@ -173,6 +177,8 @@ class GmailConnector:
             if page_token:
                 params["pageToken"] = page_token
             r = s.get(f"{_API}/users/me/messages", params=params, timeout=30)
+            if respect_retry_after(r):
+                continue  # re-issue same page
             if r.status_code != 200:
                 log.warning("Gmail list failed: %s %s", r.status_code, r.text[:200])
                 return
@@ -187,11 +193,12 @@ class GmailConnector:
                 return
 
     def _fetch_message(self, s: requests.Session, msg_id: str) -> ConnectorDocument | None:
-        r = s.get(
-            f"{_API}/users/me/messages/{msg_id}",
-            params={"format": "full"},
-            timeout=30,
-        )
+        from . import respect_retry_after
+        url = f"{_API}/users/me/messages/{msg_id}"
+        params = {"format": "full"}
+        r = s.get(url, params=params, timeout=30)
+        if respect_retry_after(r):
+            r = s.get(url, params=params, timeout=30)
         if r.status_code != 200:
             log.warning("Gmail fetch %s failed: %s", msg_id, r.status_code)
             return None

@@ -4264,7 +4264,13 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     @app.get("/timeline", response_class=HTMLResponse)
     def timeline_page(
-        date_str: str | None = None,
+        # Round 18 fix (audit-found gap H2) — the route's own links
+        # generate ``?date=...`` but the parameter was named
+        # ``date_str``, so FastAPI never bound it and every nav link
+        # snapped back to today. ``Query(alias="date")`` makes the
+        # parameter accept ``?date=...`` without shadowing Python's
+        # built-in ``date``.
+        date_str: str | None = Query(None, alias="date"),
         days: int = 1,
         kinds: str | None = None,
     ):
@@ -4279,9 +4285,29 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         from . import timeline
 
         _, conn, _, _ = get_state()
+        # Round 18 fix (audit-found gap H1) — closed-vocabulary
+        # filter for ``kinds`` BEFORE reflecting it back into HTML.
+        # The earlier code interpolated raw ``kinds=`` into ``href``
+        # attributes; an attacker-supplied query string like
+        # ``?kinds="><script>alert(1)</script>`` broke out of the
+        # attribute and ran JS in the dashboard origin (loopback
+        # access to every authenticated route). Whitelist + escape.
+        all_kinds = [
+            "file", "task", "journal", "habit", "health",
+            "email", "notif", "weekly",
+        ]
+        _all_kinds_set = set(all_kinds)
         kind_set: set[str] | None = None
         if kinds:
-            kind_set = {k.strip() for k in kinds.split(",") if k.strip()}
+            kind_set = {
+                k.strip() for k in kinds.split(",")
+                if k.strip() in _all_kinds_set
+            } or None
+        # Re-serialise ONLY the validated tokens so the query-string
+        # we reflect back is provably safe (no quotes, angle brackets,
+        # etc. — only [a-z]+ tokens from ``all_kinds``).
+        safe_kinds_str = ",".join(sorted(kind_set)) if kind_set else ""
+
         # Cap the window so a 365-day query doesn't stall the page.
         days = max(1, min(int(days or 1), 30))
         since_ts, until_ts = timeline.parse_window(date_str, days)
@@ -4301,14 +4327,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         days_chip_html = " ".join(
             f'<a class="chip {"active" if d == days else ""}" '
             f'href="/timeline?date={anchor.isoformat()}&days={d}'
-            + (f'&kinds={kinds}' if kinds else '') + '">'
+            + (f'&kinds={safe_kinds_str}' if safe_kinds_str else '')
+            + '">'
             f'{d}d</a>'
             for d in days_options
         )
-        all_kinds = [
-            "file", "task", "journal", "habit", "health",
-            "email", "notif", "weekly",
-        ]
         active_kinds = kind_set or set(all_kinds)
         kind_chip_html = " ".join(
             f'<a class="chip {"active" if k in active_kinds else ""}" '
@@ -4363,14 +4386,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             f'<div class="tl-controls card">'
             f'  <div class="tl-nav">'
             f'    <a href="/timeline?date={prev_d}&days={days}'
-            + (f'&kinds={kinds}' if kinds else '')
+            + (f'&kinds={safe_kinds_str}' if safe_kinds_str else '')
             + f'" class="link-btn">← {days}d earlier</a>'
             f'    <span class="tl-anchor"><strong>'
             f'{escape(anchor.isoformat())}</strong>'
             f' <span class="muted">({days} day{"s" if days != 1 else ""})'
             f'</span></span>'
             f'    <a href="/timeline?date={next_d}&days={days}'
-            + (f'&kinds={kinds}' if kinds else '')
+            + (f'&kinds={safe_kinds_str}' if safe_kinds_str else '')
             + f'" class="link-btn">{days}d later →</a>'
             f'  </div>'
             f'  <div class="tl-chips">'
@@ -5918,9 +5941,23 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         """Lightweight click beacon. The dashboard front-end POSTs here
         whenever the user opens a search/chat/palette result. We log the
         path so subsequent searches lift it via the click-recency boost.
+
+        Round 18 fix (audit-found gap H3) — same-origin guard. The
+        round-14 CSRF sweep covered every other state-mutating POST
+        but missed this one. ``log_click`` writes to the ``clicks``
+        table which biases search ranking via the click-recency
+        boost; without a guard, a malicious page the user visits in
+        another tab can poll-flood arbitrary paths into the log to
+        skew search results. Browsers always send Referer on
+        same-origin sendBeacon, so the existing helper still
+        accepts the dashboard's own JS.
         """
+        from fastapi.responses import JSONResponse as _JSON
+
         from .db import log_click
 
+        if not _is_same_origin_request(request):
+            return _JSON({"ok": False, "error": "forbidden"}, status_code=403)
         try:
             body = await request.json()
         except Exception:

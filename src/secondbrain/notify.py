@@ -99,10 +99,20 @@ def _notify_windows(title: str, message: str, url: str | None) -> bool:
     return True
 
 
+def _applescript_escape(s: str) -> str:
+    """Round 18 fix (audit-found gap L9) — AppleScript string
+    literals are double-quoted; ``'`` is just a literal character,
+    so the previous ``'.replace('"', "''")`` substitution emitted
+    two literal single-quotes instead of escaping the ``"``. The
+    correct AppleScript escape is ``\\"`` for ``"`` and ``\\\\``
+    for ``\``. Order matters: backslash first, then quote.
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _notify_macos(title: str, message: str) -> bool:
-    # display notification escapes via "" -> double-quote in AppleScript.
-    safe_title = title.replace('"', "''")
-    safe_msg = message.replace('"', "''")
+    safe_title = _applescript_escape(title)
+    safe_msg = _applescript_escape(message)
     script = (
         f'display notification "{safe_msg}" with title "{safe_title}" '
         f'sound name "Glass"'

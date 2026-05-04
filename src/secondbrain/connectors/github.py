@@ -64,6 +64,7 @@ class GitHubConnector:
     # --- helpers ----------------------------------------------------------
 
     def _iter_repos(self, s: requests.Session) -> Iterator[dict]:
+        from . import respect_retry_after
         page = 1
         while True:
             r = s.get(
@@ -71,6 +72,12 @@ class GitHubConnector:
                 params={"per_page": _PER_PAGE, "sort": "updated", "page": page},
                 timeout=30,
             )
+            # Round 18 fix (audit-found gap M5) — honor 429
+            # Retry-After. GitHub's primary rate limit is 5,000/hr;
+            # without backoff a 100-repo sync on a busy account
+            # blows through it and silently truncates.
+            if respect_retry_after(r):
+                continue
             if r.status_code != 200:
                 log.warning("GitHub /user/repos failed: %s %s", r.status_code, r.text[:200])
                 return
@@ -83,12 +90,15 @@ class GitHubConnector:
             page += 1
 
     def _fetch_repo(self, s: requests.Session, repo: dict) -> Iterator[ConnectorDocument]:
+        from . import respect_retry_after
         full_name = repo["full_name"]
         repo_mtime = _iso_to_ts(repo.get("updated_at"))
 
         # README
         try:
             r = s.get(f"{_API}/repos/{full_name}/readme", timeout=30)
+            if respect_retry_after(r):
+                r = s.get(f"{_API}/repos/{full_name}/readme", timeout=30)
             if r.status_code == 200:
                 data = r.json()
                 content_b64 = data.get("content", "")
@@ -108,11 +118,20 @@ class GitHubConnector:
 
         # Issues + PRs (issues endpoint returns both; we partition for clarity)
         try:
+            params = {
+                "state": "all",
+                "per_page": _ISSUES_PER_REPO,
+                "sort": "updated",
+            }
             r = s.get(
                 f"{_API}/repos/{full_name}/issues",
-                params={"state": "all", "per_page": _ISSUES_PER_REPO, "sort": "updated"},
-                timeout=30,
+                params=params, timeout=30,
             )
+            if respect_retry_after(r):
+                r = s.get(
+                    f"{_API}/repos/{full_name}/issues",
+                    params=params, timeout=30,
+                )
             if r.status_code == 200:
                 for item in r.json():
                     is_pr = "pull_request" in item

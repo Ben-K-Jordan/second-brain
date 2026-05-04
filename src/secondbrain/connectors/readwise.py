@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 import requests
 
 from ..config import Config
-from . import USER_AGENT, ConnectorDocument
+from . import USER_AGENT, ConnectorDocument, respect_retry_after
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +82,12 @@ class ReadwiseConnector:
                 yield doc
 
     def _fetch_books(self, s: requests.Session) -> dict[int, dict]:
-        """Return {book_id: book_dict} across paginated /books."""
+        """Return {book_id: book_dict} across paginated /books.
+
+        Round 18 fix (audit-found gap M5) — honor 429 Retry-After.
+        Readwise rate-limits at 240 req/min; without backoff a busy
+        account hits the wall and silently truncates the sync.
+        """
         out: dict[int, dict] = {}
         url = f"{_API_BASE}/books/?page_size=1000"
         while url:
@@ -90,6 +95,11 @@ class ReadwiseConnector:
                 r = s.get(url, timeout=_TIMEOUT)
             except requests.RequestException:
                 return out
+            if respect_retry_after(r):
+                try:
+                    r = s.get(url, timeout=_TIMEOUT)
+                except requests.RequestException:
+                    return out
             if r.status_code != 200:
                 log.warning("readwise: books HTTP %s", r.status_code)
                 return out
@@ -120,6 +130,11 @@ class ReadwiseConnector:
                 r = s.get(url, timeout=_TIMEOUT)
             except requests.RequestException:
                 return out
+            if respect_retry_after(r):
+                try:
+                    r = s.get(url, timeout=_TIMEOUT)
+                except requests.RequestException:
+                    return out
             if r.status_code != 200:
                 log.warning("readwise: highlights HTTP %s", r.status_code)
                 return out

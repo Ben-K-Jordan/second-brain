@@ -257,7 +257,13 @@ def _events_notifications(
         out.append(TimelineEvent(
             ts=float(r["created_at"]),
             kind=f"notif:{r['kind']}",
-            title=r["title"],
+            # Round 18 fix (audit-found gap M4) — every other event
+            # source applies _redact() to title; this one passed it
+            # through raw. Notification titles built from email
+            # subjects ("Re: API key for ...") could leak the
+            # secret-shaped substrings the round-13 redaction
+            # invariant was supposed to mask uniformly.
+            title=_redact(r["title"] or ""),
             detail=_redact(r["body"] or ""),
             href=r["href"] or "/notifications",
             icon="🔔",

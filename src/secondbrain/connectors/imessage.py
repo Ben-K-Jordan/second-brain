@@ -337,41 +337,56 @@ class IMessageConnector:
                 log.warning("imessage: cannot open chat.db: %s", e)
                 return
 
+            # Round 18 fix (audit-found gap L10) — wrap the whole
+            # consumer-yielding loop in try/finally so a downstream
+            # exception during ``yield`` (consumer abort, indexer
+            # crash) doesn't leak the SQLite connection. Previously
+            # ``conn.close()`` only ran if every yield completed
+            # cleanly; the GC eventually closed it but at unbounded
+            # delay during a crash storm.
             try:
-                chats = _list_chats(conn)
-            except sqlite3.OperationalError as e:
-                log.warning("imessage: chat list query failed: %s", e)
-                conn.close()
-                return
-
-            for chat in chats:
                 try:
-                    messages = _fetch_messages(conn, chat.chat_id)
+                    chats = _list_chats(conn)
                 except sqlite3.OperationalError as e:
                     log.warning(
-                        "imessage: messages query failed for chat %d: %s",
-                        chat.chat_id, e,
+                        "imessage: chat list query failed: %s", e,
                     )
-                    continue
-                if len(messages) < _MIN_MESSAGES_PER_CHAT:
-                    continue
-                title, body = _format_thread(chat, messages)
-                latest_ts = max((m["ts"] for m in messages), default=0.0)
-                yield ConnectorDocument(
-                    source="imessage",
-                    virtual_path=f"imessage://chat-{chat.chat_id}",
-                    title=title,
-                    content=body,
-                    mtime=latest_ts,
-                    kind="message",
-                    metadata={
-                        "chat_id": chat.chat_id,
-                        "is_group": chat.is_group,
-                        "participants": chat.participants,
-                        "n_messages": len(messages),
-                    },
-                )
-            conn.close()
+                    return
+
+                for chat in chats:
+                    try:
+                        messages = _fetch_messages(conn, chat.chat_id)
+                    except sqlite3.OperationalError as e:
+                        log.warning(
+                            "imessage: messages query failed for "
+                            "chat %d: %s", chat.chat_id, e,
+                        )
+                        continue
+                    if len(messages) < _MIN_MESSAGES_PER_CHAT:
+                        continue
+                    title, body = _format_thread(chat, messages)
+                    latest_ts = max(
+                        (m["ts"] for m in messages), default=0.0,
+                    )
+                    yield ConnectorDocument(
+                        source="imessage",
+                        virtual_path=f"imessage://chat-{chat.chat_id}",
+                        title=title,
+                        content=body,
+                        mtime=latest_ts,
+                        kind="message",
+                        metadata={
+                            "chat_id": chat.chat_id,
+                            "is_group": chat.is_group,
+                            "participants": chat.participants,
+                            "n_messages": len(messages),
+                        },
+                    )
+            finally:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
         finally:
             for p in (tmp_path, Path(str(tmp_path) + "-wal"),
                       Path(str(tmp_path) + "-shm")):

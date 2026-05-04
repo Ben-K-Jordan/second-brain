@@ -95,8 +95,17 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset({
 
 
 def app_data_dir() -> Path:
-    """Return the cross-platform app data directory."""
-    p = user_data_path(APP_NAME, appauthor=False, ensure_exists=True)
+    """Return the cross-platform app data directory.
+
+    Round 18 fix (audit-found gap M8) — ``ensure_exists=False`` so
+    bare ``Config()`` instantiation (e.g. in unit tests) doesn't
+    materialize the real user data dir as a side-effect of creating
+    the dataclass. Real callers (CLI/daemon/dashboard) call
+    ``cfg.data_dir.mkdir(parents=True, exist_ok=True)`` lazily on
+    first write, so the directory still gets created when actually
+    needed.
+    """
+    p = user_data_path(APP_NAME, appauthor=False, ensure_exists=False)
     return Path(p)
 
 

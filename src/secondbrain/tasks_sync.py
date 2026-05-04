@@ -106,6 +106,23 @@ def push_open_tasks(
                             r["id"], type(e).__name__)
                 errors += 1
                 continue
+            # Round 18 fix (audit-found gap M6) — honor 429
+            # Retry-After. Todoist enforces 450 req / 15 min;
+            # without backoff we hammer the API while it's
+            # asking us to slow down.
+            from .connectors import respect_retry_after
+            if respect_retry_after(resp):
+                try:
+                    resp = s.post(
+                        f"{_TODOIST_API}/tasks",
+                        json={"content": r["text"]},
+                        timeout=_TIMEOUT,
+                    )
+                except requests.RequestException as e:
+                    log.warning("todoist: push retry failed for #%s: %s",
+                                r["id"], type(e).__name__)
+                    errors += 1
+                    continue
             if resp.status_code not in (200, 204):
                 log.warning("todoist: push HTTP %s for #%s",
                             resp.status_code, r["id"])
@@ -172,6 +189,19 @@ def pull_remote_completions(
                             r["id"], type(e).__name__)
                 errors += 1
                 continue
+            # Round 18 fix (audit-found gap M6) — honor 429.
+            from .connectors import respect_retry_after
+            if respect_retry_after(resp):
+                try:
+                    resp = s.get(
+                        f"{_TODOIST_API}/tasks/{r['external_id']}",
+                        timeout=_TIMEOUT,
+                    )
+                except requests.RequestException as e:
+                    log.warning("todoist: pull retry failed for #%s: %s",
+                                r["id"], type(e).__name__)
+                    errors += 1
+                    continue
             if resp.status_code == 404:
                 # Remote deleted → cancel locally.
                 tasks_mod.mark_cancelled(conn, r["id"])
