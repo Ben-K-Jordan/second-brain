@@ -672,6 +672,10 @@ def render_capture_markdown(cap: MeetingCapture) -> str:
     return "\n".join(lines)
 
 
+# Round 24 — see db.TRANSCRIPT_KIND_SQL for shape rationale.
+from .db import TRANSCRIPT_KIND_SQL as _TRANSCRIPT_KIND_SQL  # noqa: E402
+
+
 def daemon_capture_recent(
     conn: sqlite3.Connection,
     cfg: Config,
@@ -685,10 +689,15 @@ def daemon_capture_recent(
     _ensure_schema(conn)
     cutoff = time.time() - hours * 3600
     rows = conn.execute(
+        # Round 24 fix (audit-found systemic bug) — Granola/Otter
+        # email transcripts to a folder ingested via IMAP land as
+        # ``kind='url'`` with ``imap://`` paths. The earlier filter
+        # only matched local audio files dropped in a watched
+        # folder. ``TRANSCRIPT_KIND_SQL`` covers both shapes.
         "SELECT f.id, f.path, f.kind FROM files f "
         "LEFT JOIN meeting_captures mc ON mc.file_id = f.id "
         "WHERE f.indexed_at >= ? AND mc.id IS NULL "
-        "  AND (f.kind = 'audio_video' OR f.kind = 'transcript') "
+        f"  AND {_TRANSCRIPT_KIND_SQL} "
         "ORDER BY f.indexed_at DESC LIMIT ?",
         (cutoff, max_per_run),
     ).fetchall()

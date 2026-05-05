@@ -754,7 +754,18 @@ def _has_actionable_content(brief: DailyBrief) -> bool:
         or brief.pending_email_drafts
         or brief.knowledge_gaps
         or brief.project_clusters
-        or brief.birthdays,
+        or brief.birthdays
+        # Round 24 fix (audit-found gap LOW-11) — round-20 added
+        # follow-ups + triage sections to DailyBrief but
+        # ``_has_actionable_content`` was never updated. A day with
+        # 5 overdue follow-ups + a hot triage queue could be
+        # classified "quiet" and get filled with revisit
+        # suggestions.
+        or brief.followups_open
+        or (
+            brief.triage_today
+            and brief.triage_today.get("count")
+        ),
     )
 
 

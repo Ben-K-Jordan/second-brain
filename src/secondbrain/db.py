@@ -17,6 +17,58 @@ def serialize_f32(vec: Iterable[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
+# ============================ Round 24 — kind-filter helpers ===========
+#
+# Round 24 (audit-found systemic bug) — production code stores
+# Gmail/IMAP/transcript docs with ``kind='url'`` (the
+# ``ConnectorDocument`` default), but ~10 surfaces filter by
+# ``kind = 'email'`` or ``kind = 'message'`` and silently return
+# nothing for Gmail/IMAP users. Tests passed because they manually
+# inserted with ``kind='email'``, but the production indexer never
+# writes that value.
+#
+# These constants are the single source of truth for "is this file
+# an email-shaped surface?" — used across triage_queue, followups,
+# meeting_capture, standing_threads, agenda, weekly_letter,
+# conditional_reminders, and followups_ops.
+#
+# Pattern: filter by virtual-path prefix (which connectors set
+# explicitly) UNION the iMessage ``kind='message'`` shape (which
+# the iMessage connector sets explicitly because messages don't
+# have URL-shaped paths).
+
+# Path prefixes that identify email-shaped docs in the files table.
+EMAIL_PATH_PREFIXES: tuple[str, ...] = ("imap://", "gmail://")
+
+# SQL fragment matching email-shaped files via path OR kind. Always
+# alias the files table as ``f`` at the call site. Returns True for
+# IMAP, Gmail, and iMessage docs. Also matches the legacy ``kind=
+# 'email'`` value some tests + manually-tagged rows use, so old
+# fixtures + manual user tagging keep working.
+EMAIL_KIND_SQL = (
+    "(f.path LIKE 'imap://%' "
+    "OR f.path LIKE 'gmail://%' "
+    "OR f.kind IN ('email', 'message'))"
+)
+
+# SQL fragment matching meeting-transcript files. Granola / Otter
+# email transcripts to a folder ingested via IMAP, so they land as
+# ``imap://`` URLs. Plus any local file the indexer classified as
+# audio_video or transcript via its kind heuristic.
+TRANSCRIPT_KIND_SQL = (
+    "(f.kind IN ('audio_video', 'transcript') "
+    "OR f.path LIKE 'transcript://%' "
+    "OR f.path LIKE 'imap://%transcript%')"
+)
+
+
+def is_email_path(path: str) -> bool:
+    """Python-side equivalent of EMAIL_KIND_SQL. Useful in code
+    paths that already have the row in hand and want to skip the
+    SQL round-trip."""
+    return any(path.startswith(p) for p in EMAIL_PATH_PREFIXES)
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     """Open a read/write connection with sqlite-vec loaded and sensible pragmas.
 

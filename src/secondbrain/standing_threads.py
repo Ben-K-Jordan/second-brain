@@ -136,13 +136,15 @@ def detect_threads(
     threads. Returns the number of threads created/updated."""
     _ensure_schema(conn)
     cutoff = time.time() - days * 86400
+    # Round 24 fix — see db.EMAIL_KIND_SQL.
+    from .db import EMAIL_KIND_SQL
     try:
         rows = conn.execute(
             "SELECT pm.person_id, pm.file_id, pm.mtime "
             "FROM person_mentions pm "
             "JOIN files f ON f.id = pm.file_id "
             "WHERE f.indexed_at >= ? "
-            "  AND (f.kind = 'email' OR f.kind = 'message') "
+            f"  AND {EMAIL_KIND_SQL} "
             "ORDER BY pm.file_id",
             (cutoff,),
         ).fetchall()

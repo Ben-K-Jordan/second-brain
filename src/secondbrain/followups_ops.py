@@ -428,21 +428,40 @@ def _candidate_user_authored_files(
     user_name = (
         getattr(cfg, "user_name", "") or ""
     ).strip().lower()
+    # Round 24 fix (audit-found systemic bug) — match production
+    # path/kind shapes. Gmail/IMAP land as ``kind='url'`` with
+    # imap:// or gmail:// paths; voice notes land as
+    # ``kind='document'`` with voice:// paths; journal entries
+    # land as ``kind='journal'`` (or ``kind='document'`` depending
+    # on path). The earlier filter used kind names that production
+    # never writes — the auto-resolve loop returned no candidates
+    # for any non-iMessage user.
+    from .db import EMAIL_KIND_SQL
     rows = conn.execute(
         "SELECT f.id AS fid, f.path, f.kind, f.indexed_at, "
         "       SUBSTR(c.text, 1, 1500) AS preview "
         "FROM files f "
         "JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
         "WHERE f.indexed_at >= ? "
-        "  AND (f.kind = 'email' OR f.kind = 'message' "
-        "       OR f.kind = 'voice' OR f.kind = 'journal') "
+        f"  AND ({EMAIL_KIND_SQL} "
+        "       OR f.path LIKE 'voice://%' "
+        "       OR f.path LIKE 'journal://%' "
+        "       OR f.kind = 'voice' "
+        "       OR f.kind = 'journal') "
         "ORDER BY f.indexed_at DESC LIMIT 200",
         (cutoff,),
     ).fetchall()
     out = []
     for r in rows:
         kind = r["kind"]
-        if kind in ("voice", "journal"):
+        path = r["path"] or ""
+        # Journal / voice entries are always user-authored, so they
+        # pass through without the From-header check.
+        if (
+            kind in ("voice", "journal")
+            or path.startswith("voice://")
+            or path.startswith("journal://")
+        ):
             out.append(r)
             continue
         # email / message — verify user is the sender.

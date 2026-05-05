@@ -625,7 +625,19 @@ def extract_from_recent_inputs(
     cutoff = time.time() - hours * 3600
     if user_name is None:
         user_name = getattr(cfg, "user_name", None) or "User"
-    eligible_kinds = {"email", "message", "transcript", "journal", "voice"}
+    # Round 24 fix (audit-found systemic bug) — production stores
+    # Gmail/IMAP/transcripts as ``kind='url'`` with virtual-path
+    # prefixes (``imap://``, ``gmail://``, ``transcript://``,
+    # ``voice://``, ``journal://``). The earlier ``kind`` set
+    # filter only accepted iMessage's ``kind='message'``, so
+    # extraction never ran on Gmail/IMAP for any user.
+    eligible_kinds = {
+        "email", "message", "transcript", "journal", "voice",
+    }
+    eligible_path_prefixes = (
+        "imap://", "gmail://", "transcript://",
+        "voice://", "journal://",
+    )
     rows = conn.execute(
         "SELECT f.id, f.path, f.kind, f.indexed_at FROM files f "
         "LEFT JOIN followups_extracted fe ON fe.file_id = f.id "
@@ -636,7 +648,13 @@ def extract_from_recent_inputs(
     n_files = 0
     n_followups = 0
     for r in rows:
-        if r["kind"] not in eligible_kinds:
+        path = (r["path"] or "")
+        if (
+            r["kind"] not in eligible_kinds
+            and not any(
+                path.startswith(p) for p in eligible_path_prefixes
+            )
+        ):
             continue
         # Pull body text from chunks (concat the first N for size cap).
         chunk_rows = conn.execute(

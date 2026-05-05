@@ -205,6 +205,11 @@ def build_queue(
     _ensure_schema(conn)
     cutoff = time.time() - hours * 3600
     now = time.time()
+    # Round 24 fix (audit-found systemic bug) — match by path
+    # prefix UNION iMessage kind, not by ``kind='email'``.
+    # Production Gmail/IMAP docs land as ``kind='url'``; the old
+    # filter silently returned nothing for any non-iMessage user.
+    from .db import EMAIL_KIND_SQL
     try:
         # email_drafts uses ``sent_at IS NULL`` to mean "still pending"
         # (no explicit status column). LEFT JOIN to the latest unsent
@@ -227,7 +232,7 @@ def build_queue(
             "    AND ed.sent_at IS NULL "
             "LEFT JOIN triage_state ts ON ts.file_id = f.id "
             "WHERE f.indexed_at >= ? "
-            "  AND (f.kind = 'email' OR f.kind = 'message') "
+            f"  AND {EMAIL_KIND_SQL} "
             # Round 21 fix (audit-found gap A5) — defensive parens.
             # AND > OR precedence makes the original parse correctly,
             # but a future editor adding another disjunct would

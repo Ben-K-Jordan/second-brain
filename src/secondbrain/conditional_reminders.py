@@ -174,12 +174,19 @@ def _condition_met(
         if not email or not since:
             return False
         # Look for any inbound email from this address since `since`.
+        # Round 24 fix (audit-found systemic bug) — production
+        # Gmail/IMAP land as ``kind='url'``; the earlier filter
+        # never matched, so the existence check always returned
+        # ``row is None`` → ``no_reply`` reminders ALWAYS fired,
+        # even when the user HAD received a reply. Use the shared
+        # email-kind helper.
+        from .db import EMAIL_KIND_SQL
         try:
             row = conn.execute(
                 "SELECT 1 FROM files f "
                 "JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
                 "WHERE f.indexed_at >= ? "
-                "  AND (f.kind = 'email' OR f.kind = 'message') "
+                f"  AND {EMAIL_KIND_SQL} "
                 "  AND LOWER(c.text) LIKE ? "
                 "LIMIT 1",
                 (since, f"%from: %{email}%"),

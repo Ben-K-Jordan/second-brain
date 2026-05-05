@@ -311,7 +311,12 @@ def _open_email_threads_with(
     """Recent email files mentioning this person without a
     classification of 'replied' or 'archived'. Best-effort — we
     don't have full thread state, but stale unanswered emails are
-    a common 1:1 topic."""
+    a common 1:1 topic.
+
+    Round 24 fix — uses ``EMAIL_KIND_SQL`` so Gmail/IMAP docs
+    (kind='url') are matched alongside iMessage (kind='message').
+    """
+    from .db import EMAIL_KIND_SQL as _EMAIL_KIND_SQL
     cutoff = time.time() - days * 86400
     try:
         rows = conn.execute(
@@ -322,7 +327,8 @@ def _open_email_threads_with(
             "JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
             "WHERE pm.person_id = ? "
             "  AND f.indexed_at >= ? "
-            "  AND (f.kind = 'email' OR f.kind = 'message') "
+            # Round 24 fix — see db.EMAIL_KIND_SQL.
+            f"  AND {_EMAIL_KIND_SQL} "
             "ORDER BY f.indexed_at DESC LIMIT ?",
             (person_id, cutoff, limit),
         ).fetchall()

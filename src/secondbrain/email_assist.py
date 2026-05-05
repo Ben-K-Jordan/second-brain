@@ -548,9 +548,15 @@ def classify_due(
     # summaries_due. On a backlog of 10k emails this is ~30× faster
     # than the NOT IN subquery.
     rows = conn.execute(
+        # Round 24 fix (audit-found systemic bug) — Gmail emails
+        # land as ``gmail://thread/<tid>/message/<mid>`` with
+        # ``kind='url'``. The earlier filter only matched IMAP, so
+        # Gmail-only users got no classifications, no drafts, no
+        # urgent-email notifications. The two LIKEs cover both
+        # connectors symmetrically.
         "SELECT f.id FROM files f "
         "LEFT JOIN email_classifications ec ON ec.file_id = f.id "
-        "WHERE f.path LIKE 'imap://%' "
+        "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
         "  AND f.indexed_at >= ? "
         "  AND ec.file_id IS NULL "
         "ORDER BY f.indexed_at DESC LIMIT ?",
@@ -1164,12 +1170,16 @@ def _select_style_samples_smart(
     are found. Without this, the random-sample picker would feed
     the recruiter-draft a casual reply to a friend.
     """
+    # Round 24 fix — match both IMAP "Folder: sent" and Gmail
+    # "Labels: ... SENT" markers so the style-sample picker works
+    # for users on either provider.
     rows: list = []
     if sender_email:
         rows = conn.execute(
             "SELECT c.text FROM chunks c JOIN files f ON f.id = c.file_id "
-            "WHERE f.path LIKE 'imap://%' "
-            "  AND LOWER(c.text) LIKE '%folder: sent%' "
+            "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+            "  AND (LOWER(c.text) LIKE '%folder: sent%' "
+            "       OR LOWER(c.text) LIKE '%labels:%sent%') "
             "  AND LOWER(c.text) LIKE ? "
             "ORDER BY f.indexed_at DESC LIMIT ?",
             (f"%to:%{sender_email}%", n),
@@ -1179,8 +1189,9 @@ def _select_style_samples_smart(
         # neutral-tone default the legacy picker fell back to.
         extra = conn.execute(
             "SELECT c.text FROM chunks c JOIN files f ON f.id = c.file_id "
-            "WHERE f.path LIKE 'imap://%' "
-            "  AND LOWER(c.text) LIKE '%folder: sent%' "
+            "WHERE (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
+            "  AND (LOWER(c.text) LIKE '%folder: sent%' "
+            "       OR LOWER(c.text) LIKE '%labels:%sent%') "
             "ORDER BY f.indexed_at DESC LIMIT ?",
             (n - len(rows),),
         ).fetchall()

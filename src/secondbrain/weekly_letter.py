@@ -198,11 +198,37 @@ def _signal_counts(conn: sqlite3.Connection, week_cutoff: float) -> dict:
         ).fetchone()["n"] or 0)
     except sqlite3.OperationalError:
         out["docs_indexed"] = 0
+    # Round 24 fix (audit-found systemic bug) — production stores
+    # Gmail/IMAP as ``kind='url'`` with ``imap://`` / ``gmail://``
+    # paths; transcripts via IMAP land as ``imap://`` too.
+    # Emails were silently zero before because ``kind='email'``
+    # never matches and ``email://`` is not a real prefix.
+    # ``urls_ingested`` is now the COMPLEMENT of the email/
+    # transcript/voice prefixes so it doesn't double-count.
     for key, where in [
-        ("emails", "kind = 'email' OR path LIKE 'email://%'"),
-        ("meetings", "path LIKE 'transcript://%'"),
-        ("urls_ingested", "kind = 'url'"),
-        ("voice_notes", "source = 'voice' OR path LIKE 'voice://%'"),
+        (
+            "emails",
+            "path LIKE 'imap://%' OR path LIKE 'gmail://%' "
+            "OR kind = 'message'",
+        ),
+        (
+            "meetings",
+            "path LIKE 'transcript://%' OR path LIKE 'imap://transcripts/%' "
+            "OR kind IN ('audio_video', 'transcript')",
+        ),
+        (
+            "urls_ingested",
+            # url-kind that ISN'T email or transcript above.
+            "kind = 'url' "
+            "AND path NOT LIKE 'imap://%' "
+            "AND path NOT LIKE 'gmail://%' "
+            "AND path NOT LIKE 'transcript://%'",
+        ),
+        (
+            "voice_notes",
+            "source = 'voice' OR path LIKE 'voice://%' "
+            "OR kind = 'voice'",
+        ),
     ]:
         try:
             out[key] = int(conn.execute(
