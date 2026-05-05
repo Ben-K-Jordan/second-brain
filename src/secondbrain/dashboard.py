@@ -1391,18 +1391,26 @@ def _render_decision(d) -> str:
         if action.method.upper() == "POST":
             # Round 14 same-origin guard requires Referer; this is
             # a same-origin form, so it'll match.
-            href, sep, query = action.href.partition("?")
+            # Round 23 fix (audit-found gap M9) — use parse_qsl so
+            # a query value that's already URL-encoded (e.g.
+            # ``label=Snoozed%207%20days``) gets decoded ONCE here
+            # and the browser re-encodes ONCE on submit. Without
+            # this, ``%20`` round-trips as ``%2520``.
+            from urllib.parse import parse_qsl
+            href, _sep, query = action.href.partition("?")
             hidden = ""
             if query:
-                for kv in query.split("&"):
-                    if "=" not in kv:
-                        continue
-                    k, v = kv.split("=", 1)
+                for k, v in parse_qsl(query, keep_blank_values=True):
                     hidden += (
                         f'<input type="hidden" '
                         f'name="{escape(k)}" '
                         f'value="{escape(v)}">'
                     )
+            # Round 23 — also pass next= so /today's actions stay
+            # on /today after the round-trip.
+            hidden += (
+                '<input type="hidden" name="next" value="/today">'
+            )
             return (
                 f'<form method="post" action="{escape(href)}" '
                 f'class="today-action-form">'
@@ -1422,7 +1430,7 @@ def _render_decision(d) -> str:
         actions_html += _btn(s)
     return (
         f'<div class="today-decision">'
-        f'  <div class="today-decision-icon">{d.icon}</div>'
+        f'  <div class="today-decision-icon">{escape(d.icon)}</div>'
         f'  <div class="today-decision-body">'
         f'    <div class="today-decision-title">'
         f'      {escape(_safe(d.title))}'
@@ -1446,6 +1454,12 @@ def _undo_toast_html(
     page when the previous action redirected here with the undo
     query params. The undo button POSTs back to a paired route
     (e.g. /triage/{id}/undo) which reverses the action.
+
+    Round 23 fix (audit-found gap M8) — inline JS calls
+    ``history.replaceState`` to strip the undo_* query params from
+    the URL bar AFTER the toast renders. Without this, refreshing
+    the page 5 minutes later re-rendered the same "Marked done"
+    toast misleadingly.
     """
     from html import escape as _esc
     if not undo_done or not undo_label:
@@ -1459,12 +1473,30 @@ def _undo_toast_html(
             f'  <button type="submit" class="toast-undo-btn">'
             f'    undo</button></form>'
         )
+    # Inline script strips the undo_* params after render so a
+    # refresh doesn't re-show the toast. Falls back gracefully if
+    # history.replaceState is unavailable (very old browsers).
+    cleanup_js = """
+<script>
+(function() {
+    try {
+        if (history && history.replaceState) {
+            var u = new URL(window.location.href);
+            ['undo_done','undo_label','undo_kind','undo_id'].forEach(
+                function(k){ u.searchParams.delete(k); }
+            );
+            history.replaceState({}, '', u.toString());
+        }
+    } catch (_) { /* swallow */ }
+})();
+</script>"""
     return (
         f'<div class="toast">'
         f'  <span class="toast-check">✓</span>'
         f'  <span>{_esc(_safe(undo_label))}</span>'
         f'  {undo_form}'
         f'</div>'
+        f'{cleanup_js}'
     )
 
 
@@ -2225,7 +2257,12 @@ def create_app():
         # 25-item top nav. Counts (tasks/drafts/insights) get JS-
         # populated badges via /api/nav-counts.
         launchpad_groups = [
-            ("Today", [
+            # Round 23 fix (audit-found gap H5) — renamed from
+            # "Today" to "Daily" so it doesn't collide with the
+            # round-22 ``/today`` page (which IS in primary nav).
+            # Two surfaces called "Today" was a discoverability bug.
+            ("Daily", [
+                ("Today",     "/today",         None),
                 ("Brief",     "/brief",         None),
                 ("Chat",      "/chat",          None),
                 ("Tasks",     "/tasks",         "tasks"),
@@ -5316,15 +5353,13 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         desk = today_mod.assemble_today(cfg, conn)
 
         # Round 22 — undo toast strip if a paired action just
-        # round-tripped through here.
-        toast_html = ""
-        if undo_done and undo_label:
-            toast_html = (
-                f'<div class="toast">'
-                f'  <span class="toast-check">✓</span>'
-                f'  <span>{escape(_safe(undo_label))}</span>'
-                f'</div>'
-            )
+        # round-tripped through here. Round 23 — share the
+        # ``_undo_toast_html`` helper so the inline JS that strips
+        # undo_* params on render is consistent across /today and
+        # /triage.
+        toast_html = _undo_toast_html(
+            undo_done, undo_label, "today", 0,
+        )
 
         if desk.is_quiet():
             body = (
@@ -5410,7 +5445,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                     )
                 wk_rows.append(
                     f'<li>'
-                    f'  <span class="today-wk-icon">{w.icon}</span>'
+                    f'  <span class="today-wk-icon">{escape(w.icon)}</span>'
                     f'  <div class="today-wk-body">'
                     f'    <div>{escape(_safe(w.title))}</div>'
                     f'    <div class="muted today-why">_{escape(_safe(w.why))}_</div>'
@@ -5952,15 +5987,35 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     # --- Triage queue actions -----------------------------------------
 
+    def _safe_next(next_param: str) -> str:
+        """Round 23 fix (audit-found gap M7) — ``next=`` redirect
+        param so an action POSTed from /today returns to /today
+        instead of dumping the user into the triage walkthrough.
+
+        Whitelist the allowed targets to avoid open-redirect: only
+        same-origin paths starting with ``/today`` or ``/triage``."""
+        if not next_param:
+            return "/triage"
+        candidate = str(next_param).strip()
+        if candidate in ("/today", "/triage"):
+            return candidate
+        if candidate.startswith("/today?") or candidate.startswith("/triage?"):
+            return candidate
+        return "/triage"
+
     @app.post("/triage/{file_id:int}/done")
-    def triage_done(file_id: int, request: Request):
+    def triage_done(
+        file_id: int, request: Request, next: str = Form(""),
+    ):
+        from urllib.parse import urlencode
+
         from . import triage_queue
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         triage_queue.mark_done(conn, file_id)
-        # Round 22 — paired undo redirect.
-        from urllib.parse import urlencode
+        target = _safe_next(next)
+        sep = "&" if "?" in target else "?"
         qs = urlencode({
             "undo_done": "1",
             "undo_label": "Marked done",
@@ -5968,17 +6023,22 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             "undo_id": str(file_id),
         })
         return RedirectResponse(
-            url=f"/triage?{qs}", status_code=303,
+            url=f"{target}{sep}{qs}", status_code=303,
         )
 
     @app.post("/triage/{file_id:int}/skip")
-    def triage_skip(file_id: int, request: Request):
+    def triage_skip(
+        file_id: int, request: Request, next: str = Form(""),
+    ):
+        from urllib.parse import urlencode
+
         from . import triage_queue
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         triage_queue.mark_skipped(conn, file_id)
-        from urllib.parse import urlencode
+        target = _safe_next(next)
+        sep = "&" if "?" in target else "?"
         qs = urlencode({
             "undo_done": "1",
             "undo_label": "Skipped",
@@ -5986,13 +6046,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             "undo_id": str(file_id),
         })
         return RedirectResponse(
-            url=f"/triage?{qs}", status_code=303,
+            url=f"{target}{sep}{qs}", status_code=303,
         )
 
     @app.post("/triage/{file_id:int}/snooze")
     def triage_snooze(
-        file_id: int, request: Request, hours: int = Form(24),
+        file_id: int, request: Request,
+        hours: int = Form(24), next: str = Form(""),
     ):
+        from urllib.parse import urlencode
+
         from . import triage_queue
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
@@ -6001,7 +6064,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             triage_queue.snooze(conn, file_id, hours=hours)
         except ValueError as e:
             return HTMLResponse(str(e), status_code=400)
-        from urllib.parse import urlencode
+        target = _safe_next(next)
+        sep = "&" if "?" in target else "?"
         qs = urlencode({
             "undo_done": "1",
             "undo_label": f"Snoozed {hours}h",
@@ -6009,29 +6073,49 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             "undo_id": str(file_id),
         })
         return RedirectResponse(
-            url=f"/triage?{qs}", status_code=303,
+            url=f"{target}{sep}{qs}", status_code=303,
         )
 
     # Round 22 — undo endpoint. Reverses a recent triage decision
     # by clearing the row in triage_state. CSRF-guarded; safe-by-
     # default since it's the user's own action being walked back.
+    #
+    # Round 23 fix (audit-found gap H3 + M6) — narrow the except
+    # to the expected sqlite errors so a real bug doesn't silently
+    # look successful. Redirect with paired undo-toast so the user
+    # sees confirmation rather than a silent reload.
     @app.post("/triage/{file_id:int}/undo")
     def triage_undo(file_id: int, request: Request):
+        import sqlite3 as _sq3
+        from urllib.parse import urlencode
+
+        from . import triage_queue
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         try:
-            from . import triage_queue
             triage_queue._ensure_schema(conn)
             with triage_queue._WRITE_LOCK:
-                conn.execute(
+                cur = conn.execute(
                     "DELETE FROM triage_state WHERE file_id = ?",
                     (file_id,),
                 )
                 conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
-        return RedirectResponse(url="/triage", status_code=303)
+            n_cleared = cur.rowcount
+        except _sq3.OperationalError as e:
+            log.warning("triage_undo: DB error: %s", e)
+            return HTMLResponse(
+                f"Database error: {e}", status_code=500,
+            )
+        if n_cleared == 0:
+            return RedirectResponse(url="/triage", status_code=303)
+        qs = urlencode({
+            "undo_done": "1",
+            "undo_label": "Undone",
+        })
+        return RedirectResponse(
+            url=f"/triage?{qs}", status_code=303,
+        )
 
     # --- Scheduling page ---------------------------------------------
 

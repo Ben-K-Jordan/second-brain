@@ -140,7 +140,10 @@ _GREETING_BY_MODE = {
     "midday":     "Quick check-in",
     "afternoon":  "Afternoon snapshot",
     "evening":    "Wrapping up the day",
-    "night":      "Tomorrow looks like",
+    # Round 23 fix (audit-found gap M10) — old "Tomorrow looks like"
+    # was a sentence fragment that read awkwardly when paired with
+    # the quiet-day fallback. Use a complete phrase.
+    "night":      "Day's done",
 }
 
 
@@ -300,6 +303,16 @@ def _decisions_from_triage(
             secondary=actions,
             icon="✉️",
             item_id=it.file_id,
+            # Round 23 fix (audit-found gap H4) — set age_days from
+            # the triage item's age_hours so the assemble_today
+            # sort respects round-19's VIP × urgency × age ranking.
+            # Without this, every triage decision tuples to the
+            # same sort key and Python's stable sort silently
+            # preserves arbitrary insertion order.
+            age_days=(
+                it.age_hours / 24.0
+                if getattr(it, "age_hours", None) else None
+            ),
         ))
     return out
 
@@ -360,29 +373,51 @@ def _worth_knowing_cadence(
 def _worth_knowing_health(
     conn: sqlite3.Connection,
 ) -> list[WorthKnowing]:
-    """Surface a health anomaly if one exists. Cheap query off
-    health_metrics; doesn't trigger a sync."""
+    """Surface a health anomaly if one exists. Compares the latest
+    point against the 14-day average for each tracked metric and
+    flags any metric whose latest value is ≥15% off-average.
+
+    Round 23 fix (audit-found gap H1) — round 22 called
+    ``health.snapshot()`` which doesn't exist; the entire surface
+    was silent dead code. Now uses the real ``summarise()`` API
+    on the metrics ``list_metrics`` reports.
+    """
     try:
         from . import health as health_mod
-        snap = health_mod.snapshot(conn)
-    except Exception:  # noqa: BLE001
+        metric_names = health_mod.list_metrics(conn)
+    except (AttributeError, sqlite3.OperationalError) as e:
+        log.warning("today: list_metrics failed: %s", e)
         return []
-    if snap is None or not snap.metrics:
-        return []
-    # Find the most-extreme metric where delta_pct exceeds threshold.
-    flagged = [
-        m for m in snap.metrics
-        if abs(getattr(m, "delta_pct", 0) or 0) >= 15
-    ]
+    flagged: list[tuple[str, float, float, float]] = []
+    # name, latest_value, avg, delta_pct
+    for metric in metric_names[:20]:  # cap to avoid pathological cases
+        try:
+            summary = health_mod.summarise(conn, metric, days=14)
+        except (AttributeError, sqlite3.OperationalError):
+            continue
+        if (
+            summary.latest is None or summary.average is None
+            or summary.average == 0
+        ):
+            continue
+        latest = summary.latest.value
+        avg = summary.average
+        delta_pct = ((latest - avg) / avg) * 100.0
+        if abs(delta_pct) >= 15:
+            flagged.append((metric, latest, avg, delta_pct))
     if not flagged:
         return []
-    worst = max(flagged, key=lambda m: abs(m.delta_pct))
-    direction = "dropped" if worst.delta_pct < 0 else "up"
-    pct = abs(int(worst.delta_pct))
+    # Pick the worst (largest absolute delta).
+    metric, latest, _avg, delta_pct = max(
+        flagged, key=lambda x: abs(x[3]),
+    )
+    direction = "dropped" if delta_pct < 0 else "up"
+    pct = abs(int(delta_pct))
+    nice_name = metric.replace("_", " ").title()
     return [WorthKnowing(
         kind="health",
-        title=f"{worst.label} {direction} {pct}%",
-        why=f"vs. recent average ({worst.window_days}d window)",
+        title=f"{nice_name} {direction} {pct}%",
+        why="vs. 14-day average",
         action=Action(label="View", href="/health"),
         icon="❤️",
     )]
@@ -479,31 +514,68 @@ def _worth_knowing_birthdays(
 # ============================ calendar ===============================
 
 
+def _format_when(starts_at: float) -> str:
+    """Format an event start time as "11am" / "2:30pm" — local TZ."""
+    dt = datetime.fromtimestamp(starts_at)
+    # POSIX ``%-I`` and Windows ``%#I`` strip the leading zero;
+    # fall back to manual if both raise.
+    try:
+        s = dt.strftime("%-I:%M%p").lower()
+    except ValueError:
+        try:
+            s = dt.strftime("%#I:%M%p").lower()
+        except ValueError:
+            s = dt.strftime("%I:%M%p").lstrip("0").lower()
+    # Drop the ":00" minute when it's a round hour for cleanliness.
+    return s.replace(":00", "")
+
+
+def _seconds_until_end_of_local_day() -> float:
+    now = datetime.now()
+    end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    return max(0.0, (end - now).total_seconds())
+
+
+def _seconds_until_end_of_tomorrow() -> float:
+    now = datetime.now()
+    from datetime import timedelta as _td
+    end = (now + _td(days=1)).replace(
+        hour=23, minute=59, second=59, microsecond=0,
+    )
+    return max(0.0, (end - now).total_seconds())
+
+
 def _today_calendar(
     cfg: Config, *, max_items: int = 5,
+    horizon_seconds: float | None = None,
 ) -> list[CalendarSlice]:
-    """Pull today's events from the configured calendars. Cheap and
-    forgiving — if calendar isn't configured, returns []."""
+    """Pull events from now → end-of-local-day (or further when
+    ``horizon_seconds`` overrides). Cheap and forgiving — if
+    calendar isn't configured, returns [].
+
+    Round 23 fix (audit-found gap H2) — round 22 imported a
+    ``calendar_view`` module that does not exist. The real surface
+    is ``event_briefing.iter_upcoming_events`` (same as daily_brief
+    uses); we share that path now.
+    """
     try:
-        from . import calendar_view
-    except Exception:  # noqa: BLE001
+        from .event_briefing import iter_upcoming_events
+    except ImportError:
         return []
+    horizon = (
+        horizon_seconds
+        if horizon_seconds is not None
+        else _seconds_until_end_of_local_day()
+    )
     try:
-        events = calendar_view.list_events_today(cfg)
+        events = list(iter_upcoming_events(cfg, horizon))
     except Exception as e:  # noqa: BLE001
         log.warning("today: calendar fetch failed: %s", e)
         return []
+    events.sort(key=lambda ev: ev.starts_at)
     out = []
     for e in events[:max_items]:
-        when = ""
-        try:
-            when = e.start_local.strftime("%-I:%M%p").lower()
-        except (AttributeError, ValueError):
-            try:
-                when = e.start_local.strftime("%#I:%M%p").lower()
-            except (AttributeError, ValueError):
-                when = ""
-        attendees = e.attendees if hasattr(e, "attendees") else []
+        attendees = list(getattr(e, "attendees", []) or [])
         detail = ""
         if attendees:
             detail = (
@@ -512,10 +584,10 @@ def _today_calendar(
                 f"{len(attendees)} attendees"
             )
         out.append(CalendarSlice(
-            when=when,
-            title=e.title,
+            when=_format_when(e.starts_at),
+            title=e.title or "(untitled)",
             detail=detail,
-            prep_href=getattr(e, "prep_href", None),
+            prep_href=None,  # event_briefing doesn't expose prep_href yet
         ))
     return out
 
@@ -538,53 +610,91 @@ def assemble_today(
     greeting = greeting_for(user_name, mode, now)
 
     # Decisions: blend triage + followups, cap to max_decisions.
-    decisions: list[Decision] = []
-    decisions.extend(_decisions_from_triage(conn, limit=3))
-    decisions.extend(_decisions_from_followups(conn, limit=3))
-    # Sort by urgency: overdue followups + age beats fresh triage.
-    decisions = sorted(
-        decisions,
-        key=lambda d: (
-            0 if (d.age_days and d.age_days >= 1) else 1,
-            -(d.age_days or 0),
-        ),
+    # Round 23 fix (audit-found gap H4) — three-bucket sort:
+    #   bucket 0: overdue followups (sorted by how-overdue)
+    #   bucket 1: triage emails (pre-ranked by triage_queue)
+    #   bucket 2: non-overdue followups (sorted by age)
+    # This preserves triage_queue's VIP × urgency × age ranking
+    # for fresh emails while still surfacing overdue commitments
+    # at the very top.
+    #
+    # Round 23 fix (audit-found gap LOW 17) — each sub-source
+    # wrapped so a partial failure (e.g. one connector returning
+    # garbage) doesn't take down the whole page. The page still
+    # 200s with whatever data succeeded.
+    try:
+        triage_decisions = _decisions_from_triage(conn, limit=3)
+    except Exception as e:  # noqa: BLE001
+        log.warning("today: triage decisions failed: %s", e)
+        triage_decisions = []
+    try:
+        fu_decisions = _decisions_from_followups(conn, limit=3)
+    except Exception as e:  # noqa: BLE001
+        log.warning("today: followup decisions failed: %s", e)
+        fu_decisions = []
+    fu_overdue = [
+        d for d in fu_decisions
+        if d.age_days and d.age_days >= 1
+    ]
+    fu_fresh = [
+        d for d in fu_decisions
+        if not (d.age_days and d.age_days >= 1)
+    ]
+    fu_overdue.sort(key=lambda d: -(d.age_days or 0))
+    fu_fresh.sort(key=lambda d: -(d.age_days or 0))
+    decisions = (
+        fu_overdue + triage_decisions + fu_fresh
     )[:max_decisions]
 
-    # Calendar slice for today.
-    upcoming = _today_calendar(cfg, max_items=5)
-    # In evening/night mode, surface tomorrow instead.
-    if mode in ("evening", "night"):
-        try:
-            from . import calendar_view
-            tomorrow_events = calendar_view.list_events_tomorrow(cfg)
-            upcoming = []
-            for e in tomorrow_events[:3]:
-                when = ""
-                try:
-                    when = (
-                        f"tom {e.start_local.strftime('%-I:%M%p').lower()}"
-                    )
-                except (AttributeError, ValueError):
-                    try:
-                        when = (
-                            "tom "
-                            + e.start_local.strftime('%#I:%M%p').lower()
-                        )
-                    except (AttributeError, ValueError):
-                        when = "tom"
-                upcoming.append(CalendarSlice(
-                    when=when, title=e.title,
-                    detail="", prep_href=None,
-                ))
-        except Exception:  # noqa: BLE001
-            pass
+    # Calendar slice. In morning/midday/afternoon: today only.
+    # In evening/night: skip ahead to tomorrow's events (since the
+    # rest of today is mostly past). Round-23 fix: use the same
+    # event_briefing path as ``_today_calendar``, just with a
+    # widened horizon and a "tom <time>" prefix.
+    upcoming: list[CalendarSlice] = []
+    try:
+        if mode in ("evening", "night"):
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+            tomorrow_start = (
+                _dt.now().replace(
+                    hour=0, minute=0, second=0, microsecond=0,
+                ) + _td(days=1)
+            ).timestamp()
+            from .event_briefing import iter_upcoming_events
+            evs = list(iter_upcoming_events(
+                cfg, _seconds_until_end_of_tomorrow(),
+            ))
+            evs = [e for e in evs if e.starts_at >= tomorrow_start][:3]
+            upcoming = [
+                CalendarSlice(
+                    when=f"tom {_format_when(e.starts_at)}",
+                    title=e.title or "(untitled)",
+                    detail="",
+                    prep_href=None,
+                ) for e in evs
+            ]
+        else:
+            upcoming = _today_calendar(cfg, max_items=5)
+    except Exception as e:  # noqa: BLE001
+        log.warning("today: calendar slice failed: %s", e)
+        upcoming = []
 
-    # Worth knowing.
+    # Worth knowing. Round 23 — each surface wrapped so a single
+    # failing sub-source doesn't drop the whole worth-knowing list.
     wk: list[WorthKnowing] = []
-    wk.extend(_worth_knowing_cadence(conn, limit=2))
-    wk.extend(_worth_knowing_health(conn))
-    wk.extend(_worth_knowing_journal(conn))
-    wk.extend(_worth_knowing_birthdays(conn))
+    for fn, args in (
+        (_worth_knowing_cadence, (conn,)),
+        (_worth_knowing_health, (conn,)),
+        (_worth_knowing_journal, (conn,)),
+        (_worth_knowing_birthdays, (conn,)),
+    ):
+        try:
+            wk.extend(fn(*args))
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "today: %s failed: %s", fn.__name__, e,
+            )
     wk = wk[:max_worth_knowing]
 
     # Quiet-day message?
@@ -608,7 +718,10 @@ _QUIET_BY_MODE = {
     "midday":    "Nothing on the table. Smooth so far.",
     "afternoon": "All clear. Take the focus block.",
     "evening":   "Day's wrapped. Well done.",
-    "night":     "Light tomorrow — same shape, less to do.",
+    # Round 23 fix — composes with the new "Day's done" greeting:
+    # "Day's done" + "Tomorrow's quiet too — sleep on it." reads
+    # naturally end-to-end.
+    "night":     "Tomorrow's quiet too — sleep on it.",
 }
 
 
