@@ -1112,7 +1112,10 @@ PALETTE_JS = r"""
 # in the "More ▾" dropdown below or is reachable via ⌘K.
 _PRIMARY_NAV = [
     # (label, href, badge_key) — badge_key=None means no count chip
-    ("Brief",    "/brief",    None),
+    # Round 22 (Phase EA-UI) — Today is the new EA-style landing.
+    # Replaces "Brief" as the first nav item; Brief stays in the
+    # More dropdown for the comprehensive emailable digest.
+    ("Today",    "/today",    None),
     ("Review",   "/review",   None),  # Round 16 (Phase B) — weekly letter
     ("Chat",     "/chat",     None),
     ("Tasks",    "/tasks",    "tasks"),
@@ -1138,6 +1141,9 @@ _NAV_GROUPS = [
         ("Capture",    "/capture"),
         ("Scheduling", "/scheduling"),
         ("EOD",        "/eod"),
+        # Round 22 — moved from primary nav. Today is the new EA
+        # front-door; Brief stays here for the full emailable digest.
+        ("Brief",      "/brief"),
     ]),
     ("Personal", [
         ("Habits",   "/habits"),
@@ -1367,6 +1373,410 @@ def _result_block(
     {tldr_html}
     <div class="snippet">{snippet}</div>
 </article>"""
+
+
+def _render_decision(d) -> str:
+    """Round 22 — render one Decision card on /today.
+
+    ``d`` is a ``today.Decision``. Renders a card with an icon,
+    title, why-line, and inline action buttons. Primary action is
+    a styled button; secondary actions are plain links/forms.
+    """
+    def _btn(action, *, primary: bool = False) -> str:
+        css = "today-btn"
+        if primary or action.style == "primary":
+            css += " today-btn-primary"
+        elif action.style == "subtle":
+            css += " today-btn-subtle"
+        if action.method.upper() == "POST":
+            # Round 14 same-origin guard requires Referer; this is
+            # a same-origin form, so it'll match.
+            href, sep, query = action.href.partition("?")
+            hidden = ""
+            if query:
+                for kv in query.split("&"):
+                    if "=" not in kv:
+                        continue
+                    k, v = kv.split("=", 1)
+                    hidden += (
+                        f'<input type="hidden" '
+                        f'name="{escape(k)}" '
+                        f'value="{escape(v)}">'
+                    )
+            return (
+                f'<form method="post" action="{escape(href)}" '
+                f'class="today-action-form">'
+                f'  {hidden}'
+                f'  <button type="submit" class="{css}">'
+                f'    {escape(action.label)}'
+                f'  </button>'
+                f'</form>'
+            )
+        return (
+            f'<a class="{css}" href="{escape(action.href)}">'
+            f'{escape(action.label)}</a>'
+        )
+
+    actions_html = _btn(d.primary, primary=True)
+    for s in d.secondary:
+        actions_html += _btn(s)
+    return (
+        f'<div class="today-decision">'
+        f'  <div class="today-decision-icon">{d.icon}</div>'
+        f'  <div class="today-decision-body">'
+        f'    <div class="today-decision-title">'
+        f'      {escape(_safe(d.title))}'
+        f'    </div>'
+        f'    <div class="today-decision-why muted">'
+        f'      {escape(_safe(d.why))}'
+        f'    </div>'
+        f'    <div class="today-decision-actions">{actions_html}</div>'
+        f'  </div>'
+        f'</div>'
+    )
+
+
+def _undo_toast_html(
+    undo_done: int, undo_label: str,
+    undo_kind: str, undo_id: int,
+) -> str:
+    """Round 22 — server-rendered undo toast strip.
+
+    Renders an inline "✓ <label> [undo]" banner at the top of the
+    page when the previous action redirected here with the undo
+    query params. The undo button POSTs back to a paired route
+    (e.g. /triage/{id}/undo) which reverses the action.
+    """
+    from html import escape as _esc
+    if not undo_done or not undo_label:
+        return ""
+    undo_form = ""
+    if undo_kind == "triage" and undo_id:
+        undo_form = (
+            f'<form method="post" '
+            f'action="/triage/{int(undo_id)}/undo" '
+            f'class="toast-undo-form">'
+            f'  <button type="submit" class="toast-undo-btn">'
+            f'    undo</button></form>'
+        )
+    return (
+        f'<div class="toast">'
+        f'  <span class="toast-check">✓</span>'
+        f'  <span>{_esc(_safe(undo_label))}</span>'
+        f'  {undo_form}'
+        f'</div>'
+    )
+
+
+def _render_triage_walkthrough(
+    *, queue, done_today: int,
+    undo_done: int = 0, undo_label: str = "",
+    undo_kind: str = "", undo_id: int = 0,
+):
+    """Round 22 — single-email decision walkthrough for /triage.
+
+    Shows ONE email at a time with action buttons inline. After
+    any action POSTs, the queue rebuilds (the acted-on email drops
+    out via triage_state) and the next item is the new top.
+
+    Pattern: like an EA walking you through your inbox one decision
+    at a time, not a database list view.
+    """
+    from html import escape as _esc
+
+    from fastapi.responses import HTMLResponse
+    toast_html = _undo_toast_html(
+        undo_done, undo_label, undo_kind, undo_id,
+    )
+    it = queue[0]
+    remaining = len(queue)
+    vip_badge = (
+        '<span class="tag urgent">VIP</span>'
+        if it.is_vip else ""
+    )
+    label_class = {
+        "urgent": "urgent", "follow_up": "warn",
+        "review": "muted", "fyi": "muted",
+    }.get(it.label, "muted")
+    age_str = (
+        f"{int(it.age_hours)}h ago"
+        if it.age_hours and it.age_hours < 24
+        else f"{int(it.age_hours / 24)}d ago"
+    )
+    sender = it.from_display or it.from_email or "(unknown)"
+    subject = it.subject or "(no subject)"
+    preview = (it.body_preview or "")[:400]
+    # The actions row.
+    actions = []
+    if it.draft_id:
+        actions.append(
+            f'<form method="post" '
+            f'action="/drafts/{it.draft_id}/sent" '
+            f'class="walk-action-form">'
+            f'  <button class="walk-btn walk-btn-primary">'
+            f'    Send draft</button></form>'
+        )
+        actions.append(
+            f'<a class="walk-btn" href="/drafts#d{it.draft_id}">'
+            f'Edit draft</a>'
+        )
+    else:
+        actions.append(
+            f'<a class="walk-btn walk-btn-primary" '
+            f'href="/file?file_id={it.file_id}">Open</a>'
+        )
+    actions.append(
+        f'<form method="post" action="/triage/{it.file_id}/done" '
+        f'class="walk-action-form">'
+        f'  <button class="walk-btn">Mark done</button></form>'
+    )
+    actions.append(
+        f'<form method="post" action="/triage/{it.file_id}/snooze" '
+        f'class="walk-action-form">'
+        f'  <input type="hidden" name="hours" value="24">'
+        f'  <button class="walk-btn walk-btn-subtle">'
+        f'  Snooze 1d</button></form>'
+    )
+    actions.append(
+        f'<form method="post" action="/triage/{it.file_id}/skip" '
+        f'class="walk-action-form">'
+        f'  <button class="walk-btn walk-btn-subtle">'
+        f'  Not for me</button></form>'
+    )
+
+    progress_chip = ""
+    if done_today:
+        progress_chip = (
+            f'<span class="walk-progress-chip">'
+            f'  ✓ {done_today} cleared today'
+            f'</span>'
+        )
+
+    body = f"""
+{toast_html}
+<div class="walk-header">
+  <h1 class="walk-h1">Triage</h1>
+  <span class="walk-counter">{remaining} left</span>
+  {progress_chip}
+  <a class="walk-show-all muted" href="/triage?show=all">show all</a>
+</div>
+
+<div class="walk-card">
+  <div class="walk-meta">
+    <span class="tag {label_class}">{_esc(it.label or "?")}</span>
+    {vip_badge}
+    <span class="muted">{_esc(_safe(sender))}</span>
+    <span class="muted">·</span>
+    <span class="muted">{age_str}</span>
+  </div>
+  <h2 class="walk-subject">{_esc(_safe(subject))}</h2>
+  <p class="walk-preview muted">{_esc(_safe(preview))}</p>
+  <div class="walk-actions">{"".join(actions)}</div>
+</div>
+
+<style>
+.walk-header {{
+    display: flex; align-items: center; gap: var(--s-3);
+    margin-bottom: var(--s-4);
+}}
+.walk-h1 {{ margin: 0; }}
+.walk-counter {{
+    font-size: 11px; color: var(--text-3);
+    background: var(--bg-card); padding: 2px 8px;
+    border-radius: var(--r); border: 1px solid var(--border);
+}}
+.walk-progress-chip {{
+    font-size: 11px; color: var(--green);
+    background: var(--green-soft); padding: 2px 8px;
+    border-radius: var(--r); border: 1px solid var(--green-dim);
+}}
+.walk-show-all {{ margin-left: auto; font-size: 11px; }}
+.walk-card {{
+    background: var(--bg-card); border: 1px solid var(--border-strong);
+    border-radius: var(--r); padding: var(--s-5);
+    box-shadow: var(--shadow-glow);
+}}
+.walk-meta {{ font-size: 11.5px; margin-bottom: var(--s-2); }}
+.walk-subject {{
+    margin: var(--s-2) 0 var(--s-3); font-size: 18px;
+    font-weight: 500; color: var(--text);
+}}
+.walk-preview {{
+    font-size: 13px; line-height: 1.6; max-height: 200px;
+    overflow: auto; white-space: pre-wrap;
+    background: var(--bg-input); padding: var(--s-3);
+    border-radius: var(--r); margin: var(--s-3) 0;
+    border: 1px solid var(--border);
+}}
+.walk-actions {{
+    display: flex; gap: var(--s-2); flex-wrap: wrap;
+    margin-top: var(--s-4);
+}}
+.walk-action-form {{ display: inline; margin: 0; }}
+.walk-btn {{
+    display: inline-block; padding: 6px 14px; font-size: 12.5px;
+    background: var(--bg-elevated); color: var(--text-2);
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    cursor: pointer; font-family: var(--mono);
+    transition: all var(--ease);
+}}
+.walk-btn:hover {{
+    background: var(--bg-hover); color: var(--text);
+    border-color: var(--text-3);
+}}
+.walk-btn-primary {{
+    background: var(--green-soft); color: var(--green);
+    border-color: var(--green-dim);
+}}
+.walk-btn-primary:hover {{
+    background: var(--green-dim); color: #000;
+}}
+.walk-btn-subtle {{ color: var(--text-3); border-color: var(--border); }}
+.tag {{
+    font-size: 10px; padding: 1px 6px;
+    border-radius: var(--r); margin-right: 4px;
+}}
+.tag.urgent {{ background: rgba(255,77,77,0.10); color: var(--red); }}
+.tag.warn {{ background: rgba(255,183,0,0.10); color: var(--amber); }}
+</style>
+"""
+    return HTMLResponse(_layout("Triage", body, "triage"))
+
+
+def _today_styles() -> str:
+    """CSS scoped to the /today page. Visual goal: warm, narrative,
+    less dense than the database-grid pages elsewhere."""
+    return """
+<style>
+.today-greet {
+    font-size: 22px; font-weight: 500; margin: var(--s-3) 0 var(--s-5);
+    color: var(--text);
+}
+.today-quiet {
+    font-size: 16px; color: var(--text-2);
+    margin-top: var(--s-7); text-align: center;
+}
+.today-section { margin: var(--s-5) 0; }
+.today-h2 {
+    font-size: 12px; font-weight: 600; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    margin: 0 0 var(--s-3); padding-bottom: var(--s-1);
+    border-bottom: 1px solid var(--border);
+}
+.today-num {
+    color: var(--green); font-weight: 700; font-size: 14px;
+    margin-right: var(--s-1);
+}
+.today-decisions { display: flex; flex-direction: column; gap: var(--s-3); }
+.today-decision {
+    display: flex; gap: var(--s-3); padding: var(--s-3);
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r);
+    transition: border-color var(--ease);
+}
+.today-decision:hover { border-color: var(--border-strong); }
+.today-decision-icon {
+    font-size: 18px; line-height: 1.2;
+    flex-shrink: 0; width: 24px; text-align: center;
+}
+.today-decision-body { flex: 1; min-width: 0; }
+.today-decision-title {
+    font-weight: 500; font-size: 14px; margin-bottom: 3px;
+    color: var(--text);
+}
+.today-decision-why {
+    font-size: 12px; color: var(--text-2);
+    font-style: italic; margin-bottom: var(--s-2);
+}
+.today-decision-actions {
+    display: flex; gap: var(--s-2); flex-wrap: wrap;
+    margin-top: var(--s-2);
+}
+.today-action-form { display: inline; margin: 0; }
+.today-btn {
+    display: inline-block; padding: 4px 10px; font-size: 11.5px;
+    background: var(--bg-elevated); color: var(--text-2);
+    border: 1px solid var(--border-strong); border-radius: var(--r);
+    cursor: pointer; transition: all var(--ease);
+    font-family: var(--mono);
+}
+.today-btn:hover {
+    background: var(--bg-hover); color: var(--text);
+    border-color: var(--text-3);
+}
+.today-btn-primary {
+    background: var(--green-soft); color: var(--green);
+    border-color: var(--green-dim);
+}
+.today-btn-primary:hover {
+    background: var(--green-dim); color: #000;
+    text-shadow: 0 0 6px var(--green-glow);
+}
+.today-btn-subtle {
+    background: transparent; color: var(--text-3);
+    border-color: var(--border);
+}
+.today-cal {
+    list-style: none; padding: 0; margin: 0;
+}
+.today-cal li {
+    padding: var(--s-2) 0;
+    border-bottom: 1px dashed var(--border);
+    font-size: 13px;
+}
+.today-cal li:last-child { border-bottom: none; }
+.today-when {
+    font-family: var(--mono); color: var(--amber);
+    font-weight: 600; margin-right: var(--s-2);
+    display: inline-block; min-width: 60px;
+}
+.today-prep {
+    margin-left: var(--s-2); font-size: 11px;
+    color: var(--green); text-decoration: underline;
+}
+.today-wk {
+    list-style: none; padding: 0; margin: 0;
+    display: flex; flex-direction: column; gap: var(--s-3);
+}
+.today-wk li {
+    display: flex; align-items: flex-start; gap: var(--s-2);
+    padding: var(--s-2) 0;
+}
+.today-wk-icon { font-size: 16px; flex-shrink: 0; }
+.today-wk-body { flex: 1; min-width: 0; font-size: 13px; }
+.today-why { font-size: 11.5px; }
+.today-wk-action {
+    font-size: 11px; padding: 2px 8px;
+    background: transparent; color: var(--text-3);
+    border: 1px solid var(--border); border-radius: var(--r);
+    flex-shrink: 0;
+}
+.today-wk-action:hover { color: var(--text); border-color: var(--text-3); }
+.today-end {
+    margin-top: var(--s-7); font-size: 12px; text-align: center;
+}
+.toast {
+    display: inline-flex; align-items: center; gap: var(--s-2);
+    padding: var(--s-2) var(--s-3);
+    background: var(--green-soft); color: var(--green);
+    border: 1px solid var(--green-dim); border-radius: var(--r);
+    font-size: 12px; margin-bottom: var(--s-3);
+}
+.toast-check { font-weight: 700; }
+.toast-undo-form { display: inline; margin: 0 0 0 var(--s-2); }
+.toast-undo-btn {
+    background: transparent; border: 1px solid var(--green-dim);
+    color: var(--green); padding: 1px 8px; border-radius: var(--r);
+    font-size: 11px; cursor: pointer;
+    font-family: var(--mono);
+}
+.toast-undo-btn:hover { background: var(--green-dim); color: #000; }
+@media (max-width: 600px) {
+    .today-decision { flex-direction: column; }
+    .today-when { min-width: auto; }
+}
+</style>
+"""
 
 
 def _markdown_to_html_block(md: str) -> str:
@@ -4883,21 +5293,209 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         )
         return HTMLResponse(_layout("Agenda", body, "agenda"))
 
+    # ============================ Round 22 — /today ====================
+
+    @app.get("/today", response_class=HTMLResponse)
+    def today_page(undo_done: int = 0, undo_label: str = ""):
+        """Round 22 (Phase EA-UI) — the morning desk.
+
+        EA-shaped front door. Replaces the "browse my data" landing
+        with a single narrative surface: greeting, top decisions,
+        today's calendar, "worth knowing", and a quiet-day fallback.
+
+        Time-of-day mode (morning/midday/afternoon/evening/night)
+        shifts the framing AND the data slice (evening pulls
+        tomorrow's calendar instead of today's).
+
+        ``?undo_done=1&undo_label=Snoozed%207%20days`` renders the
+        round-22 undo toast at the top of the page after a
+        round-tripped action.
+        """
+        from . import today as today_mod
+        cfg, conn, _, _ = get_state()
+        desk = today_mod.assemble_today(cfg, conn)
+
+        # Round 22 — undo toast strip if a paired action just
+        # round-tripped through here.
+        toast_html = ""
+        if undo_done and undo_label:
+            toast_html = (
+                f'<div class="toast">'
+                f'  <span class="toast-check">✓</span>'
+                f'  <span>{escape(_safe(undo_label))}</span>'
+                f'</div>'
+            )
+
+        if desk.is_quiet():
+            body = (
+                toast_html
+                + f'<h1 class="today-greet">{escape(desk.greeting)}</h1>'
+                + '<p class="today-quiet">'
+                + f'  {escape(desk.quiet_message or "All clear.")}'
+                + '</p>'
+                + _today_styles()
+            )
+            return HTMLResponse(_layout("Today", body, "today"))
+
+        # Decisions
+        dec_html_rows = []
+        for d in desk.decisions:
+            dec_html_rows.append(_render_decision(d))
+        dec_section = ""
+        if desk.decisions:
+            verb = {
+                "morning":   "decisions for you this morning",
+                "midday":    "things waiting on you",
+                "afternoon": "still open",
+                "evening":   "loose ends from today",
+                "night":     "open from yesterday",
+            }.get(desk.mode, "open")
+            dec_section = (
+                f'<section class="today-section">'
+                f'  <h2 class="today-h2">'
+                f'    <span class="today-num">{len(desk.decisions)}</span> '
+                f'    {verb}'
+                f'  </h2>'
+                f'  <div class="today-decisions">'
+                f'    {"".join(dec_html_rows)}'
+                f'  </div>'
+                f'</section>'
+            )
+
+        # Calendar
+        cal_html = ""
+        if desk.upcoming:
+            header = (
+                "Coming up today"
+                if desk.mode in ("morning", "midday", "afternoon")
+                else "Tomorrow"
+            )
+            cal_rows = []
+            for ev in desk.upcoming:
+                prep_link = ""
+                if ev.prep_href:
+                    prep_link = (
+                        f' <a class="today-prep" href="{escape(ev.prep_href)}">'
+                        f'prep ready</a>'
+                    )
+                detail = (
+                    f' <span class="muted">— {escape(_safe(ev.detail))}</span>'
+                    if ev.detail else ''
+                )
+                cal_rows.append(
+                    f'<li>'
+                    f'  <span class="today-when">{escape(ev.when)}</span> '
+                    f'  <span>{escape(_safe(ev.title))}</span>'
+                    f'  {detail}{prep_link}'
+                    f'</li>'
+                )
+            cal_html = (
+                f'<section class="today-section">'
+                f'  <h2 class="today-h2">{header}</h2>'
+                f'  <ul class="today-cal">{"".join(cal_rows)}</ul>'
+                f'</section>'
+            )
+
+        # Worth knowing
+        wk_html = ""
+        if desk.worth_knowing:
+            wk_rows = []
+            for w in desk.worth_knowing:
+                action_html = ""
+                if w.action:
+                    action_html = (
+                        f'  <a class="today-wk-action" '
+                        f'href="{escape(w.action.href)}">'
+                        f'{escape(w.action.label)}</a>'
+                    )
+                wk_rows.append(
+                    f'<li>'
+                    f'  <span class="today-wk-icon">{w.icon}</span>'
+                    f'  <div class="today-wk-body">'
+                    f'    <div>{escape(_safe(w.title))}</div>'
+                    f'    <div class="muted today-why">_{escape(_safe(w.why))}_</div>'
+                    f'  </div>'
+                    f'  {action_html}'
+                    f'</li>'
+                )
+            wk_html = (
+                f'<section class="today-section">'
+                f'  <h2 class="today-h2">Worth knowing</h2>'
+                f'  <ul class="today-wk">{"".join(wk_rows)}</ul>'
+                f'</section>'
+            )
+
+        body = (
+            toast_html
+            + f'<h1 class="today-greet">{escape(desk.greeting)}</h1>'
+            + dec_section + cal_html + wk_html
+            + '<p class="today-end muted">'
+            + '  _That\'s it for now._'
+            + '</p>'
+            + _today_styles()
+        )
+        return HTMLResponse(_layout("Today", body, "today"))
+
+    # / route — soft-launch period. Existing / at line ~1765 stays
+    # for power users; nav now points at /today as the front door.
+    # A future round may flip / to redirect.
+
+    # ============================ /triage (walkthrough or list) ====
+
     @app.get("/triage", response_class=HTMLResponse)
-    def triage_page():
-        """Round 19 (Phase EA-6) — morning email triage queue."""
+    def triage_page(
+        show: str = "",
+        undo_done: int = 0,
+        undo_label: str = "",
+        undo_kind: str = "",
+        undo_id: int = 0,
+    ):
+        """Round 19 (Phase EA-6) — morning email triage queue.
+
+        Round 22 (Phase EA-UI) — default rendering is now the
+        single-email walkthrough. ``?show=all`` keeps the legacy
+        list-view for power users.
+
+        ``?undo_done=1&undo_label=...&undo_kind=triage&undo_id=N``
+        renders the round-22 undo toast at the top of the page.
+        """
         from . import triage_queue
 
         _, conn, _, _ = get_state()
         queue = triage_queue.build_queue(conn)
+        # Round 22 — count of done-today for the progress chip.
+        try:
+            done_today = triage_queue.done_count_today(conn)
+        except Exception:  # noqa: BLE001
+            done_today = 0
         if not queue:
+            from .ux_copy import adaptive_empty
+            done_chip = (
+                f'<p class="muted" style="text-align:center;">'
+                f'You cleared {done_today} today. Nice work.</p>'
+                if done_today else ""
+            )
+            toast_html = _undo_toast_html(
+                undo_done, undo_label, undo_kind, undo_id,
+            )
             body = (
+                f'{toast_html}'
                 '<h1>Triage</h1>'
                 '<div class="empty card">'
-                '  <p>Inbox zero — nothing in the last 48h needs '
-                '  your decision.</p></div>'
+                f'  <p>{adaptive_empty("triage")}</p></div>'
+                f'{done_chip}'
             )
             return HTMLResponse(_layout("Triage", body, "triage"))
+
+        # Round 22 walkthrough: focused single-email view with the
+        # next-up item front and centre. The full ranked list lives
+        # at ?show=all for power users.
+        if show != "all":
+            return _render_triage_walkthrough(
+                queue=queue, done_today=done_today,
+                undo_done=undo_done, undo_label=undo_label,
+                undo_kind=undo_kind, undo_id=undo_id,
+            )
         items_html = []
         for it in queue:
             vip_badge = (
@@ -4930,10 +5528,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f'</div>'
             )
         body = (
-            f'<h1>Triage queue</h1>'
+            f'<h1>Triage queue (full list)</h1>'
             f'<p class="muted">'
             f'  {len(queue)} email(s) need your decision today, '
-            f'  ranked by VIP × urgency × age.'
+            f'  ranked by VIP × urgency × age. '
+            f'  <a href="/triage">walk through one at a time →</a>'
             f'</p>'
             + "".join(items_html)
             + '<style>'
@@ -5360,7 +5959,17 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         triage_queue.mark_done(conn, file_id)
-        return RedirectResponse(url="/triage", status_code=303)
+        # Round 22 — paired undo redirect.
+        from urllib.parse import urlencode
+        qs = urlencode({
+            "undo_done": "1",
+            "undo_label": "Marked done",
+            "undo_kind": "triage",
+            "undo_id": str(file_id),
+        })
+        return RedirectResponse(
+            url=f"/triage?{qs}", status_code=303,
+        )
 
     @app.post("/triage/{file_id:int}/skip")
     def triage_skip(file_id: int, request: Request):
@@ -5369,7 +5978,16 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         triage_queue.mark_skipped(conn, file_id)
-        return RedirectResponse(url="/triage", status_code=303)
+        from urllib.parse import urlencode
+        qs = urlencode({
+            "undo_done": "1",
+            "undo_label": "Skipped",
+            "undo_kind": "triage",
+            "undo_id": str(file_id),
+        })
+        return RedirectResponse(
+            url=f"/triage?{qs}", status_code=303,
+        )
 
     @app.post("/triage/{file_id:int}/snooze")
     def triage_snooze(
@@ -5383,6 +6001,36 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             triage_queue.snooze(conn, file_id, hours=hours)
         except ValueError as e:
             return HTMLResponse(str(e), status_code=400)
+        from urllib.parse import urlencode
+        qs = urlencode({
+            "undo_done": "1",
+            "undo_label": f"Snoozed {hours}h",
+            "undo_kind": "triage",
+            "undo_id": str(file_id),
+        })
+        return RedirectResponse(
+            url=f"/triage?{qs}", status_code=303,
+        )
+
+    # Round 22 — undo endpoint. Reverses a recent triage decision
+    # by clearing the row in triage_state. CSRF-guarded; safe-by-
+    # default since it's the user's own action being walked back.
+    @app.post("/triage/{file_id:int}/undo")
+    def triage_undo(file_id: int, request: Request):
+        if not _is_same_origin_request(request):
+            return HTMLResponse("Forbidden", status_code=403)
+        _, conn, _, _ = get_state()
+        try:
+            from . import triage_queue
+            triage_queue._ensure_schema(conn)
+            with triage_queue._WRITE_LOCK:
+                conn.execute(
+                    "DELETE FROM triage_state WHERE file_id = ?",
+                    (file_id,),
+                )
+                conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
         return RedirectResponse(url="/triage", status_code=303)
 
     # --- Scheduling page ---------------------------------------------
@@ -6086,12 +6734,13 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         cfg, conn, _, _ = get_state()
         drafts = email_assist.list_unsent_drafts(conn)
         if not drafts:
+            from .ux_copy import empty_state
             body = (
-                "<h1>Email drafts</h1><div class='card'><p class='muted'>"
-                "No pending drafts. The daemon generates drafts for "
-                "emails classified urgent/response — wait for the next "
-                "tick or trigger via "
-                "<code>secondbrain sync imap</code> + the daemon."
+                "<h1>Email drafts</h1>"
+                "<div class='card'><p class='muted'>"
+                f"{empty_state('drafts')} "
+                "<small>The daemon drafts replies to urgent / "
+                "response-worthy emails on its next tick.</small>"
                 "</p></div>"
             )
             return HTMLResponse(_layout("Drafts", body, "drafts"))

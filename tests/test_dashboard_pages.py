@@ -229,17 +229,17 @@ def test_svg_sparkline_handles_single_point():
 # ============================ Nav redesign (v3 round 5) ==============
 
 def test_primary_nav_is_eight_items():
-    """The redesign capped the primary nav at 6, then round 16
-    raised the cap to 8 to add Review (weekly letter) and Inbox
-    (proactive notifications). Pin the new shape so we don't drift
-    further without a deliberate decision."""
+    """Round 5: capped at 6. Round 16: raised to 8 (Review + Inbox).
+    Round 22: replaced "Brief" with "Today" as the EA-style front
+    door; Brief moved to the More dropdown EA group. Still 8 items.
+    """
     from secondbrain.dashboard import _PRIMARY_NAV
 
     assert len(_PRIMARY_NAV) == 8
     labels = {item[0] for item in _PRIMARY_NAV}
-    # Daily-use anchor items must all be present.
+    # Daily-use anchor items.
     assert {
-        "Brief", "Review", "Chat", "Tasks", "Search",
+        "Today", "Review", "Chat", "Tasks", "Search",
         "Drafts", "Thanks", "Inbox",
     } == labels
 
@@ -468,9 +468,12 @@ def test_projects_page_renders_empty(client):
 
 
 def test_drafts_page_renders_empty(client):
+    """Round 22 — empty copy moved to ux_copy.EMPTY_STATES. The page
+    renders the warmer 'No drafts pending. Inbox stays calm.'
+    string instead of the legacy 'No pending drafts'."""
     r = client.get("/drafts")
     assert r.status_code == 200
-    assert "No pending drafts" in r.text
+    assert "No drafts pending" in r.text
 
 
 def test_habits_checkin_creates_row(monkeypatch, tmp_path, fake_embedder):
