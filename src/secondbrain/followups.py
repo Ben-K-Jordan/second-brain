@@ -668,7 +668,7 @@ def extract_from_recent_inputs(
         added = extract_and_persist(
             conn, cfg,
             text=text, user_name=user_name,
-            source_kind=_normalise_kind(r["kind"]),
+            source_kind=_normalise_kind(r["kind"], r["path"] or ""),
             source_file_id=int(r["id"]),
             source_label=str(r["path"] or ""),
         )
@@ -686,7 +686,24 @@ def extract_from_recent_inputs(
     return {"files_scanned": n_files, "followups_added": n_followups}
 
 
-def _normalise_kind(kind: str) -> str:
+def _normalise_kind(kind: str, path: str = "") -> str:
+    """Round 25 fix (audit-found gap M3+M4) — round-24's filter
+    accepted ``kind='url'`` for Gmail/IMAP/transcript/voice/journal
+    paths, but the kind normalization didn't follow. Production was
+    persisting followups with ``source_kind='url'`` rather than
+    ``'email'``/``'meeting'``/etc. Now switches on the path prefix
+    when ``kind='url'``, matching what the rest of the system
+    expects.
+    """
+    if path:
+        if path.startswith(("imap://", "gmail://")):
+            return "email"
+        if path.startswith("transcript://"):
+            return "meeting"
+        if path.startswith("voice://"):
+            return "journal"
+        if path.startswith("journal://"):
+            return "journal"
     if kind == "transcript":
         return "meeting"
     if kind == "voice":

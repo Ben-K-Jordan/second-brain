@@ -2820,9 +2820,34 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return {"nodes": nodes, "edges": edges}
 
     @app.get("/file", response_class=HTMLResponse)
-    def file_view(path: str):
+    def file_view(
+        path: str | None = None, file_id: int | None = None,
+    ):
+        """Round 25 fix (audit-found gap H1) — accept ``file_id``
+        as well as ``path``. Round 22's EA UI generates
+        ``/file?file_id=N`` links from 6 places (today, agenda,
+        triage walkthrough, command palette, followups, capture);
+        without this signature the route returned 422 on every
+        click, silently breaking the EA UI's primary navigation."""
         # Read-only — pure rendering, no mutations.
         cfg, conn, embedder, reranker = get_read_state()
+        if file_id is not None and not path:
+            row_path = conn.execute(
+                "SELECT path FROM files WHERE id = ?", (int(file_id),),
+            ).fetchone()
+            if row_path is None:
+                return HTMLResponse(_layout(
+                    f"file_id={file_id}",
+                    f'<h1>file_id {int(file_id)}</h1>'
+                    f'<div class="empty">Not in index.</div>',
+                ))
+            path = row_path["path"]
+        if not path:
+            return HTMLResponse(_layout(
+                "File", '<h1>File</h1>'
+                '<div class="empty">Need either ?path=... or '
+                '?file_id=N.</div>',
+            ), status_code=400)
         row = conn.execute(
             "SELECT id, path, kind, mtime, size FROM files WHERE path = ?", (path,)
         ).fetchone()

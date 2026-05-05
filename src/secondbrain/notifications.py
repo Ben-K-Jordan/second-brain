@@ -312,6 +312,12 @@ def _detect_email_urgent(conn: sqlite3.Connection) -> int:
         ).fetchall()
     except sqlite3.OperationalError:
         return 0
+    # Round 25 fix (audit-found gap M2) — use file_id as the URL
+    # parameter (round-25 fix H1 makes /file accept it). The
+    # earlier ``?path=...`` interpolation didn't URL-encode and
+    # broke for paths containing ``<``, ``>``, ``@``, ``?``, ``&``,
+    # ``+``, ``#`` (e.g. imap://msgid/<id@host>). file_id is just
+    # a digit, no escaping concerns.
     for r in rows:
         title = (r["path"] or "").rsplit("/", 1)[-1] or "(email)"
         if enqueue(
@@ -320,7 +326,7 @@ def _detect_email_urgent(conn: sqlite3.Connection) -> int:
             kind="email_urgent", urgency="high",
             title=f"Urgent email: {title[:60]}",
             body="Triaged as urgent. Open the drafts page to respond.",
-            href=f"/file?path={r['path']}",
+            href=f"/file?file_id={int(r['file_id'])}",
             payload={"file_id": int(r["file_id"])},
         ):
             n += 1

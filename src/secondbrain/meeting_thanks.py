@@ -161,17 +161,26 @@ class MeetingThanks:
 def _own_email_domains(cfg) -> set[str]:
     """Domains that count as the user's "own" — used to filter out
     pure-internal meetings. Sources, in priority order:
-      1. ``cfg.imap_username`` if it looks like an email
-      2. ``cfg.digest_smtp_user``
-      3. The IMAP username's domain (most users will have at least
-         one of these set)
+      1. ``cfg.user_email`` (round 21 — the canonical user identity)
+      2. ``cfg.imap_username`` if it looks like an email
+      3. ``cfg.digest_smtp_user`` / ``cfg.digest_smtp_from``
 
     Returns a set of lowercased domain strings (empty when nothing
     is configured — in that case every meeting is treated as
     external, which is the safer default).
+
+    Round 25 fix (audit-found gap H4) — added ``user_email``.
+    Without it, Gmail-OAuth users (no IMAP password) with no
+    digest configured ended up with ``own_domains == set()``,
+    so the user was classified as an "external" attendee in
+    their own meeting and got drafted thank-yous addressed back
+    to themselves.
     """
     domains: set[str] = set()
-    for attr in ("imap_username", "digest_smtp_user", "digest_smtp_from"):
+    for attr in (
+        "user_email",
+        "imap_username", "digest_smtp_user", "digest_smtp_from",
+    ):
         val = getattr(cfg, attr, "") or ""
         if "@" in val:
             domains.add(val.split("@", 1)[1].strip().lower())
@@ -571,7 +580,7 @@ MEETING CONTEXT
 def generate_thanks_draft(
     conn: sqlite3.Connection, cfg, mt_id: int,
     *,
-    user_name: str = "I",
+    user_name: str | None = None,
     drafter=None,
 ) -> int | None:
     """Round 8 — generate a thank-you draft for a meeting.
@@ -581,12 +590,18 @@ def generate_thanks_draft(
     inbox-reply pipeline uses, and persists the draft into
     ``email_drafts`` so it surfaces in the existing /drafts UI.
 
+    Round 25 fix (audit-found gap H2): default ``user_name`` to
+    ``cfg.user_name`` so the daemon path + dashboard /thanks/.../draft
+    POST both pick up the round-21 config field.
+
     Returns the new draft_id on success, None when:
       - Meeting not found
       - Status isn't 'ready' (no context to draft from)
       - Drafter LLM failed
       - Already drafted within the redraft cooldown
     """
+    if user_name is None:
+        user_name = getattr(cfg, "user_name", None) or "I"
     _ensure_schema(conn)
     mt = get(conn, mt_id)
     if mt is None:

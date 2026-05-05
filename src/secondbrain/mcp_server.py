@@ -1941,8 +1941,8 @@ def remind_if(
 def find_open_time_slots(
     days_ahead: int = 7,
     duration_minutes: int = 30,
-    earliest_hour: int = 9,
-    latest_hour: int = 17,
+    earliest_hour: int = 0,   # 0 = use cfg default
+    latest_hour: int = 0,     # 0 = use cfg default
     busy_events_json: str = "[]",
 ) -> str:
     """Round 19 (Phase EA-4) — find candidate meeting slots.
@@ -1953,26 +1953,46 @@ def find_open_time_slots(
     with ``dateTime`` (ISO) keys, matching the Google Calendar
     list_events shape. Returns ranked candidate slots in human-
     readable Markdown.
+
+    Round 25 fix (audit-found gap H5) — when ``earliest_hour`` /
+    ``latest_hour`` aren't explicitly passed (=0), use the round-21
+    config defaults via ``merge_with_global_prefs``. Without this,
+    a user who set ``scheduling_earliest_hour = 7`` got the
+    hardcoded 9-5 instead.
     """
     import json as _json
     from datetime import date as _date
     from datetime import timedelta as _td
 
     from . import scheduling
+    cfg, _, _, _ = _get_state()
     try:
         events = _json.loads(busy_events_json or "[]")
     except _json.JSONDecodeError as e:
         return f"_Bad busy_events_json: {e}_"
     busy = scheduling.parse_busy_blocks(events)
     today = _date.today()
+    # Use cfg defaults when caller didn't override.
+    base_prefs = scheduling.merge_with_global_prefs(
+        cfg, None, duration_minutes=int(duration_minutes),
+    )
+    final_earliest = (
+        int(earliest_hour) if earliest_hour
+        else base_prefs.earliest_hour
+    )
+    final_latest = (
+        int(latest_hour) if latest_hour
+        else base_prefs.latest_hour
+    )
     slots = scheduling.find_open_slots(
         busy,
         window_start=today,
         window_end=today + _td(days=max(1, int(days_ahead))),
         prefs=scheduling.SchedulingPrefs(
             duration_minutes=int(duration_minutes),
-            earliest_hour=int(earliest_hour),
-            latest_hour=int(latest_hour),
+            earliest_hour=final_earliest,
+            latest_hour=final_latest,
+            buffer_minutes=base_prefs.buffer_minutes,
         ),
     )
     if not slots:

@@ -1836,10 +1836,17 @@ def generate_drafts_due(
         "ORDER BY ec.classified_at DESC LIMIT ?",
         (max_per_tick,),
     ).fetchall()
+    # Round 25 fix (audit-found gap H2) — pass cfg.user_name
+    # through to the drafter. Without this, the drafter prompt
+    # uses the hardcoded default "I", silently undermining
+    # round-7's voice-fidelity work for every auto-generated
+    # daemon draft.
+    user_name = getattr(cfg, "user_name", None) or "I"
     n = 0
     for r in rows:
         if generate_draft(
             conn, int(r["file_id"]), cfg=cfg, drafter=drafter,
+            user_name=user_name,
         ) is not None:
             n += 1
     if n:

@@ -156,7 +156,16 @@ def docs_pending_cards(
         "JOIN chunks c ON c.file_id = f.id "
         "LEFT JOIN study_cards sc ON sc.file_id = f.id "
         "WHERE c.chunk_index = 0 "
-        "  AND (f.path LIKE 'transcript://%' OR f.path LIKE 'imap://%') "
+        # Round 25 fix (audit-found gap H3) — Canvas LMS course
+        # content (assignments, syllabi, announcements) lives at
+        # ``canvas://...`` paths; without this prefix the entire
+        # Canvas → flashcards pipeline was dead. Also include
+        # voice notes about coursework.
+        "  AND (f.path LIKE 'transcript://%' "
+        "       OR f.path LIKE 'imap://%' "
+        "       OR f.path LIKE 'gmail://%' "
+        "       OR f.path LIKE 'canvas://%' "
+        "       OR f.path LIKE 'voice://%') "
         "  AND sc.file_id IS NULL "
         "ORDER BY f.indexed_at DESC LIMIT ?",
         (limit * 4,),  # over-fetch then filter to course-coded ones
