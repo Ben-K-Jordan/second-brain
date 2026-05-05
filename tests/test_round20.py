@@ -153,6 +153,10 @@ def test_auto_resolve_marks_followup_resolved(
     from secondbrain import followups, followups_ops
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-test")
+    # Round 21 — user_email is now required for auto-resolve to
+    # consider an email file "user-authored" (audit-found gap A1
+    # fix: don't resolve based on incoming mail).
+    tmp_cfg.user_email = "ben@x"
     fid = followups.add_followup(
         fresh_db, direction="outgoing",
         topic="Send Q3 deck",

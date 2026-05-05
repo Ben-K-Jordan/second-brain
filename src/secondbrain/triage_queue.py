@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+# Round 21 fix (audit-found gap F1) — write lock for triage_state.
+_WRITE_LOCK = threading.RLock()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -69,26 +72,28 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 def mark_done(conn: sqlite3.Connection, file_id: int) -> bool:
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO triage_state"
-        "(file_id, decision, decided_at, snooze_until) "
-        "VALUES (?, 'done', ?, NULL)",
-        (file_id, time.time()),
-    )
-    conn.commit()
-    return True
+    with _WRITE_LOCK:
+        conn.execute(
+            "INSERT OR REPLACE INTO triage_state"
+            "(file_id, decision, decided_at, snooze_until) "
+            "VALUES (?, 'done', ?, NULL)",
+            (file_id, time.time()),
+        )
+        conn.commit()
+        return True
 
 
 def mark_skipped(conn: sqlite3.Connection, file_id: int) -> bool:
     _ensure_schema(conn)
-    conn.execute(
-        "INSERT OR REPLACE INTO triage_state"
-        "(file_id, decision, decided_at, snooze_until) "
-        "VALUES (?, 'skipped', ?, NULL)",
-        (file_id, time.time()),
-    )
-    conn.commit()
-    return True
+    with _WRITE_LOCK:
+        conn.execute(
+            "INSERT OR REPLACE INTO triage_state"
+            "(file_id, decision, decided_at, snooze_until) "
+            "VALUES (?, 'skipped', ?, NULL)",
+            (file_id, time.time()),
+        )
+        conn.commit()
+        return True
 
 
 def snooze(
@@ -98,14 +103,15 @@ def snooze(
         raise ValueError(f"hours must be >= 1; got {hours}")
     _ensure_schema(conn)
     until = time.time() + hours * 3600
-    conn.execute(
-        "INSERT OR REPLACE INTO triage_state"
-        "(file_id, decision, decided_at, snooze_until) "
-        "VALUES (?, 'snoozed', ?, ?)",
-        (file_id, time.time(), until),
-    )
-    conn.commit()
-    return True
+    with _WRITE_LOCK:
+        conn.execute(
+            "INSERT OR REPLACE INTO triage_state"
+            "(file_id, decision, decided_at, snooze_until) "
+            "VALUES (?, 'snoozed', ?, ?)",
+            (file_id, time.time(), until),
+        )
+        conn.commit()
+        return True
 
 
 def done_count_today(conn: sqlite3.Connection) -> int:
@@ -222,10 +228,14 @@ def build_queue(
             "LEFT JOIN triage_state ts ON ts.file_id = f.id "
             "WHERE f.indexed_at >= ? "
             "  AND (f.kind = 'email' OR f.kind = 'message') "
-            "  AND (ts.decision IS NULL "
-            "       OR ts.decision = 'snoozed' "
-            "         AND (ts.snooze_until IS NULL "
-            "              OR ts.snooze_until <= ?)) "
+            # Round 21 fix (audit-found gap A5) — defensive parens.
+            # AND > OR precedence makes the original parse correctly,
+            # but a future editor adding another disjunct would
+            # almost certainly get it wrong. Wrap the snoozed branch.
+            "  AND (ts.decision IS NULL OR ("
+            "       ts.decision = 'snoozed' "
+            "       AND (ts.snooze_until IS NULL "
+            "            OR ts.snooze_until <= ?))) "
             "ORDER BY f.indexed_at DESC LIMIT 300",
             (cutoff, now),
         ).fetchall()

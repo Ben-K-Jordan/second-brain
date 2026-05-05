@@ -1127,6 +1127,18 @@ _PRIMARY_NAV = [
 # section instead of reading 25 alphabetical labels. Each tuple:
 # (group_title, [(label, href), ...]).
 _NAV_GROUPS = [
+    # Round 21 fix (audit-found gap I1) — surface the EA features
+    # in the More dropdown. Round 19+20 added 6 pages
+    # (/followups, /agenda, /triage, /capture, /scheduling, /eod)
+    # but none were in nav, making them effectively undiscoverable.
+    ("EA", [
+        ("Follow-ups", "/followups"),
+        ("Agenda",     "/agenda"),
+        ("Triage",     "/triage"),
+        ("Capture",    "/capture"),
+        ("Scheduling", "/scheduling"),
+        ("EOD",        "/eod"),
+    ]),
     ("Personal", [
         ("Habits",   "/habits"),
         ("Journal",  "/journal"),
@@ -4778,11 +4790,45 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                     "<h1>Person not found</h1>", status_code=404,
                 )
             md = agenda_mod.render_markdown(result)
+            # Round 21 fix (audit-found gap I2) — render an "Add
+            # note" form + per-note "discussed" buttons inline so
+            # the user-curated notes layer is actually usable from
+            # the dashboard. Previously the POST endpoints existed
+            # but had no UI affordances.
+            user_notes = agenda_mod.list_notes(conn, id)
+            notes_html_rows = "".join(
+                f'<li>'
+                f'  <span>{escape(_safe(n.text))}</span> '
+                f'  <form method="post" '
+                f'    action="/agenda/note/{n.id}/discussed" '
+                f'    style="display:inline;">'
+                f'    <button type="submit">discussed</button>'
+                f'  </form>'
+                f'</li>'
+                for n in user_notes
+            )
+            notes_section = (
+                f'<section class="card">'
+                f'  <h2>Things to bring up</h2>'
+                f'  <form method="post" action="/agenda/{id}/note">'
+                f'    <input type="text" name="text" '
+                f'      placeholder="Add a topic..." '
+                f'      style="width:60%;">'
+                f'    <button type="submit">Add</button>'
+                f'  </form>'
+                + (
+                    f'<ul class="agenda-note-list">{notes_html_rows}</ul>'
+                    if notes_html_rows else
+                    '<p class="muted">_(no pending notes)_</p>'
+                )
+                + '</section>'
+            )
             body = (
                 f'<h1>1:1 with {escape(_safe(result.person_name))}</h1>'
                 f'<p class="muted">'
                 f'  {result.total_items} item(s) on the table.'
                 f'</p>'
+                f'{notes_section}'
                 f'<div class="briefing-body">'
                 f'{_markdown_to_html_block(md)}'
                 f'</div>'
@@ -4793,6 +4839,12 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
                 f'<p style="margin-top:var(--s-4);">'
                 f'<a class="link-btn" href="/agenda">'
                 f'← all people</a></p>'
+                '<style>'
+                '.agenda-note-list { padding-left: var(--s-4); }'
+                '.agenda-note-list li { margin: var(--s-1) 0; }'
+                '.agenda-note-list button { font-size: 11px; '
+                '  padding: 2px 8px; background: #222; }'
+                '</style>'
             )
             return HTMLResponse(_layout(
                 f"Agenda · {result.person_name}", body, "agenda",

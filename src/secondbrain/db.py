@@ -252,6 +252,16 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
         conn.execute(
             "ALTER TABLE people ADD COLUMN last_contact_at REAL"
         )
+    # Round 21 — `cadence_user_set` distinguishes "user explicitly
+    # set / cleared cadence" from "never set, can be auto-inferred".
+    # Without this, auto_apply_inferred_cadence couldn't tell
+    # user-cleared from never-set and would re-infer over a user's
+    # explicit choice.
+    if people_cols and "cadence_user_set" not in people_cols:
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN "
+            "cadence_user_set INTEGER NOT NULL DEFAULT 0"
+        )
 
     # Chat conversations: each conversation has many turns, each turn has a
     # role (user / assistant) and a content blob. Citations are stored per
@@ -427,6 +437,8 @@ def init_schema(conn: sqlite3.Connection, embedding_dim: int, embedder_name: str
             tier TEXT NOT NULL DEFAULT 'regular',
             cadence_days INTEGER,
             last_contact_at REAL,
+            -- Round 21 — see migration comment lower in init_schema.
+            cadence_user_set INTEGER NOT NULL DEFAULT 0,
             UNIQUE(canonical_name)
         );
         CREATE INDEX IF NOT EXISTS idx_people_email ON people(email);

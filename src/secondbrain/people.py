@@ -593,6 +593,10 @@ def set_field(
         cd = int(cadence_days) if int(cadence_days) > 0 else None
         updates.append("cadence_days = ?")
         params.append(cd)
+        # Round 21 fix — flip the user-set flag so the auto-inference
+        # job won't override this choice (including "user explicitly
+        # cleared by setting cadence_days=0").
+        updates.append("cadence_user_set = 1")
     if not updates:
         return False
     params.append(person_id)
@@ -955,7 +959,7 @@ def is_vip_email(conn: sqlite3.Connection, email: str) -> bool:
 def infer_cadence_for_person(
     conn: sqlite3.Connection, person_id: int,
     *,
-    min_contacts: int = 4,
+    min_contacts: int = 6,
     lookback_days: int = 365,
 ) -> int | None:
     """Round 20 — infer the user's typical contact frequency with
@@ -968,6 +972,12 @@ def infer_cadence_for_person(
 
     Returns the suggested cadence_days (rounded), or None if not
     enough signal. Caller decides whether to apply it.
+
+    Round 21 fix (audit-found gap A8) — raised ``min_contacts``
+    from 4 to 6 so we have at least 5 inter-arrival gaps. With 3
+    gaps the median was wildly unstable (one new contact could
+    shift the bucket from weekly to monthly). With 5 gaps it's
+    much more robust.
     """
     cutoff = time.time() - lookback_days * 86400
     rows = conn.execute(
@@ -986,7 +996,8 @@ def infer_cadence_for_person(
         if gap >= 0.5:  # ignore same-day repeats
             gaps_days.append(gap)
         prev = cur
-    if not gaps_days:
+    if len(gaps_days) < 4:
+        # Not enough inter-arrival samples for a stable median.
         return None
     gaps_days.sort()
     median_days = gaps_days[len(gaps_days) // 2]
@@ -1005,14 +1016,25 @@ def auto_apply_inferred_cadence(
 ) -> int:
     """Walk people in the given tiers, infer cadence_days for each
     that meets the signal threshold, and persist if (a) we have
-    enough data and (b) cadence_days isn't already set when
-    ``only_if_unset`` is True. Returns count updated."""
+    enough data and (b) the user hasn't explicitly set/cleared
+    cadence_days when ``only_if_unset`` is True.
+
+    Round 21 fix (audit-found gap A7) — uses ``cadence_user_set``
+    column to distinguish user-cleared (don't auto-set) from
+    never-set (OK to auto-set). Without this column, a user who
+    explicitly cleared cadence_days back to NULL would have it
+    silently re-inferred on the next weekly run.
+    """
     placeholders = ",".join("?" * len(only_for_tier))
-    rows = conn.execute(
-        f"SELECT id, cadence_days FROM people "
+    sql = (
+        f"SELECT id, cadence_days, cadence_user_set FROM people "
         f"WHERE tier IN ({placeholders}) "
-        f"ORDER BY mention_count DESC LIMIT ?",
-        (*only_for_tier, max_updates * 4),
+    )
+    if only_if_unset:
+        sql += " AND cadence_user_set = 0"
+    sql += " ORDER BY mention_count DESC LIMIT ?"
+    rows = conn.execute(
+        sql, (*only_for_tier, max_updates * 4),
     ).fetchall()
     n_updated = 0
     for r in rows:
@@ -1023,6 +1045,8 @@ def auto_apply_inferred_cadence(
         suggested = infer_cadence_for_person(conn, int(r["id"]))
         if suggested is None:
             continue
+        # Note: we DO NOT set cadence_user_set=1 here, since this
+        # is an inferred value, not an explicit user choice.
         conn.execute(
             "UPDATE people SET cadence_days = ? WHERE id = ?",
             (suggested, int(r["id"])),

@@ -34,11 +34,19 @@ import time
 import weakref as _weakref
 from dataclasses import dataclass
 
+from . import followups as _followups
 from .config import Config
 
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+# Round 21 fix (audit-found gap F1) — share the followups module's
+# write lock so a single critical section covers add_followup()
+# and the auto-resolve writes here. Without this, dashboard worker
+# threads + daemon (extractor + auto-resolve) intermittently hit
+# ``database is locked`` under contention.
+_WRITE_LOCK = _followups._WRITE_LOCK
 
 _AUTO_RESOLVE_MIN_CONFIDENCE = 0.7
 _NUDGE_MODEL = "claude-haiku-4-5"
@@ -109,24 +117,26 @@ def snooze(
         raise ValueError(f"days must be >= 1; got {days}")
     _ensure_extended_schema(conn)
     target = time.time() + days * 86400
-    cur = conn.execute(
-        "UPDATE followups SET snooze_until = ?, updated_at = ? "
-        "WHERE id = ? AND status = 'open'",
-        (target, time.time(), followup_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE followups SET snooze_until = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'open'",
+            (target, time.time(), followup_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def unsnooze(conn: sqlite3.Connection, followup_id: int) -> bool:
     _ensure_extended_schema(conn)
-    cur = conn.execute(
-        "UPDATE followups SET snooze_until = NULL, updated_at = ? "
-        "WHERE id = ?",
-        (time.time(), followup_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE followups SET snooze_until = NULL, updated_at = ? "
+            "WHERE id = ?",
+            (time.time(), followup_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def edit(
@@ -169,12 +179,13 @@ def edit(
     updates.append("updated_at = ?")
     params.append(time.time())
     params.append(followup_id)
-    cur = conn.execute(
-        f"UPDATE followups SET {', '.join(updates)} WHERE id = ?",
-        params,
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            f"UPDATE followups SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def bulk_dismiss(
@@ -201,9 +212,10 @@ def bulk_dismiss(
     if direction:
         sql += " AND direction = ?"
         params.append(direction)
-    cur = conn.execute(sql, params)
-    conn.commit()
-    return cur.rowcount
+    with _WRITE_LOCK:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.rowcount
 
 
 # ============================ queries ==============================
@@ -333,21 +345,17 @@ def auto_resolve_from_sent_mail(
     ).fetchall()
     if not open_rows:
         return 0
-    # Pull recent sent-mail-ish files. We treat any email-kind file
-    # the user is the From: of as "sent". The user may not always
-    # have a sent-mail connector, so we also accept journal entries
-    # where the user wrote "I sent the deck to Sarah".
-    candidate_files = conn.execute(
-        "SELECT f.id AS fid, f.path, f.indexed_at, "
-        "       SUBSTR(c.text, 1, 1500) AS preview "
-        "FROM files f "
-        "JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
-        "WHERE f.indexed_at >= ? "
-        "  AND (f.kind = 'email' OR f.kind = 'message' "
-        "       OR f.kind = 'voice' OR f.kind = 'journal') "
-        "ORDER BY f.indexed_at DESC LIMIT 60",
-        (cutoff,),
-    ).fetchall()
+    # Pull recent files that look like user-authored content. We
+    # treat journal/voice entries as user-authored unconditionally
+    # (they're literally the user typing/dictating). For email/
+    # message files we MUST verify the user is the sender — the
+    # round-21 audit found that without this filter, an incoming
+    # email from Sarah ("Re: Q3 deck — looks great!") that mentions
+    # the topic was being treated as evidence that the user fulfilled
+    # the commitment.
+    candidate_files = _candidate_user_authored_files(
+        conn, cutoff=cutoff, cfg=cfg,
+    )
     if not candidate_files:
         return 0
     n_resolved = 0
@@ -377,12 +385,83 @@ def auto_resolve_from_sent_mail(
         ) >= _AUTO_RESOLVE_MIN_CONFIDENCE:
             evidence = verdict.get("evidence", "")[:500]
             evidence_fid = verdict.get("evidence_file_id")
+            # Round 21 fix (audit-found gap A2) — validate the
+            # LLM-returned file_id is in the candidate set we showed
+            # it. The model can hallucinate fids; we coerce to None
+            # rather than persist a bad reference.
+            valid_fids = {int(c["fid"]) for c in candidates}
+            if evidence_fid is not None:
+                try:
+                    evidence_fid = int(evidence_fid)
+                    if evidence_fid not in valid_fids:
+                        evidence_fid = None
+                except (TypeError, ValueError):
+                    evidence_fid = None
             _record_auto_resolution(
                 conn, followup_id=f.id,
                 evidence=evidence, evidence_file_id=evidence_fid,
             )
             n_resolved += 1
     return n_resolved
+
+
+def _candidate_user_authored_files(
+    conn: sqlite3.Connection, *, cutoff: float, cfg,
+) -> list:
+    """Round 21 fix (audit-found gap A1) — pull recent files that
+    are user-authored.
+
+    Two safe paths:
+      1. ``kind in ('voice', 'journal')`` → always user-authored.
+      2. ``kind in ('email', 'message')`` → must contain the user's
+         email address in the From: header (case-insensitive). This
+         filters out incoming mail that just happens to mention the
+         topic.
+
+    Without the email filter, an incoming reply with "Re: Q3 deck"
+    matched the keyword scan and the LLM resolved the followup
+    based on someone else's reply.
+    """
+    user_email = (
+        getattr(cfg, "user_email", "") or ""
+    ).strip().lower()
+    user_name = (
+        getattr(cfg, "user_name", "") or ""
+    ).strip().lower()
+    rows = conn.execute(
+        "SELECT f.id AS fid, f.path, f.kind, f.indexed_at, "
+        "       SUBSTR(c.text, 1, 1500) AS preview "
+        "FROM files f "
+        "JOIN chunks c ON c.file_id = f.id AND c.chunk_index = 0 "
+        "WHERE f.indexed_at >= ? "
+        "  AND (f.kind = 'email' OR f.kind = 'message' "
+        "       OR f.kind = 'voice' OR f.kind = 'journal') "
+        "ORDER BY f.indexed_at DESC LIMIT 200",
+        (cutoff,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        kind = r["kind"]
+        if kind in ("voice", "journal"):
+            out.append(r)
+            continue
+        # email / message — verify user is the sender.
+        preview = (r["preview"] or "").lower()
+        # Find the From: line.
+        import re as _re
+        m = _re.search(r"(?im)^from:\s*(.+?)$", preview)
+        if not m:
+            continue
+        from_line = m.group(1).strip()
+        # Match if user_email appears verbatim, OR if user_name
+        # appears with an angle-brackets-style "Name <email>" form
+        # AND user_email is empty (best-effort fallback).
+        if user_email and user_email in from_line or user_name and not user_email and user_name in from_line:
+            out.append(r)
+        # Else skip — we can't verify it's user-authored.
+        if len(out) >= 60:
+            break
+    return out
 
 
 def _has_evidence_signal(
@@ -455,10 +534,21 @@ def _llm_check_resolution(
     except ImportError:
         def _safe_for_prompt(s, max_chars):
             return (s or "")[:max_chars]
+    # Round 21 fix (audit-found gap C1) — redact candidate previews
+    # before sending to Anthropic. ``_safe_for_prompt`` only does
+    # truncation + prompt-injection guard; the round-13 invariant
+    # is that user content also passes through ``redact_text``
+    # before egress. Defense-in-depth on followup fields too —
+    # they should already be redacted at write but let's be sure.
+    try:
+        from .safety import redact_text
+    except ImportError:
+        def redact_text(s):
+            return s
     cands_block = []
     for c in candidates[:5]:
         body = _safe_for_prompt(
-            c["preview"] or "", max_chars=1000,
+            redact_text(c["preview"] or ""), max_chars=1000,
         )
         cands_block.append(
             f"<file_id={c['fid']} path={c['path']!r}>\n{body}\n</file>"
@@ -466,9 +556,10 @@ def _llm_check_resolution(
     prompt = (
         f"User name: {user_name}\n\n"
         f"COMMITMENT:\n"
-        f"  topic: {_safe_for_prompt(followup.topic, max_chars=200)}\n"
+        f"  topic: "
+        f"{_safe_for_prompt(redact_text(followup.topic), max_chars=200)}\n"
         f"  description: "
-        f"{_safe_for_prompt(followup.description, max_chars=500)}\n"
+        f"{_safe_for_prompt(redact_text(followup.description), max_chars=500)}\n"
         f"  person: {followup.person_name or 'unknown'}\n"
         f"  promised_at_ts: {followup.promised_at or 0}\n"
         f"  due_at_ts: {followup.due_at or 0}\n\n"
@@ -522,21 +613,22 @@ def _record_auto_resolution(
     evidence_file_id: int | None,
 ) -> None:
     now = time.time()
-    conn.execute(
-        "UPDATE followups SET "
-        "  status = 'resolved', resolved_at = ?, "
-        "  auto_resolve_evidence = ?, updated_at = ? "
-        "WHERE id = ? AND status = 'open'",
-        (now, evidence[:500], now, followup_id),
-    )
-    conn.execute(
-        "INSERT INTO followup_resolutions"
-        "(followup_id, resolved_at, resolution_kind, "
-        " evidence, evidence_file_id) "
-        "VALUES (?, ?, 'auto', ?, ?)",
-        (followup_id, now, evidence[:500], evidence_file_id),
-    )
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute(
+            "UPDATE followups SET "
+            "  status = 'resolved', resolved_at = ?, "
+            "  auto_resolve_evidence = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'open'",
+            (now, evidence[:500], now, followup_id),
+        )
+        conn.execute(
+            "INSERT INTO followup_resolutions"
+            "(followup_id, resolved_at, resolution_kind, "
+            " evidence, evidence_file_id) "
+            "VALUES (?, ?, 'auto', ?, ?)",
+            (followup_id, now, evidence[:500], evidence_file_id),
+        )
+        conn.commit()
 
 
 # ============================ auto-nudge ==========================
@@ -632,12 +724,19 @@ def draft_nudge(
     except ImportError:
         def _safe_for_prompt(s, max_chars):
             return (s or "")[:max_chars]
+    # Round 21 fix (audit-found gap C2) — redact before send.
+    try:
+        from .safety import redact_text
+    except ImportError:
+        def redact_text(s):
+            return s
     prompt = (
         f"User name: {user_name}\n"
-        f"Recipient: {f.person_name or 'them'}\n"
-        f"Topic: {_safe_for_prompt(f.topic, max_chars=200)}\n"
+        f"Recipient: {redact_text(f.person_name or 'them')}\n"
+        f"Topic: "
+        f"{_safe_for_prompt(redact_text(f.topic), max_chars=200)}\n"
         f"Original ask: "
-        f"{_safe_for_prompt(f.description, max_chars=500)}\n"
+        f"{_safe_for_prompt(redact_text(f.description), max_chars=500)}\n"
         f"Days since ask: {age_days}\n"
         f"{voice_block}"
     )

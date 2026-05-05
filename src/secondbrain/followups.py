@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from collections.abc import Iterable
@@ -53,6 +54,12 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+
+# Round 21 fix (audit-found gap F1) — write-lock for the followups
+# table. Shared with followups_ops via that module's import-and-use.
+# Serialises concurrent writers from the daemon (extractor +
+# auto-resolve) and the dashboard.
+_WRITE_LOCK = threading.RLock()
 
 _MIN_CONFIDENCE = 0.55
 _EXTRACTOR_MODEL = "claude-haiku-4-5"
@@ -176,6 +183,84 @@ def _dedup_key(
     return h.hexdigest()[:32]
 
 
+def add_followup_with_status(
+    conn: sqlite3.Connection,
+    *,
+    direction: str,
+    topic: str,
+    description: str,
+    person_id: int | None = None,
+    person_name: str = "",
+    source_kind: str = "manual",
+    source_file_id: int | None = None,
+    source_excerpt: str = "",
+    due_at: float | None = None,
+    promised_at: float | None = None,
+    confidence: float = 1.0,
+    extracted_by: str = "manual",
+) -> tuple[int, bool]:
+    """Round 21 — idempotent insert returning (row_id, was_new).
+
+    The "was_new" flag comes directly from ``cur.rowcount`` AFTER the
+    INSERT OR IGNORE, BEFORE any commit. Replaces the round-19 racy
+    5-second time-window heuristic. Returns (0, False) on failure.
+    """
+    if direction not in ("outgoing", "incoming"):
+        raise ValueError(
+            f"direction must be outgoing|incoming; got {direction!r}",
+        )
+    key = _dedup_key(
+        source_kind=source_kind, source_file_id=source_file_id,
+        direction=direction, description=description,
+    )
+    # Round 13/14 invariant — redact before persisting.
+    try:
+        from .safety import redact_text
+        description = redact_text(description)
+        source_excerpt = redact_text(source_excerpt)
+        topic = redact_text(topic)
+        person_name = redact_text(person_name)
+    except ImportError:
+        pass
+    now = time.time()
+    try:
+        with _WRITE_LOCK:
+            # Round 21 — schema init also under the lock; otherwise
+            # the first writer thread can race against a concurrent
+            # one on the executescript + commit path even though the
+            # WeakSet guard tries to short-circuit subsequent calls.
+            _ensure_schema(conn)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO followups"
+                "(direction, person_id, person_name, topic, description, "
+                " source_kind, source_file_id, source_excerpt, status, "
+                " due_at, promised_at, created_at, updated_at, "
+                " confidence, extracted_by, dedup_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    direction, person_id, person_name, topic, description,
+                    source_kind, source_file_id, source_excerpt,
+                    due_at, promised_at, now, now,
+                    float(confidence), extracted_by, key,
+                ),
+            )
+            was_new = cur.rowcount > 0
+            try:
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # INSERT OR IGNORE hit dedup → no transaction
+            existing = conn.execute(
+                "SELECT id FROM followups WHERE dedup_key = ?", (key,),
+            ).fetchone()
+            return (
+                int(existing["id"]) if existing else 0,
+                was_new,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("followups.add: failed: %s", e)
+        return 0, False
+
+
 def add_followup(
     conn: sqlite3.Connection,
     *,
@@ -193,80 +278,42 @@ def add_followup(
     extracted_by: str = "manual",
 ) -> int:
     """Idempotent insert. Returns the new (or existing) row id, or 0
-    on failure."""
-    if direction not in ("outgoing", "incoming"):
-        raise ValueError(
-            f"direction must be outgoing|incoming; got {direction!r}",
-        )
-    _ensure_schema(conn)
-    key = _dedup_key(
+    on failure. See ``add_followup_with_status`` if you also need
+    to know whether the row was new vs. existing."""
+    row_id, _was_new = add_followup_with_status(
+        conn,
+        direction=direction, topic=topic, description=description,
+        person_id=person_id, person_name=person_name,
         source_kind=source_kind, source_file_id=source_file_id,
-        direction=direction, description=description,
+        source_excerpt=source_excerpt, due_at=due_at,
+        promised_at=promised_at, confidence=confidence,
+        extracted_by=extracted_by,
     )
-    # Round 13/14 invariant — redact before persisting.
-    try:
-        from .safety import redact_text
-        description = redact_text(description)
-        source_excerpt = redact_text(source_excerpt)
-        topic = redact_text(topic)
-        person_name = redact_text(person_name)
-    except ImportError:
-        pass
-    now = time.time()
-    try:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO followups"
-            "(direction, person_id, person_name, topic, description, "
-            " source_kind, source_file_id, source_excerpt, status, "
-            " due_at, promised_at, created_at, updated_at, "
-            " confidence, extracted_by, dedup_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
-            (
-                direction, person_id, person_name, topic, description,
-                source_kind, source_file_id, source_excerpt,
-                due_at, promised_at, now, now,
-                float(confidence), extracted_by, key,
-            ),
-        )
-        try:
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # INSERT OR IGNORE hit dedup → no transaction
-        if cur.rowcount > 0:
-            row = conn.execute(
-                "SELECT id FROM followups WHERE dedup_key = ?",
-                (key,),
-            ).fetchone()
-            return int(row["id"]) if row else 0
-        existing = conn.execute(
-            "SELECT id FROM followups WHERE dedup_key = ?", (key,),
-        ).fetchone()
-        return int(existing["id"]) if existing else 0
-    except Exception as e:  # noqa: BLE001
-        log.warning("followups.add: failed: %s", e)
-        return 0
+    return row_id
 
 
 def mark_resolved(conn: sqlite3.Connection, followup_id: int) -> bool:
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE followups SET status='resolved', resolved_at=?, "
-        "updated_at=? WHERE id = ? AND status = 'open'",
-        (time.time(), time.time(), followup_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE followups SET status='resolved', resolved_at=?, "
+            "updated_at=? WHERE id = ? AND status = 'open'",
+            (time.time(), time.time(), followup_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def mark_dismissed(conn: sqlite3.Connection, followup_id: int) -> bool:
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE followups SET status='dismissed', resolved_at=?, "
-        "updated_at=? WHERE id = ? AND status = 'open'",
-        (time.time(), time.time(), followup_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE followups SET status='dismissed', resolved_at=?, "
+            "updated_at=? WHERE id = ? AND status = 'open'",
+            (time.time(), time.time(), followup_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # ============================ queries ===============================
@@ -523,7 +570,7 @@ def extract_and_persist(
                 except (ValueError, TypeError):
                     due_at = None
             excerpt = str(it.get("excerpt") or "")[:1000]
-            new_id = add_followup(
+            new_id, was_new = add_followup_with_status(
                 conn,
                 direction=direction,
                 topic=topic,
@@ -538,15 +585,13 @@ def extract_and_persist(
                 confidence=confidence,
                 extracted_by="llm",
             )
-            if new_id:
-                # Note: add_followup returns the row id whether new
-                # or pre-existing. Distinguish via a quick check.
-                row = conn.execute(
-                    "SELECT created_at FROM followups WHERE id = ?",
-                    (new_id,),
-                ).fetchone()
-                if row and abs(time.time() - row["created_at"]) < 5.0:
-                    n_added += 1
+            # Round 21 fix (audit-found gap A3) — use the
+            # ``was_new`` flag directly from ``cur.rowcount`` instead
+            # of a 5-second wall-clock window. The earlier heuristic
+            # was racy with concurrent extractor runs and broken on
+            # slow LLMs.
+            if new_id and was_new:
+                n_added += 1
         except Exception as e:  # noqa: BLE001
             log.debug("followups: skipping malformed item: %s", e)
             continue

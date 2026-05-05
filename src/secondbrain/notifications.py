@@ -651,12 +651,17 @@ def _detect_cadence_overdue(conn: sqlite3.Connection) -> int:
         )
     except Exception:  # noqa: BLE001
         return 0
+    # Round 21 fix (audit-found gap A6) — use local-tz date for the
+    # "once per day per person" key. Earlier ``int(time.time()/86400)``
+    # was UTC days, so users west of UTC had the boundary flip mid-
+    # afternoon → either two notifications in one local day or none
+    # for two local days.
+    today_iso = date.today().isoformat()
     n = 0
     for o in overdue:
         if enqueue(
             conn,
-            key=f"cadence_overdue:{o.person.id}:"
-                f"{int(time.time() / 86400)}",  # one per day per person
+            key=f"cadence_overdue:{o.person.id}:{today_iso}",
             kind="cadence_overdue",
             urgency="med",
             title=f"Reach out: {o.person.display_name}",

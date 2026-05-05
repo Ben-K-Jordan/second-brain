@@ -641,13 +641,16 @@ def _followups_section(conn: sqlite3.Connection) -> list[dict]:
     decoupled from the followups module's dataclass shape."""
     try:
         from . import followups, followups_ops
-        # Get the visible-open list (excludes snoozed) for both
-        # directions. Cap to 10 total so we don't overwhelm the brief.
+        # Round 21 fix (audit-found gap A9) — pull more per side
+        # then sort+truncate to a single hard cap. Earlier 6+6=12
+        # → trim to 10 silently dropped 2 every time the user had
+        # heavy load. Now 8+8=16 with explicit cap=10 makes the
+        # truncation visible (and gives the sort more to work with).
         out_rows = followups_ops.list_visible_open(
-            conn, direction="outgoing", limit=6,
+            conn, direction="outgoing", limit=8,
         )
         in_rows = followups_ops.list_visible_open(
-            conn, direction="incoming", limit=6,
+            conn, direction="incoming", limit=8,
         )
         # Surface overdue first.
         rows = sorted(

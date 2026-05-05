@@ -211,6 +211,11 @@ class Config:
     # User's display name for prompts ("Ben"). Used by followups +
     # meeting_capture + nudge drafter to refer to the user.
     user_name: str = ""
+    # User's primary email address — used by auto-resolve to
+    # distinguish "user sent this" from "someone replied to user".
+    # Without this, an incoming reply mentioning the topic could
+    # mistakenly resolve an outgoing followup. Round 21 fix.
+    user_email: str = ""
     # Jobs connector: companies to watch on each ATS provider. The slug is
     # whatever appears in the public board URL - e.g. anthropic.com's
     # Greenhouse board is at boards.greenhouse.io/anthropic, so the slug
@@ -603,6 +608,28 @@ def load_config(path: Path | None = None) -> Config:
             cfg.obsidian_vaults = tuple(data["obsidian_vaults"])
         if "imessage_db_path" in data:
             cfg.imessage_db_path = str(data["imessage_db_path"])
+        # Round 21 fix (audit-found gap A-config) — load the round-19
+        # / round-20 EA-shaped fields. Without these blocks the user
+        # could set them in config.toml and it would be a silent
+        # no-op (defaults always won).
+        if "user_name" in data:
+            cfg.user_name = str(data["user_name"])
+        if "user_email" in data:
+            cfg.user_email = str(data["user_email"])
+        if "scheduling_earliest_hour" in data:
+            cfg.scheduling_earliest_hour = int(
+                data["scheduling_earliest_hour"],
+            )
+        if "scheduling_latest_hour" in data:
+            cfg.scheduling_latest_hour = int(
+                data["scheduling_latest_hour"],
+            )
+        if "scheduling_buffer_minutes" in data:
+            cfg.scheduling_buffer_minutes = int(
+                data["scheduling_buffer_minutes"],
+            )
+        if "eod_send_time" in data:
+            cfg.eod_send_time = str(data["eod_send_time"])
         if "jobs_greenhouse" in data:
             cfg.jobs_greenhouse = tuple(data["jobs_greenhouse"])
         if "jobs_lever" in data:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from dataclasses import asdict, dataclass
@@ -40,6 +41,9 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+# Round 21 fix (audit-found gap F1) — daemon (auto-capture) +
+# dashboard (edit / mark_recap_sent) write here concurrently.
+_WRITE_LOCK = threading.RLock()
 
 _CAPTURE_MODEL = "claude-sonnet-4-5"
 _CAPTURE_MAX_TRANSCRIPT_CHARS = 30000
@@ -400,8 +404,10 @@ def capture(
         now, model,
         json.dumps(attendees),
     )
-    # Round 17-style atomic transaction.
-    with conn:
+    # Round 17-style atomic transaction. Round 21 — also
+    # serialised behind _WRITE_LOCK so the daemon's auto-capture
+    # job can't race the dashboard's manual capture.
+    with _WRITE_LOCK, conn:
         if overwrite:
             conn.execute(
                 "DELETE FROM meeting_captures WHERE file_id = ?",
@@ -522,13 +528,14 @@ def mark_recap_sent(
     conn: sqlite3.Connection, file_id: int,
 ) -> bool:
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE meeting_captures SET recap_sent_at = ? "
-        "WHERE file_id = ?",
-        (time.time(), file_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE meeting_captures SET recap_sent_at = ? "
+            "WHERE file_id = ?",
+            (time.time(), file_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # ============================ Round 20 — edits ===================
@@ -603,13 +610,14 @@ def edit_capture(
         return False
     updates.append("user_edited = 1")
     params.append(file_id)
-    cur = conn.execute(
-        f"UPDATE meeting_captures SET {', '.join(updates)} "
-        f"WHERE file_id = ?",
-        params,
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            f"UPDATE meeting_captures SET {', '.join(updates)} "
+            f"WHERE file_id = ?",
+            params,
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def link_to_calendar_event(

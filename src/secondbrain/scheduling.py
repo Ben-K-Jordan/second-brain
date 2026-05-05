@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time as _time_mod
 import weakref as _weakref
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ from datetime import date, datetime, time, timedelta
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+# Round 21 fix (audit-found gap F1) — serialise writes from
+# dashboard threads + chat tools.
+_WRITE_LOCK = threading.RLock()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -158,18 +162,19 @@ def set_person_prefs(
         if buffer_minutes is not None
         else (existing.buffer_minutes if existing else None)
     )
-    conn.execute(
-        "INSERT OR REPLACE INTO scheduling_prefs"
-        "(person_id, preferred_weekdays_json, preferred_hours_json, "
-        " avoid_weekdays_json, duration_minutes, buffer_minutes, "
-        " updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            person_id, json.dumps(pw), json.dumps(ph),
-            json.dumps(aw), dm, bm, _time_mod.time(),
-        ),
-    )
-    conn.commit()
+    with _WRITE_LOCK:
+        conn.execute(
+            "INSERT OR REPLACE INTO scheduling_prefs"
+            "(person_id, preferred_weekdays_json, preferred_hours_json, "
+            " avoid_weekdays_json, duration_minutes, buffer_minutes, "
+            " updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                person_id, json.dumps(pw), json.dumps(ph),
+                json.dumps(aw), dm, bm, _time_mod.time(),
+            ),
+        )
+        conn.commit()
 
 
 def merge_with_global_prefs(
@@ -224,14 +229,18 @@ def log_proposal(
             "rank": s.rank,
         } for s in slots
     ])
-    cur = conn.execute(
-        "INSERT INTO scheduling_proposals"
-        "(person_id, person_name, slots_json, email_body, proposed_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (person_id, person_name, slots_json, email_body, _time_mod.time()),
-    )
-    conn.commit()
-    return int(cur.lastrowid or 0)
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "INSERT INTO scheduling_proposals"
+            "(person_id, person_name, slots_json, email_body, proposed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                person_id, person_name, slots_json, email_body,
+                _time_mod.time(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
 
 
 def list_recent_proposals(
@@ -265,13 +274,14 @@ def mark_proposal_outcome(
     if outcome not in ("scheduled", "declined", "expired"):
         raise ValueError(f"bad outcome: {outcome!r}")
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE scheduling_proposals SET outcome = ?, "
-        "chosen_slot_iso = ? WHERE id = ?",
-        (outcome, chosen_slot_iso or None, proposal_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE scheduling_proposals SET outcome = ?, "
+            "chosen_slot_iso = ? WHERE id = ?",
+            (outcome, chosen_slot_iso or None, proposal_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 @dataclass

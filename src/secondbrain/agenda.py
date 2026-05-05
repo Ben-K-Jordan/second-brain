@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 import weakref as _weakref
 from dataclasses import dataclass, field
@@ -43,6 +44,9 @@ from dataclasses import dataclass, field
 log = logging.getLogger(__name__)
 
 _SCHEMA_INITIALIZED: _weakref.WeakSet = _weakref.WeakSet()
+# Round 21 fix (audit-found gap F1) — write lock for agenda_notes.
+# Daemon doesn't write here, but dashboard worker threads do.
+_WRITE_LOCK = threading.RLock()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -104,13 +108,14 @@ def add_note(
         text = redact_text(text)
     except ImportError:
         pass
-    cur = conn.execute(
-        "INSERT INTO agenda_notes(person_id, text, created_at, tags_json) "
-        "VALUES (?, ?, ?, ?)",
-        (person_id, text, time.time(), json.dumps(tags or [])),
-    )
-    conn.commit()
-    return int(cur.lastrowid or 0)
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "INSERT INTO agenda_notes(person_id, text, created_at, tags_json) "
+            "VALUES (?, ?, ?, ?)",
+            (person_id, text, time.time(), json.dumps(tags or [])),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
 
 
 def list_notes(
@@ -141,24 +146,26 @@ def list_notes(
 
 def mark_discussed(conn: sqlite3.Connection, note_id: int) -> bool:
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE agenda_notes SET status='discussed', discussed_at=? "
-        "WHERE id = ? AND status = 'pending'",
-        (time.time(), note_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE agenda_notes SET status='discussed', discussed_at=? "
+            "WHERE id = ? AND status = 'pending'",
+            (time.time(), note_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def drop_note(conn: sqlite3.Connection, note_id: int) -> bool:
     _ensure_schema(conn)
-    cur = conn.execute(
-        "UPDATE agenda_notes SET status='dropped', discussed_at=? "
-        "WHERE id = ? AND status = 'pending'",
-        (time.time(), note_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE agenda_notes SET status='dropped', discussed_at=? "
+            "WHERE id = ? AND status = 'pending'",
+            (time.time(), note_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 @dataclass
