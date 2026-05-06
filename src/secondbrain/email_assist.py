@@ -1889,15 +1889,31 @@ _MSGID_LINE_RE = re.compile(
 )
 
 
+_LABELS_SENT_RE = re.compile(
+    r"^labels:[^\n]*\bsent\b", re.MULTILINE | re.IGNORECASE,
+)
+
+
 def _is_sent_item(text: str) -> bool:
     """Sent items have 'Folder: Sent' or '/Sent' in their first chunk —
-    that's how the IMAP / Gmail connectors mark outbound mail."""
+    that's how the IMAP / Gmail connectors mark outbound mail.
+
+    Round 27 fix (audit-found gap H2) — Gmail's connector emits
+    ``Labels: INBOX, SENT, IMPORTANT`` (comma-separated, in any
+    order). The earlier literal substring ``"labels: sent"``
+    only matched when SENT was the very first label, so most
+    Gmail sent items were rejected and the round-25 reply-pair
+    indexing job never produced any pairs for Gmail-only users.
+    Now we tokenize: any line starting ``Labels:`` containing the
+    word SENT counts.
+    """
     if not text:
         return False
-    head = text[:2000].lower()
-    return ("folder: sent" in head
-            or "labels: sent" in head
-            or "/sent" in head)
+    head = text[:2000]
+    head_lower = head.lower()
+    if "folder: sent" in head_lower or "/sent" in head_lower:
+        return True
+    return _LABELS_SENT_RE.search(head) is not None
 
 
 def _msgid_for_file(conn: sqlite3.Connection, file_id: int) -> str:
@@ -2111,11 +2127,18 @@ def extract_voice_profile(
     learn from — the drafter falls back to its default voice rules.
     """
     _ensure_schema(conn)
+    # Round 27 fix (audit-found gap H1) — also match Gmail's
+    # ``Labels: ... SENT ...`` shape. Round 24 fixed the analogous
+    # gap in ``_select_style_samples_smart`` (lines 1181/1194) but
+    # the migration never reached this voice-profile extractor, so
+    # Gmail-only users got an empty profile and the drafter silently
+    # fell back to the default voice rules.
     rows = conn.execute(
         "SELECT c.text FROM chunks c JOIN files f ON f.id = c.file_id "
         "WHERE c.chunk_index = 0 "
         "  AND (f.path LIKE 'imap://%' OR f.path LIKE 'gmail://%') "
-        "  AND LOWER(c.text) LIKE '%folder: sent%' "
+        "  AND (LOWER(c.text) LIKE '%folder: sent%' "
+        "       OR LOWER(c.text) LIKE '%labels:%sent%') "
         "ORDER BY f.indexed_at DESC LIMIT ?",
         (max_samples,),
     ).fetchall()

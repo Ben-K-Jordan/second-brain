@@ -7100,11 +7100,27 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     ):
         from fastapi.responses import RedirectResponse
 
-        from . import email_assist
+        # Round 27 fix (audit-found gap M8) — also release the
+        # linked ``meeting_thanks`` row if any. The /drafts/sent
+        # mirror calls ``mark_sent_for_draft``; the discard mirror
+        # was missing the paired ``mark_dismissed_for_draft`` call,
+        # so the meeting_thanks row stayed stuck in DRAFTED status
+        # forever, blocking the daemon's re-draft early-return AND
+        # leaving /thanks pointing at a draft the user just rejected.
+        from . import email_assist, meeting_thanks
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         email_assist.discard_draft(conn, draft_id)
+        try:
+            meeting_thanks.mark_dismissed_for_draft(conn, draft_id)
+        except Exception:  # noqa: BLE001
+            # Best-effort hook; failure here doesn't block the
+            # email-side discard the user actually requested.
+            log.exception(
+                "drafts_discard: meeting_thanks release failed for "
+                "draft %d", draft_id,
+            )
         return RedirectResponse(
             url=_safe_drafts_next(next), status_code=303,
         )

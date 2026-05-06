@@ -42,6 +42,8 @@ import time
 import weakref as _weakref
 from dataclasses import dataclass, field
 
+from .db import TRANSCRIPT_KIND_SQL
+
 log = logging.getLogger(__name__)
 
 
@@ -773,19 +775,25 @@ def assemble_weekly_review(
         "SELECT COUNT(*) AS n FROM files WHERE indexed_at >= ?",
         (week_cutoff,),
     ).fetchone()["n"] or 0
+    # Round 27 fix (audit-found gap H6) — broaden the meetings /
+    # lectures filters via the shared ``TRANSCRIPT_KIND_SQL``
+    # constant. Round 24 migrated weekly_letter._signal_counts to
+    # the constant; the synthesis weekly-review counts were missed,
+    # so users with IMAP-delivered Granola/Otter transcripts saw
+    # "0 meetings this week" even on busy weeks.
     n_meetings = conn.execute(
-        "SELECT COUNT(*) AS n FROM files "
-        "WHERE indexed_at >= ? AND path LIKE 'transcript://%' "
-        "  AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id "
-        "              AND c.text LIKE '%[meeting]%')",
+        f"SELECT COUNT(*) AS n FROM files f "
+        f"WHERE f.indexed_at >= ? AND {TRANSCRIPT_KIND_SQL} "
+        f"  AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id "
+        f"              AND c.text LIKE '%[meeting]%')",
         (week_cutoff,),
     ).fetchone()["n"] or 0
     n_lectures = conn.execute(
-        "SELECT COUNT(*) AS n FROM files "
-        "WHERE indexed_at >= ? AND path LIKE 'transcript://%' "
-        "  AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id "
-        "              AND c.chunk_index = 0 "
-        "              AND c.text LIKE '%[%')",
+        f"SELECT COUNT(*) AS n FROM files f "
+        f"WHERE f.indexed_at >= ? AND {TRANSCRIPT_KIND_SQL} "
+        f"  AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id "
+        f"              AND c.chunk_index = 0 "
+        f"              AND c.text LIKE '%[%')",
         (week_cutoff,),
     ).fetchone()["n"] or 0
     n_jobs = 0

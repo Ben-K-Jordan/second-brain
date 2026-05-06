@@ -634,9 +634,14 @@ def extract_from_recent_inputs(
     eligible_kinds = {
         "email", "message", "transcript", "journal", "voice",
     }
+    # Round 27 fix (audit-found gap H5) — also walk ``capture://``
+    # paths so iOS-Shortcut / browser-bookmarklet quick captures
+    # ("told Sarah I'd send the doc by Tuesday") surface as
+    # follow-ups too. Round 26 H3 added the same prefix to the
+    # tasks materializer; this sibling was missed.
     eligible_path_prefixes = (
         "imap://", "gmail://", "transcript://",
-        "voice://", "journal://",
+        "voice://", "journal://", "capture://",
     )
     rows = conn.execute(
         "SELECT f.id, f.path, f.kind, f.indexed_at FROM files f "
@@ -703,6 +708,11 @@ def _normalise_kind(kind: str, path: str = "") -> str:
         if path.startswith("voice://"):
             return "journal"
         if path.startswith("journal://"):
+            return "journal"
+        # Round 27 fix (audit-found gap H5) — capture:// quick-notes
+        # are journal-shaped (free-form personal note), not email
+        # or meeting transcripts.
+        if path.startswith("capture://"):
             return "journal"
     if kind == "transcript":
         return "meeting"

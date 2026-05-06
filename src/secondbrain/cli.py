@@ -1461,7 +1461,7 @@ def transcripts_list(
     IMAP connector show up here with their inferred course code and
     recording timestamp.
     """
-    from .db import connect_readonly
+    from .db import TRANSCRIPT_KIND_SQL, connect_readonly
 
     cfg = load_config()
     try:
@@ -1469,10 +1469,18 @@ def transcripts_list(
     except FileNotFoundError as e:
         console.print(f"[yellow]{e}[/]")
         raise typer.Exit(code=1) from None
+    # Round 27 fix (audit-found gap H4) — listing previously
+    # filtered to ``transcript://%`` only, contradicting the
+    # docstring that says "...ingested via the IMAP connector show
+    # up here". IMAP-delivered Granola/Otter/Plaud transcripts land
+    # at ``imap://...`` so they never appeared. Use the shared
+    # ``TRANSCRIPT_KIND_SQL`` constant (alias files as ``f``).
     rows = conn.execute(
-        "SELECT path, mtime, indexed_at FROM files "
-        "WHERE path LIKE 'transcript://%' "
-        "ORDER BY mtime DESC LIMIT ?",
+        f"SELECT f.path AS path, f.mtime AS mtime, "
+        f"       f.indexed_at AS indexed_at "
+        f"FROM files f "
+        f"WHERE {TRANSCRIPT_KIND_SQL} "
+        f"ORDER BY f.mtime DESC LIMIT ?",
         (limit * 3,),
     ).fetchall()
     if not rows:

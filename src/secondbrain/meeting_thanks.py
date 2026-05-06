@@ -39,6 +39,8 @@ import time
 import weakref as _weakref
 from dataclasses import dataclass
 
+from .db import TRANSCRIPT_KIND_SQL
+
 log = logging.getLogger(__name__)
 
 
@@ -372,21 +374,30 @@ def _title_overlap(a: str, b: str) -> float:
 def _find_transcript_for_event(
     conn: sqlite3.Connection, *, title: str, ends_at: float,
 ) -> str | None:
-    """Look up a transcript:// file that plausibly captures this
+    """Look up a transcript file that plausibly captures this
     meeting. Two-pronged: mtime within ±2h of event end (cheap SQL
     filter) AND title-token overlap ≥ 0.3 (cheap Python filter).
-    Returns the path of the best match, or None."""
+    Returns the path of the best match, or None.
+
+    Round 27 fix (audit-found gap H3) — broadened the SQL filter
+    via the shared ``TRANSCRIPT_KIND_SQL`` constant. Round 24
+    migrated ``meeting_capture.py`` to that constant; this sibling
+    in ``meeting_thanks`` was missed in the same sweep, so users
+    whose Granola/Otter transcripts arrive over IMAP (``imap://``)
+    never had a thank-you draft fire — the matcher silently
+    returned None.
+    """
     if not ends_at:
         return None
     lo = ends_at - _TRANSCRIPT_MATCH_WINDOW
     hi = ends_at + _TRANSCRIPT_MATCH_WINDOW
     rows = conn.execute(
-        "SELECT f.path, f.mtime, c.text "
-        "FROM files f JOIN chunks c ON c.file_id = f.id "
-        "WHERE f.path LIKE 'transcript://%' "
-        "  AND f.mtime BETWEEN ? AND ? "
-        "  AND c.chunk_index = 0 "
-        "ORDER BY ABS(f.mtime - ?) ASC LIMIT 10",
+        f"SELECT f.path, f.mtime, c.text "
+        f"FROM files f JOIN chunks c ON c.file_id = f.id "
+        f"WHERE {TRANSCRIPT_KIND_SQL} "
+        f"  AND f.mtime BETWEEN ? AND ? "
+        f"  AND c.chunk_index = 0 "
+        f"ORDER BY ABS(f.mtime - ?) ASC LIMIT 10",
         (lo, hi, ends_at),
     ).fetchall()
     if not rows:
@@ -493,6 +504,37 @@ def mark_sent_for_draft(
         "UPDATE meeting_thanks SET status = ?, updated_at = ? "
         "WHERE draft_id = ? AND status = ?",
         (_STATUS_SENT, time.time(), draft_id, _STATUS_DRAFTED),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def mark_dismissed_for_draft(
+    conn: sqlite3.Connection, draft_id: int,
+) -> bool:
+    """Round 27 fix (audit-found gap M8) — paired with
+    ``mark_sent_for_draft``. Called when the user discards an
+    email_drafts row that was originally generated from a
+    ``meeting_thanks`` entry. Without this, the meeting row stays
+    stuck in ``_STATUS_DRAFTED`` forever:
+
+      - ``generate_thanks_draft`` early-returns at the
+        ``mt.status != _STATUS_READY`` guard, so the daemon never
+        re-drafts.
+      - The /thanks UI keeps showing the meeting as drafted with
+        a link to a draft the user just rejected.
+
+    Flips the row back to ``_STATUS_SKIPPED`` so it falls out of
+    the ``_STATUS_READY`` queue. We deliberately don't go back to
+    ``_STATUS_READY`` (which would cause an immediate re-draft)
+    since the user just expressed "no thanks" by discarding.
+    """
+    _ensure_schema(conn)
+    cur = conn.execute(
+        "UPDATE meeting_thanks SET status = ?, updated_at = ?, "
+        "                          draft_id = NULL "
+        "WHERE draft_id = ? AND status = ?",
+        (_STATUS_SKIPPED, time.time(), draft_id, _STATUS_DRAFTED),
     )
     conn.commit()
     return cur.rowcount > 0

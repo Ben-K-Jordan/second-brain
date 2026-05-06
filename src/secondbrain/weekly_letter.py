@@ -482,14 +482,23 @@ def _signal_email_volume(
 def _signal_meetings(
     conn: sqlite3.Connection, week_cutoff: float,
 ) -> list[dict]:
-    """Recent meetings — title + first 200 chars of transcript."""
+    """Recent meetings — title + first 200 chars of transcript.
+
+    Round 27 fix (audit-found gap M7) — round 26 M10 migrated the
+    paired ``_signal_counts`` to ``TRANSCRIPT_KIND_SQL`` but the
+    body-listing here still used ``f.path LIKE 'transcript://%'``.
+    Result: the letter would say "12 meetings this week" but only
+    list 4 by title (the IMAP-delivered ones were counted but
+    omitted from the body). Now both queries share one source of
+    truth.
+    """
     try:
         rows = conn.execute(
-            "SELECT f.id, f.path, c.text "
-            "FROM files f JOIN chunks c ON c.file_id = f.id "
-            "WHERE f.indexed_at >= ? AND f.path LIKE 'transcript://%' "
-            "  AND c.chunk_index = 0 "
-            "ORDER BY f.indexed_at DESC LIMIT 8",
+            f"SELECT f.id, f.path, c.text "
+            f"FROM files f JOIN chunks c ON c.file_id = f.id "
+            f"WHERE f.indexed_at >= ? AND {_db.TRANSCRIPT_KIND_SQL} "
+            f"  AND c.chunk_index = 0 "
+            f"ORDER BY f.indexed_at DESC LIMIT 8",
             (week_cutoff,),
         ).fetchall()
     except sqlite3.OperationalError:
