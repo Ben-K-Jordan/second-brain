@@ -76,6 +76,12 @@ def _events_files(
         "image": "🖼", "url": "🔗", "email": "✉",
         "transcript": "💬", "review": "📅", "message": "💬",
     }
+    # Round 26 fix (audit-found gap M9) — use file_id in the link
+    # (round-25 H1 added that route). Earlier ``?path=...`` left the
+    # raw path uninterpolated, so virtual paths containing ``<``,
+    # ``>``, ``@``, ``?``, ``&``, ``+``, ``#`` (eg.
+    # imap://msgid/<id@host>) produced broken links. file_id is just
+    # a digit, no encoding concerns.
     for r in rows:
         title = (r["path"] or "").rsplit("/", 1)[-1] or "(unnamed)"
         kind = r["kind"] or "file"
@@ -84,7 +90,7 @@ def _events_files(
             kind=f"file:{kind}",
             title=_redact(title),
             detail=_redact(r["path"] or ""),
-            href=f"/file?path={r['path']}",
+            href=f"/file?file_id={int(r['id'])}",
             icon=icon_for.get(kind, "📁"),
         ))
     return out
@@ -216,7 +222,8 @@ def _events_email_triage(
     out = []
     try:
         rows = conn.execute(
-            "SELECT ec.label, ec.confidence, f.path, f.indexed_at "
+            "SELECT ec.label, ec.confidence, ec.file_id, "
+            "       f.path, f.indexed_at "
             "FROM email_classifications ec "
             "JOIN files f ON f.id = ec.file_id "
             "WHERE f.indexed_at >= ? AND f.indexed_at < ? "
@@ -227,13 +234,16 @@ def _events_email_triage(
         return out
     icon_for = {"urgent": "🔴", "important": "🟠", "fyi": "🔵",
                 "social": "🟢", "promo": "⚪"}
+    # Round 26 fix (audit-found gap M9) — link by file_id, mirroring
+    # the round-25 H1 fix. imap:// / gmail:// paths frequently embed
+    # `<msgid@host>` which would have broken raw-path interpolation.
     for r in rows:
         title = (r["path"] or "").rsplit("/", 1)[-1] or "(email)"
         out.append(TimelineEvent(
             ts=float(r["indexed_at"]),
             kind=f"email:{r['label']}",
             title=f"Email ({r['label']}): {_redact(title)[:60]}",
-            href=f"/file?path={r['path']}",
+            href=f"/file?file_id={int(r['file_id'])}",
             icon=icon_for.get(r["label"], "✉"),
         ))
     return out

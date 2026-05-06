@@ -1444,6 +1444,48 @@ def _render_decision(d) -> str:
     )
 
 
+# Round 26 — extended whitelist for ``next=`` round-trips. The
+# /today EA surface posts actions whose handlers redirect using
+# this whitelist so the user lands back where they came from.
+# Hoisted to module scope (round 26) so tests can import directly.
+_SAFE_NEXT_PREFIXES: tuple[str, ...] = (
+    "/today", "/triage", "/followups", "/drafts",
+)
+
+
+def _safe_next_with_default(next_param: str, default: str) -> str:
+    """Whitelist-validate a ``next=`` param against the EA-action
+    prefix set. Returns ``default`` for anything that doesn't
+    match (open-redirect-safe)."""
+    if not next_param:
+        return default
+    candidate = str(next_param).strip()
+    if candidate in _SAFE_NEXT_PREFIXES:
+        return candidate
+    for prefix in _SAFE_NEXT_PREFIXES:
+        if candidate.startswith(f"{prefix}?"):
+            return candidate
+    return default
+
+
+def _safe_next(next_param: str) -> str:
+    """Round 23 fix (audit-found gap M7) — ``next=`` redirect
+    param so an action POSTed from /today returns to /today
+    instead of dumping the user into the triage walkthrough.
+    Triage-specific default (/triage)."""
+    return _safe_next_with_default(next_param, "/triage")
+
+
+def _safe_followup_next(next_param: str) -> str:
+    """Followup-specific default (/followups)."""
+    return _safe_next_with_default(next_param, "/followups")
+
+
+def _safe_drafts_next(next_param: str) -> str:
+    """Drafts-specific default (/drafts)."""
+    return _safe_next_with_default(next_param, "/drafts")
+
+
 def _undo_toast_html(
     undo_done: int, undo_label: str,
     undo_kind: str, undo_id: int,
@@ -5227,22 +5269,31 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Follow-ups", body, "followups"))
 
     @app.post("/followups/{followup_id:int}/resolve")
-    def followup_resolve(followup_id: int, request: Request):
+    def followup_resolve(
+        followup_id: int, request: Request, next: str = Form(""),
+    ):
+        """Round 26 fix (audit-found gap H1) — honor ``next=`` form
+        param so /today's "Mark done" button keeps the user on
+        /today instead of teleporting them to /followups."""
         from . import followups as fu_mod
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         fu_mod.mark_resolved(conn, followup_id)
-        return RedirectResponse(url="/followups", status_code=303)
+        target = _safe_followup_next(next)
+        return RedirectResponse(url=target, status_code=303)
 
     @app.post("/followups/{followup_id:int}/dismiss")
-    def followup_dismiss(followup_id: int, request: Request):
+    def followup_dismiss(
+        followup_id: int, request: Request, next: str = Form(""),
+    ):
         from . import followups as fu_mod
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         fu_mod.mark_dismissed(conn, followup_id)
-        return RedirectResponse(url="/followups", status_code=303)
+        target = _safe_followup_next(next)
+        return RedirectResponse(url=target, status_code=303)
 
     @app.get("/agenda", response_class=HTMLResponse)
     def agenda_page(id: int = 0):  # noqa: A002
@@ -5358,7 +5409,10 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     # ============================ Round 22 — /today ====================
 
     @app.get("/today", response_class=HTMLResponse)
-    def today_page(undo_done: int = 0, undo_label: str = ""):
+    def today_page(
+        undo_done: int = 0, undo_label: str = "",
+        undo_kind: str = "", undo_id: int = 0,
+    ):
         """Round 22 (Phase EA-UI) — the morning desk.
 
         EA-shaped front door. Replaces the "browse my data" landing
@@ -5371,7 +5425,10 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
         ``?undo_done=1&undo_label=Snoozed%207%20days`` renders the
         round-22 undo toast at the top of the page after a
-        round-tripped action.
+        round-tripped action. Round 26 fix (audit-found gap H2) —
+        also accept ``undo_kind`` + ``undo_id`` so the toast's
+        Undo button actually works on /today (was hardcoded to
+        ``("today", 0)`` which never matched the kind whitelist).
         """
         from . import today as today_mod
         cfg, conn, _, _ = get_state()
@@ -5383,7 +5440,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         # undo_* params on render is consistent across /today and
         # /triage.
         toast_html = _undo_toast_html(
-            undo_done, undo_label, "today", 0,
+            undo_done, undo_label, undo_kind, undo_id,
         )
 
         if desk.is_quiet():
@@ -5777,7 +5834,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
     def followup_snooze(
         followup_id: int, request: Request,
         days: int = Form(7),
+        next: str = Form(""),
     ):
+        """Round 26 fix — honor ``next=`` for /today round-trips."""
         from . import followups_ops
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
@@ -5786,16 +5845,22 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             followups_ops.snooze(conn, followup_id, days=days)
         except ValueError as e:
             return HTMLResponse(str(e), status_code=400)
-        return RedirectResponse(url="/followups", status_code=303)
+        return RedirectResponse(
+            url=_safe_followup_next(next), status_code=303,
+        )
 
     @app.post("/followups/{followup_id:int}/unsnooze")
-    def followup_unsnooze(followup_id: int, request: Request):
+    def followup_unsnooze(
+        followup_id: int, request: Request, next: str = Form(""),
+    ):
         from . import followups_ops
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
         followups_ops.unsnooze(conn, followup_id)
-        return RedirectResponse(url="/followups", status_code=303)
+        return RedirectResponse(
+            url=_safe_followup_next(next), status_code=303,
+        )
 
     @app.post("/followups/{followup_id:int}/edit")
     def followup_edit(
@@ -5803,6 +5868,7 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         topic: str = Form(""),
         description: str = Form(""),
         due_iso: str = Form(""),
+        next: str = Form(""),
     ):
         from . import followups_ops
         if not _is_same_origin_request(request):
@@ -5823,7 +5889,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             description=(description or None) if description else None,
             due_at=due_at,
         )
-        return RedirectResponse(url="/followups", status_code=303)
+        return RedirectResponse(
+            url=_safe_followup_next(next), status_code=303,
+        )
 
     @app.post("/followups/{followup_id:int}/nudge")
     def followup_nudge(followup_id: int, request: Request):
@@ -5987,7 +6055,21 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         if not _is_same_origin_request(request):
             return HTMLResponse("Forbidden", status_code=403)
         _, conn, _, _ = get_state()
+        # Round 26 fix (audit-found gap M7) — look up the note's
+        # person_id BEFORE marking it discussed, then redirect back
+        # to that person's agenda so the user keeps their place in
+        # the per-person review flow. Earlier the redirect dumped
+        # the user back to the empty /agenda landing page.
+        person_id_row = conn.execute(
+            "SELECT person_id FROM agenda_notes WHERE id = ?",
+            (note_id,),
+        ).fetchone()
         agenda.mark_discussed(conn, note_id)
+        if person_id_row is not None:
+            return RedirectResponse(
+                url=f"/agenda?id={int(person_id_row['person_id'])}",
+                status_code=303,
+            )
         return RedirectResponse(url="/agenda", status_code=303)
 
     @app.post("/person/{person_id:int}/tier")
@@ -6012,21 +6094,8 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
 
     # --- Triage queue actions -----------------------------------------
 
-    def _safe_next(next_param: str) -> str:
-        """Round 23 fix (audit-found gap M7) — ``next=`` redirect
-        param so an action POSTed from /today returns to /today
-        instead of dumping the user into the triage walkthrough.
-
-        Whitelist the allowed targets to avoid open-redirect: only
-        same-origin paths starting with ``/today`` or ``/triage``."""
-        if not next_param:
-            return "/triage"
-        candidate = str(next_param).strip()
-        if candidate in ("/today", "/triage"):
-            return candidate
-        if candidate.startswith("/today?") or candidate.startswith("/triage?"):
-            return candidate
-        return "/triage"
+    # Round 26 — _SAFE_NEXT_PREFIXES + the _safe_*_next helpers
+    # are now module-level (above) so tests can import them.
 
     @app.post("/triage/{file_id:int}/done")
     def triage_done(
@@ -7003,7 +7072,11 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
         return HTMLResponse(_layout("Drafts", body, "drafts"))
 
     @app.post("/drafts/{draft_id:int}/sent")
-    def drafts_mark_sent(draft_id: int, request: Request):
+    def drafts_mark_sent(
+        draft_id: int, request: Request, next: str = Form(""),
+    ):
+        """Round 26 fix — honor ``next=`` so /today's "Send draft"
+        keeps the user on /today."""
         from fastapi.responses import RedirectResponse
 
         from . import email_assist, meeting_thanks
@@ -7017,10 +7090,14 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             meeting_thanks.mark_sent_for_draft(conn, draft_id)
         except Exception:  # noqa: BLE001
             pass
-        return RedirectResponse(url="/drafts", status_code=303)
+        return RedirectResponse(
+            url=_safe_drafts_next(next), status_code=303,
+        )
 
     @app.post("/drafts/{draft_id:int}/discard")
-    def drafts_discard(draft_id: int, request: Request):
+    def drafts_discard(
+        draft_id: int, request: Request, next: str = Form(""),
+    ):
         from fastapi.responses import RedirectResponse
 
         from . import email_assist
@@ -7028,7 +7105,9 @@ fetch('/graph/data?top_n={top_n}&min_cooccur={min_cooccur}').then(r => r.json())
             return HTMLResponse("Forbidden", status_code=403)
         cfg, conn, _, _ = get_state()
         email_assist.discard_draft(conn, draft_id)
-        return RedirectResponse(url="/drafts", status_code=303)
+        return RedirectResponse(
+            url=_safe_drafts_next(next), status_code=303,
+        )
 
     # --- Round 8: meeting thanks page ---------------------------------
 

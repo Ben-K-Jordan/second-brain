@@ -63,7 +63,15 @@ def _slug(text: str, *, max_len: int = 80) -> str:
 
 
 def _classify(path: str, kind: str) -> str:
-    """Map a virtual path / kind to one of our seven vault folders."""
+    """Map a virtual path / kind to one of our seven vault folders.
+
+    Round 26 fix (audit-found gap M5) — added explicit handlers for
+    every connector prefix the indexer emits so connector docs land in
+    sensible folders instead of ``misc``. Email-shaped sources route
+    to ``notes`` (treated as documents); journal entries get their own
+    bucket; chat / project-tracker connectors flow into ``captures``
+    so they're co-located with capture:// rapid-fire notes.
+    """
     if path.startswith("transcript://") or path.startswith("voice://"):
         return "transcripts"
     if path.startswith("capture://"):
@@ -74,6 +82,15 @@ def _classify(path: str, kind: str) -> str:
         return "health"
     if path.startswith("review://"):
         return "reviews"
+    if path.startswith("journal://"):
+        return "journal"
+    if path.startswith(("imap://", "gmail://", "message://")):
+        return "notes"
+    if path.startswith((
+        "slack://", "linear://", "github://",
+        "notion://", "obsidian://", "pocket://", "readwise://",
+    )):
+        return "captures"
     if (path.startswith(("/", "C:\\", "C:/", "~"))
             or kind in ("document", "code", "image")):
         return "notes"

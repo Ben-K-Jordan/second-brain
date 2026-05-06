@@ -3007,15 +3007,24 @@ def thanks_skip(
 @thanks_app.command("draft")
 def thanks_draft(
     mt_id: int = typer.Argument(..., help="Meeting id."),
-    user_name: str = typer.Option(
-        "I", "--name", help="Name to sign as (defaults to 'I').",
+    user_name: str | None = typer.Option(
+        None, "--name",
+        help="Name to sign as. Defaults to your config user_name "
+             "(or 'I' if unset).",
     ),
 ) -> None:
     """Generate a thank-you draft for a specific meeting now.
 
     Uses your voice profile + reply-pair few-shot. The draft lands
     in /drafts where you can review, tweak, and mark sent through
-    the same UI as inbox replies."""
+    the same UI as inbox replies.
+
+    Round 26 fix (audit-found gap H4) — typer default is now ``None``
+    instead of ``"I"`` so ``meeting_thanks.generate_thanks_draft``'s
+    fallback to ``cfg.user_name`` (round 25 H2 fix) actually triggers.
+    Previously the CLI clobbered the cfg-derived name with the
+    placeholder before the fallback could run.
+    """
     from . import meeting_thanks
 
     cfg = load_config()

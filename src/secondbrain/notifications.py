@@ -318,11 +318,16 @@ def _detect_email_urgent(conn: sqlite3.Connection) -> int:
     # broke for paths containing ``<``, ``>``, ``@``, ``?``, ``&``,
     # ``+``, ``#`` (e.g. imap://msgid/<id@host>). file_id is just
     # a digit, no escaping concerns.
+    # Round 26 fix (audit-found gap M6) — date-bucket the key so
+    # the same urgent email re-fires once per local day if the user
+    # hasn't acted on it. Previously a single notification would
+    # never resurface even if the email sat triaged-urgent for days.
+    today = date.today().isoformat()
     for r in rows:
         title = (r["path"] or "").rsplit("/", 1)[-1] or "(email)"
         if enqueue(
             conn,
-            key=f"email_urgent:file_id={r['file_id']}",
+            key=f"email_urgent:file_id={r['file_id']}:{today}",
             kind="email_urgent", urgency="high",
             title=f"Urgent email: {title[:60]}",
             body="Triaged as urgent. Open the drafts page to respond.",
@@ -578,6 +583,12 @@ def _detect_followup_overdue(conn: sqlite3.Connection) -> int:
     except sqlite3.OperationalError:
         return 0
     n = 0
+    # Round 26 fix (audit-found gap M6) — date-bucket the key so a
+    # still-overdue followup re-surfaces every local day until the
+    # user resolves, snoozes, or dismisses it. Earlier the unique
+    # key fired exactly once per followup id, so an item that sat
+    # overdue for two weeks only ever pinged on day 1.
+    today = date.today().isoformat()
     for r in rows:
         urgency = "high" if r["direction"] == "outgoing" else "med"
         action = "send" if r["direction"] == "outgoing" else "nudge"
@@ -587,7 +598,7 @@ def _detect_followup_overdue(conn: sqlite3.Connection) -> int:
         )
         if enqueue(
             conn,
-            key=f"followup_overdue:{r['id']}",
+            key=f"followup_overdue:{r['id']}:{today}",
             kind="followup_overdue",
             urgency=urgency,
             title=f"Overdue: {r['topic']}",
@@ -626,13 +637,19 @@ def _detect_followup_stale(conn: sqlite3.Connection) -> int:
     except sqlite3.OperationalError:
         return 0
     n = 0
+    # Round 26 fix (audit-found gap M6) — week-bucket the key so a
+    # stale incoming followup quietly re-surfaces once per ISO week
+    # until the user resolves or nudges. A weekly cadence avoids
+    # nagging the user daily while still keeping aging items in view.
+    iso_year, iso_week, _ = date.today().isocalendar()
+    week_bucket = f"{iso_year}W{iso_week:02d}"
     for r in rows:
         days = int(
             (time.time() - float(r["promised_at"] or 0)) / 86400.0,
         )
         if enqueue(
             conn,
-            key=f"followup_stale:{r['id']}",
+            key=f"followup_stale:{r['id']}:{week_bucket}",
             kind="followup_stale",
             urgency="low",
             title=f"Stale: {r['topic']}",

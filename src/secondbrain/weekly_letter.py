@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from . import db as _db
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -205,35 +206,35 @@ def _signal_counts(conn: sqlite3.Connection, week_cutoff: float) -> dict:
     # never matches and ``email://`` is not a real prefix.
     # ``urls_ingested`` is now the COMPLEMENT of the email/
     # transcript/voice prefixes so it doesn't double-count.
+    #
+    # Round 26 fix (audit-found gap M10) — emails + meetings now
+    # delegate to ``db.EMAIL_KIND_SQL`` / ``db.TRANSCRIPT_KIND_SQL``
+    # so all three places (notifications, dashboard, weekly letter)
+    # share the same source-of-truth definition. Earlier the inline
+    # filter quietly diverged: it missed ``kind='email'`` (some test
+    # fixtures + manual tagging use that), so the weekly letter
+    # under-counted relative to the rest of the system.
     for key, where in [
-        (
-            "emails",
-            "path LIKE 'imap://%' OR path LIKE 'gmail://%' "
-            "OR kind = 'message'",
-        ),
-        (
-            "meetings",
-            "path LIKE 'transcript://%' OR path LIKE 'imap://transcripts/%' "
-            "OR kind IN ('audio_video', 'transcript')",
-        ),
+        ("emails", _db.EMAIL_KIND_SQL),
+        ("meetings", _db.TRANSCRIPT_KIND_SQL),
         (
             "urls_ingested",
             # url-kind that ISN'T email or transcript above.
-            "kind = 'url' "
-            "AND path NOT LIKE 'imap://%' "
-            "AND path NOT LIKE 'gmail://%' "
-            "AND path NOT LIKE 'transcript://%'",
+            "f.kind = 'url' "
+            "AND f.path NOT LIKE 'imap://%' "
+            "AND f.path NOT LIKE 'gmail://%' "
+            "AND f.path NOT LIKE 'transcript://%'",
         ),
         (
             "voice_notes",
-            "source = 'voice' OR path LIKE 'voice://%' "
-            "OR kind = 'voice'",
+            "f.source = 'voice' OR f.path LIKE 'voice://%' "
+            "OR f.kind = 'voice'",
         ),
     ]:
         try:
             out[key] = int(conn.execute(
-                f"SELECT COUNT(*) AS n FROM files "
-                f"WHERE indexed_at >= ? AND ({where})",
+                f"SELECT COUNT(*) AS n FROM files f "
+                f"WHERE f.indexed_at >= ? AND ({where})",
                 (week_cutoff,),
             ).fetchone()["n"] or 0)
         except sqlite3.OperationalError:

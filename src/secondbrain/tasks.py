@@ -659,10 +659,18 @@ def materialize_promises_from_transcripts(
     _ensure_round9c_columns(conn)
     cutoff = time.time() - lookback_days * 86400
     # Find recent transcripts we haven't extracted from yet.
+    # Round 26 fix (audit-found gap H3) — also walk voice:// + capture://
+    # paths so iOS Shortcut sends and Whisper voice memos go through the
+    # structured LLM extractor (matching the broader regex extractor in
+    # ``materialize_from_transcripts`` at lines 434-436). Round 25 fixed
+    # the analogous gap in ``study.materialize_due_cards``; this function
+    # was missed in the same sweep.
     rows = conn.execute(
         "SELECT f.id, f.path FROM files f "
         "LEFT JOIN task_promise_runs tpr ON tpr.file_id = f.id "
-        "WHERE f.path LIKE 'transcript://%' "
+        "WHERE (f.path LIKE 'transcript://%' "
+        "    OR f.path LIKE 'voice://%' "
+        "    OR f.path LIKE 'capture://%') "
         "  AND f.indexed_at >= ? "
         "  AND tpr.file_id IS NULL "
         "ORDER BY f.indexed_at DESC LIMIT ?",
